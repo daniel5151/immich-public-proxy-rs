@@ -1,0 +1,130 @@
+html {
+    background: #191919;
+}
+
+body,
+main {
+    margin: 0;
+    padding: 0;
+}
+
+#lightgallery a {
+    position: relative;
+    display: inline-block;
+    text-decoration: none;
+    margin: 0;
+    padding: 0;
+    cursor: pointer;
+}
+
+#lightgallery img {
+    max-height: 250px;
+    margin: 4px;
+}
+
+@media (max-width: 800px) {
+    #lightgallery a {
+        width: calc(100vw / 3 - 10px);
+        height: calc(100vw / 3 - 10px);
+        overflow: hidden;
+    }
+
+    #lightgallery img {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+        object-position: center;
+    }
+}
+
+@media (min-width: 801px) {
+    #lightgallery a.thumb-error {
+        width: 250px;
+        height: 250px;
+        margin: 4px;
+    }
+}
+
+#lightgallery a.thumb-error {
+    background: #2a2a2a;
+}
+
+#lightgallery a.thumb-error img {
+    display: none;
+}
+
+.play-icon {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    width: 50px;
+    height: 50px;
+    background-image: url('/images/play.png');
+    background-size: contain;
+    background-repeat: no-repeat;
+    opacity: 0.5;
+}
+
+#lightgallery a:has(.play-icon):hover .play-icon {
+    opacity: 1;
+}
+
+#password {
+    color: white;
+}
+
+#header,
+#album-description {
+    font-family: system-ui, "Segoe UI", Roboto, Oxygen, Ubuntu, Cantarell, Helvetica, Arial, "Helvetica Neue", sans-serif;
+    color: white;
+}
+
+#header {
+    width: 100%;
+    display: flex;
+}
+
+#header h1 {
+    font-size: 18pt;
+    font-weight: bold;
+    margin: 4px;
+}
+
+#album-description h2 {
+    font-size: 12pt;
+    font-weight: normal;
+    font-style: italic;
+    margin: 4px;
+    white-space: pre-wrap;
+}
+
+#download-all {
+    margin: auto 4px auto auto;
+}
+
+#loading-spinner {
+    text-align: center;
+    margin: 75px 0;
+}
+
+.loader {
+    width: 48px;
+    height: 48px;
+    border: 5px solid #888;
+    border-bottom-color: transparent;
+    border-radius: 50%;
+    display: inline-block;
+    box-sizing: border-box;
+    animation: rotation 1s linear infinite;
+}
+
+@keyframes rotation {
+    0% {
+        transform: rotate(0deg);
+    }
+
+    100% {
+        transform: rotate(360deg);
+    }
+}
