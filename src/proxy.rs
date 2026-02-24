@@ -83,9 +83,14 @@ pub mod ssr {
             format!("/assets/{}/thumbnail", id)
         };
 
-        let _url = client.build_url(&subpath, &params);
+        let url = client.build_url(&subpath, &params);
 
-        let res = match client.http_client.get(&_url).send().await {
+        let mut req = client.http_client.get(&url);
+        if let Some(range) = headers.get(axum::http::header::RANGE) {
+            req = req.header(reqwest::header::RANGE, range.clone());
+        }
+
+        let res = match req.send().await {
             Ok(res) => res,
             Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         };
@@ -98,6 +103,9 @@ pub mod ssr {
                 "etag",
                 "last-modified",
                 "content-disposition",
+                "cache-control",
+                "accept-ranges",
+                "content-range",
             ]
             .contains(&k.as_str())
             {

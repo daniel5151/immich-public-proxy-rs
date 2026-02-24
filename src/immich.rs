@@ -70,9 +70,13 @@ pub mod ssr {
                 .trim_end_matches('/')
                 .to_string()
                 + "/api";
+
+            static CLIENT: std::sync::OnceLock<Client> = std::sync::OnceLock::new();
+            let http_client = CLIENT.get_or_init(Client::new).clone();
+
             Self {
                 api_url,
-                http_client: Client::new(),
+                http_client,
             }
         }
 
