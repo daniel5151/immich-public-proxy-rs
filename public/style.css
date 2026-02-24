@@ -103,10 +103,11 @@ main {
 .gallery-date-header {
     display: flex;
     align-items: center;
-    padding: 1rem 0 0.5rem 1rem;
+    padding: 1rem 0 0.5rem 4px;
     gap: 12px;
 }
 
+body.selection-mode .date-selector,
 .gallery-date-header:hover .date-selector,
 .date-selector.selected {
     opacity: 1;
@@ -247,7 +248,8 @@ main {
 }
 
 .tile-wrapper:hover .tile-selector,
-.tile-wrapper.selected .tile-selector {
+.tile-wrapper.selected .tile-selector,
+body.selection-mode .tile-selector {
     opacity: 1;
 }
 

@@ -1,5 +1,5 @@
 use leptos::prelude::*;
-use leptos_meta::{provide_meta_context, MetaTags, Stylesheet, Title};
+use leptos_meta::{provide_meta_context, Body, MetaTags, Stylesheet, Title};
 use leptos_router::{
     components::{Route, Router, Routes},
     ParamSegment, StaticSegment,
@@ -143,7 +143,9 @@ fn AssetTile(
                     ev.prevent_default();
                     on_toggle.run(id_for_toggle.clone());
                 }
-            ></div>
+            >
+                <span class="check-icon"></span>
+            </div>
             <a
                 class="gallery-item"
                 attr:data-index=i
@@ -302,7 +304,10 @@ fn Gallery(details: crate::server_fns::ShareDetails) -> impl IntoView {
         }
     };
 
+    let is_selection_mode = move || !selected_assets.get().is_empty();
+
     view! {
+        <Body attr:class=move || if is_selection_mode() { "selection-mode" } else { "" } />
         <div id="gallery-root">
             <div id="selection-bar" class:active=move || !selected_assets.get().is_empty()>
                 <button class="icon-btn" on:click=move |_| selected_assets.set(HashSet::new())>
@@ -376,12 +381,14 @@ fn Gallery(details: crate::server_fns::ShareDetails) -> impl IntoView {
                         view! {
                             <div class="gallery-date-group">
                                 <div class="gallery-date-header">
+                                    <span class="date-label">{label}</span>
                                     <div
                                         class="date-selector"
                                         class:selected=has_all_selected
                                         on:click=on_group_toggle
-                                    ></div>
-                                    <span class="date-label">{label}</span>
+                                    >
+                                        <span class="check-icon"></span>
+                                    </div>
                                 </div>
                                 <div class="gallery-date-items">
                                     <For
