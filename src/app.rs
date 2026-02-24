@@ -156,35 +156,40 @@ fn AssetTile(
     };
 
     view! {
-        <a
+        <div
+            class="tile-wrapper"
             class:selected=is_selected
             style=format!("flex-basis: {}; flex-grow: {}", flex_basis, aspect_ratio)
-            attr:data-lg-id=i
-            href=move || if is_video { None } else { Some(preview_url.clone()) }
-            attr:data-video=video_attr
-            attr:data-download-url=download_url
-            attr:data-download=filename
-            attr:data-slide-name=id_for_slide
         >
             <div
                 class="tile-selector"
                 on:click=move |ev| {
                     ev.stop_propagation();
+                    ev.prevent_default();
                     on_toggle.run(id_for_toggle.clone());
                 }
             ></div>
-            <img
-                loading="lazy"
-                src=thumbnail_url
-                alt=""
-                onerror="this.closest('a').classList.add('thumb-error')"
-            />
-            {if is_video {
-                view! { <div class="play-icon"></div> }.into_any()
-            } else {
-                view! { <span/> }.into_any()
-            }}
-        </a>
+            <a
+                attr:data-lg-id=i
+                href=move || if is_video { None } else { Some(preview_url.clone()) }
+                attr:data-video=video_attr
+                attr:data-download-url=download_url
+                attr:data-download=filename
+                attr:data-slide-name=id_for_slide
+            >
+                <img
+                    loading="lazy"
+                    src=thumbnail_url
+                    alt=""
+                    onerror="this.closest('a').classList.add('thumb-error')"
+                />
+                {if is_video {
+                    view! { <div class="play-icon"></div> }.into_any()
+                } else {
+                    view! { <span/> }.into_any()
+                }}
+            </a>
+        </div>
     }
 }
 
@@ -325,10 +330,13 @@ fn Gallery(details: crate::server_fns::ShareDetails) -> impl IntoView {
 
             <div id="header">
                 <h1>{title}</h1>
-                <div id="download-all" style={if allow_download { "" } else { "display:none" }}>
-                    <a href=format!("/share/{}/download", share_key) rel="external" title="Download all">
-                        <img src="/images/download-all.svg" height="24" width="24" alt="Download all" />
-                    </a>
+                <div class="header-actions">
+                    <div id="download-all" style={if allow_download { "" } else { "display:none" }}>
+                        <a href=format!("/share/{}/download", share_key) rel="external" title="Download all">
+                            <img src="/images/download-all.svg" alt="" />
+                            <span>"Download all"</span>
+                        </a>
+                    </div>
                 </div>
             </div>
             {album_description.map(|desc| {

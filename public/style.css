@@ -27,20 +27,56 @@ main {
     left: 0;
     right: 0;
     height: var(--header-height);
-    background: rgba(0, 0, 0, 0.8);
+    background: rgba(0, 0, 0, 0.9);
     backdrop-filter: blur(10px);
     z-index: 100;
     display: flex;
     align-items: center;
+    justify-content: space-between;
     padding: 0 2rem;
     box-sizing: border-box;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.1);
 }
 
 #header h1 {
-    font-size: 2.5rem;
-    font-weight: 700;
+    font-size: 1.25rem;
+    font-weight: 600;
     margin: 0;
-    letter-spacing: -0.02em;
+    letter-spacing: -0.01em;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 60%;
+}
+
+.header-actions {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+}
+
+#download-all a {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 16px;
+    background: rgba(255, 255, 255, 0.1);
+    border-radius: 20px;
+    color: white;
+    text-decoration: none;
+    font-size: 0.9rem;
+    font-weight: 500;
+    transition: all 0.2s;
+}
+
+#download-all a:hover {
+    background: rgba(255, 255, 255, 0.2);
+}
+
+#download-all img {
+    filter: invert(1);
+    width: 20px;
+    height: 20px;
 }
 
 #album-description {
@@ -61,13 +97,17 @@ main {
     padding: var(--gap);
 }
 
-#lightgallery a {
+#lightgallery .tile-wrapper {
     position: relative;
     height: 250px;
-    flex-grow: 1;
     overflow: hidden;
-    cursor: pointer;
     background: #111;
+}
+
+#lightgallery a {
+    display: block;
+    width: 100%;
+    height: 100%;
 }
 
 #lightgallery img {
@@ -77,7 +117,7 @@ main {
     transition: transform 0.3s ease;
 }
 
-#lightgallery a:hover img {
+.tile-wrapper:hover img {
     transform: scale(1.05);
 }
 
@@ -149,12 +189,12 @@ main {
     opacity: 0;
 }
 
-#lightgallery a:hover .tile-selector,
-#lightgallery a.selected .tile-selector {
+.tile-wrapper:hover .tile-selector,
+.tile-wrapper.selected .tile-selector {
     opacity: 1;
 }
 
-#lightgallery a.selected .tile-selector {
+.tile-wrapper.selected .tile-selector {
     background: #3b82f6;
     border-color: #3b82f6;
 }
@@ -166,17 +206,18 @@ main {
     display: none;
 }
 
-#lightgallery a.selected .tile-selector::after {
+.tile-wrapper.selected .tile-selector::after {
     display: block;
 }
 
-#lightgallery a.selected::after {
+.tile-wrapper.selected::after {
     content: '';
     position: absolute;
     inset: 0;
     background: rgba(59, 130, 246, 0.1);
     border: 3px solid #3b82f6;
     pointer-events: none;
+    z-index: 5;
 }
 
 .play-icon {
