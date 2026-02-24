@@ -14,45 +14,38 @@ pub async fn get_share_details(
     key: String,
     password: Option<String>,
 ) -> Result<ShareDetails, ServerFnError> {
-    use crate::immich::ssr::ImmichClient;
+    use crate::immich::ImmichClient;
 
-    let (host, proto) = if let Ok(headers) = leptos_axum::extract::<axum::http::HeaderMap>().await {
-        let h = headers
-            .get("host")
-            .and_then(|h| h.to_str().ok())
-            .unwrap_or("localhost")
-            .to_string();
-        let p = headers
-            .get("x-forwarded-proto")
-            .and_then(|p| p.to_str().ok())
-            .unwrap_or("http")
-            .to_string();
-        (h, p)
-    } else {
-        ("localhost".to_string(), "http".to_string())
-    };
+    let headers = leptos_axum::extract::<axum::http::HeaderMap>()
+        .await
+        .map_err(|_| ServerFnError::new("Failed to extract headers"))?;
+
+    let host = headers
+        .get("host")
+        .and_then(|h| h.to_str().ok())
+        .ok_or_else(|| ServerFnError::new("Host header must be present"))?;
+
+    let proto = headers
+        .get("x-forwarded-proto")
+        .and_then(|p| p.to_str().ok())
+        .unwrap_or("http");
+
     let public_base_url =
         std::env::var("PUBLIC_BASE_URL").unwrap_or_else(|_| format!("{}://{}", proto, host));
 
     // Check cookie for password if not provided
-    let password = if password.is_none() {
-        if let Ok(headers) = leptos_axum::extract::<axum::http::HeaderMap>().await {
-            let cookie_str = headers
-                .get(axum::http::header::COOKIE)
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("");
-            let prefix = format!("immich_pwd_{}=", key);
-            cookie_str
-                .split(';')
-                .map(|s| s.trim())
-                .find(|s| s.starts_with(&prefix))
-                .map(|s| s[prefix.len()..].to_string())
-        } else {
-            None
-        }
-    } else {
-        password
-    };
+    let password = password.or_else(|| {
+        let cookie_str = headers
+            .get(axum::http::header::COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let prefix = format!("immich_pwd_{}=", key);
+        cookie_str
+            .split(';')
+            .map(|s| s.trim())
+            .find(|s| s.starts_with(&prefix))
+            .map(|s| s[prefix.len()..].to_string())
+    });
 
     let client = ImmichClient::new();
     let params = if let Some(p) = &password {

@@ -67,7 +67,7 @@ fn HomePage() -> impl IntoView {
 #[component]
 fn SharePage() -> impl IntoView {
     let params = leptos_router::hooks::use_params_map();
-    let key = move || params.with(|p| p.get("key").unwrap_or_default());
+    let key = move || params.with(|p| p.get("key").expect("key must be present"));
 
     let share_res = Resource::new(key, |k| crate::server_fns::get_share_details(k, None));
 
@@ -122,8 +122,20 @@ fn AssetTile(
     let thumbnail_url = format!("/share/photo/{}/{}/thumbnail", share_key, id);
     let is_video = asset.r#type == "VIDEO";
 
-    let width = asset.width.unwrap_or(250) as f32;
-    let height = asset.height.unwrap_or(250) as f32;
+    let width = match asset.width {
+        Some(w) => w as f32,
+        None => {
+            return view! { <div class="error-msg">"Error: asset width must be present"</div> }
+                .into_any()
+        }
+    };
+    let height = match asset.height {
+        Some(h) => h as f32,
+        None => {
+            return view! { <div class="error-msg">"Error: asset height must be present"</div> }
+                .into_any()
+        }
+    };
     let aspect_ratio = width / height;
     let flex_basis = format!("{}px", 250.0 * aspect_ratio);
 
@@ -165,6 +177,7 @@ fn AssetTile(
             </a>
         </div>
     }
+    .into_any()
 }
 
 mod ipp_callback {
@@ -194,13 +207,22 @@ fn Gallery(details: crate::server_fns::ShareDetails) -> impl IntoView {
     let link = details.link;
     let share_key = link.key.clone();
     let assets = link.assets.clone();
-    let allow_download = link.allow_download.unwrap_or(true);
+    let allow_download = match link.allow_download {
+        Some(a) => a,
+        None => {
+            return view! { <div class="error-msg">"Error: allow_download must be present"</div> }
+                .into_any()
+        }
+    };
 
-    let title = link
+    let title = match link
         .description
         .clone()
         .or_else(|| link.album.as_ref().and_then(|a| a.album_name.clone()))
-        .unwrap_or_else(|| "Gallery".to_string());
+    {
+        Some(t) => t,
+        None => return view! { <div class="error-msg">"Error: gallery title/description must be present"</div> }.into_any(),
+    };
 
     let album_description = link.album.as_ref().and_then(|a| a.description.clone());
 
@@ -427,5 +449,5 @@ fn Gallery(details: crate::server_fns::ShareDetails) -> impl IntoView {
                 else document.addEventListener('DOMContentLoaded', window.initLG);"
             </script>
         </div>
-    }
+    }.into_any()
 }
