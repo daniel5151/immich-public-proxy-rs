@@ -117,7 +117,6 @@ fn AssetTile(
 ) -> impl IntoView {
     let id = asset.id.clone();
     let id_for_selected = id.clone();
-    let id_for_slide = id.clone();
     let id_for_toggle = id.clone();
 
     let thumbnail_url = format!("/share/photo/{}/{}/thumbnail", share_key, id);
@@ -129,31 +128,7 @@ fn AssetTile(
     let flex_basis = format!("{}px", 250.0 * aspect_ratio);
 
     let is_selected = move || selected_assets.get().contains(&id_for_selected);
-
     let preview_url = format!("/share/photo/{}/{}/preview", share_key, id);
-    let download_url = format!("/share/photo/{}/{}/original", share_key, id);
-    let filename = asset
-        .original_file_name
-        .clone()
-        .unwrap_or_else(|| id.clone());
-
-    let video_attr = if is_video {
-        let video = serde_json::json!({
-            "source": [
-                {
-                    "src": format!("/share/video/{}/{}", share_key, id),
-                    "type": "video/mp4"
-                }
-            ],
-            "attributes": {
-                "playsinline": "playsinline",
-                "controls": "controls"
-            }
-        });
-        Some(serde_json::to_string(&video).unwrap())
-    } else {
-        None
-    };
 
     view! {
         <div
@@ -170,12 +145,9 @@ fn AssetTile(
                 }
             ></div>
             <a
-                attr:data-lg-id=i
-                href=move || if is_video { None } else { Some(preview_url.clone()) }
-                attr:data-video=video_attr
-                attr:data-download-url=download_url
-                attr:data-download=filename
-                attr:data-slide-name=id_for_slide
+                class="gallery-item"
+                attr:data-index=i
+                href=preview_url
             >
                 <img
                     loading="lazy"
@@ -186,7 +158,7 @@ fn AssetTile(
                 {if is_video {
                     view! { <div class="play-icon"></div> }.into_any()
                 } else {
-                    view! { <span/> }.into_any()
+                    view! { <span style="display:none" /> }.into_any()
                 }}
             </a>
         </div>
@@ -232,61 +204,46 @@ fn Gallery(details: crate::server_fns::ShareDetails) -> impl IntoView {
 
     let selected_assets = RwSignal::new(HashSet::<String>::new());
 
-    // LightGallery items array format
-    let items_array = assets.iter().map(|asset| {
-        let key = share_key.clone();
-        let preview_url = format!("/share/photo/{}/{}/preview", key, asset.id);
-        let thumbnail_url = format!("/share/photo/{}/{}/thumbnail", key, asset.id);
-        let mut download_url = format!("/share/photo/{}/{}/original", key, asset.id);
-        let mut video = serde_json::Value::Null;
+    // LightGallery items array format for dynamic mode
+    let items_array = assets
+        .iter()
+        .map(|asset| {
+            let key = share_key.clone();
+            let preview_url = format!("/share/photo/{}/{}/preview", key, asset.id);
+            let thumbnail_url = format!("/share/photo/{}/{}/thumbnail", key, asset.id);
+            let download_url = format!("/share/photo/{}/{}/original", key, asset.id);
 
-        let item_description = asset.exif_info.as_ref()
-            .and_then(|exif| exif.get("description"))
-            .and_then(|d| d.as_str())
-            .unwrap_or("")
-            .to_string();
-
-        if asset.r#type == "VIDEO" {
-            download_url = format!("/share/photo/{}/{}/original", key, asset.id);
-            video = serde_json::json!({
-                "source": [
-                    {
-                        "src": format!("/share/video/{}/{}", key, asset.id),
-                        "type": "video/mp4"
-                    }
-                ],
-                "attributes": {
-                    "playsinline": "playsinline",
-                    "controls": "controls"
-                }
-            });
-        }
-
-        let mut html = format!("<a href=\"{}\"", preview_url);
-        if asset.r#type == "VIDEO" {
-            html = format!("<a data-video='{}'", serde_json::to_string(&video).unwrap().replace("'", "&apos;"));
-        }
-        html += &format!(" data-download-url=\"{}\"", download_url);
-        if !item_description.is_empty() {
-            html += &format!(" data-sub-html=\"<p>{}</p>\"", item_description.replace("\"", "&quot;"));
-        }
-        html += &format!(" data-download=\"{}\" data-slide-name=\"{}\">", asset.original_file_name.clone().unwrap_or_else(|| asset.id.clone()), asset.id);
-        html += &format!("<img alt=\"{}\" loading=\"lazy\" src=\"{}\" onerror=\"this.closest('a').classList.add('thumb-error')\" />", item_description.replace("\"", "&quot;"), thumbnail_url);
-        if asset.r#type == "VIDEO" {
-            html += "<div class=\"play-icon\"></div>";
-        }
-        html += "</a>";
-
-        serde_json::json!({
-            "html": html,
-            "thumbnailUrl": thumbnail_url,
-            "previewUrl": preview_url
+            if asset.r#type == "VIDEO" {
+                serde_json::json!({
+                    "video": {
+                        "source": [
+                            {
+                                "src": format!("/share/video/{}/{}", key, asset.id),
+                                "type": "video/mp4"
+                            }
+                        ],
+                        "attributes": {
+                            "playsinline": true,
+                            "controls": true
+                        }
+                    },
+                    "poster": preview_url,
+                    "thumb": thumbnail_url,
+                    "downloadUrl": download_url
+                })
+            } else {
+                serde_json::json!({
+                    "src": preview_url,
+                    "thumb": thumbnail_url,
+                    "downloadUrl": download_url
+                })
+            }
         })
-    }).collect::<Vec<_>>();
+        .collect::<Vec<_>>();
 
     let items_json = serde_json::to_string(&items_array).unwrap();
     let gallery_data = format!(
-        "window.GALLERY_DATA = {{ lgConfig: {{ hideScrollbar: true, counter: false, download: true, customSlideName: true, mobileSettings: {{ controls: false, showCloseIcon: true, download: true }} }}, items: {} }};",
+        "window.GALLERY_DATA = {{ lgConfig: {{ }}, items: {} }};",
         items_json
     );
 
