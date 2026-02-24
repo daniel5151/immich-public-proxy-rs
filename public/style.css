@@ -91,26 +91,83 @@ main {
 }
 
 #lightgallery {
+    display: block;
+}
+
+.gallery-date-group {
+    display: flex;
+    flex-direction: column;
+    margin-bottom: 2rem;
+}
+
+.gallery-date-header {
+    display: flex;
+    align-items: center;
+    padding: 1rem 0 0.5rem 1rem;
+    gap: 12px;
+}
+
+.gallery-date-header:hover .date-selector,
+.date-selector.selected {
+    opacity: 1;
+}
+
+.date-selector {
+    width: 24px;
+    height: 24px;
+    border-radius: 50%;
+    border: 2px solid rgba(255, 255, 255, 0.5);
+    background: rgba(0, 0, 0, 0.2);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.2s;
+    opacity: 0;
+}
+
+.date-selector.selected {
+    background: #3b82f6;
+    border-color: #3b82f6;
+}
+
+.date-selector::after {
+    content: '✓';
+    color: white;
+    font-size: 14px;
+    display: none;
+}
+
+.date-selector.selected::after {
+    display: block;
+}
+
+.date-label {
+    font-size: 1.1rem;
+    font-weight: 500;
+}
+
+.gallery-date-items {
     display: flex;
     flex-wrap: wrap;
     gap: var(--gap);
     padding: var(--gap);
 }
 
-#lightgallery .tile-wrapper {
+.gallery-date-items .tile-wrapper {
     position: relative;
     height: 250px;
     overflow: hidden;
     background: #111;
 }
 
-#lightgallery a {
+.gallery-date-items a {
     display: block;
     width: 100%;
     height: 100%;
 }
 
-#lightgallery img {
+.gallery-date-items img {
     height: 100%;
     width: 100%;
     object-fit: cover;
@@ -281,7 +338,7 @@ main {
 }
 
 /* Prevent last row flex items from stretching to full width */
-#lightgallery::after {
+.gallery-date-items::after {
     content: '';
     flex-grow: 999999999;
 }

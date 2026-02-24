@@ -204,6 +204,37 @@ fn Gallery(details: crate::server_fns::ShareDetails) -> impl IntoView {
 
     let selected_assets = RwSignal::new(HashSet::<String>::new());
 
+    #[derive(Clone)]
+    struct AssetGroup {
+        label: String,
+        items: Vec<(usize, crate::immich::Asset)>,
+    }
+
+    let mut groups: Vec<AssetGroup> = Vec::new();
+    for (i, asset) in assets.clone().into_iter().enumerate() {
+        let date_label = match &asset.file_created_at {
+            Some(dstr) => {
+                let parsed = chrono::DateTime::parse_from_rfc3339(dstr).ok();
+                match parsed {
+                    Some(dt) => dt.format("%a, %b %-d, %Y").to_string(),
+                    None => "Unknown Date".to_string(),
+                }
+            }
+            None => "Unknown Date".to_string(),
+        };
+
+        if let Some(last) = groups.last_mut() {
+            if last.label == date_label {
+                last.items.push((i, asset));
+                continue;
+            }
+        }
+        groups.push(AssetGroup {
+            label: date_label,
+            items: vec![(i, asset)],
+        });
+    }
+
     // LightGallery items array format for dynamic mode
     let items_array = assets
         .iter()
@@ -306,20 +337,73 @@ fn Gallery(details: crate::server_fns::ShareDetails) -> impl IntoView {
 
             <div id="lightgallery">
                 <For
-                    each=move || assets.clone().into_iter().enumerate()
-                    key=|(_, a)| a.id.clone()
-                    children={
+                    each=move || groups.clone().into_iter()
+                    key=|g| g.label.clone()
+                    children=move |group| {
+                        let label = group.label.clone();
+                        let group_items = group.items.clone();
                         let s_key_for_tile = share_key.clone();
-                        move |(i, asset)| {
-                            view! {
-                                <AssetTile
-                                    i=i
-                                    asset=asset
-                                    share_key=s_key_for_tile.clone()
-                                    selected_assets=selected_assets
-                                    on_toggle=on_toggle_select
-                                />
+
+                        let has_all_selected = {
+                            let items = group_items.clone();
+                            move || {
+                                let selected = selected_assets.get();
+                                items.iter().all(|(_, a)| selected.contains(&a.id))
                             }
+                        };
+
+                        let on_group_toggle = {
+                            let items = group_items.clone();
+                            move |_| {
+                                let is_all_selected = selected_assets.with(|set| {
+                                    items.iter().all(|(_, a)| set.contains(&a.id))
+                                });
+
+                                selected_assets.update(|set| {
+                                    if is_all_selected {
+                                        for (_, a) in &items {
+                                            set.remove(&a.id);
+                                        }
+                                    } else {
+                                        for (_, a) in &items {
+                                            set.insert(a.id.clone());
+                                        }
+                                    }
+                                });
+                            }
+                        };
+
+                        view! {
+                            <div class="gallery-date-group">
+                                <div class="gallery-date-header">
+                                    <div
+                                        class="date-selector"
+                                        class:selected=has_all_selected
+                                        on:click=on_group_toggle
+                                    ></div>
+                                    <span class="date-label">{label}</span>
+                                </div>
+                                <div class="gallery-date-items">
+                                    <For
+                                        each=move || group_items.clone()
+                                        key=|(_, a)| a.id.clone()
+                                        children={
+                                            let key_clone = s_key_for_tile.clone();
+                                            move |(i, asset)| {
+                                                view! {
+                                                    <AssetTile
+                                                        i=i
+                                                        asset=asset
+                                                        share_key=key_clone.clone()
+                                                        selected_assets=selected_assets
+                                                        on_toggle=on_toggle_select
+                                                    />
+                                                }
+                                            }
+                                        }
+                                    />
+                                </div>
+                            </div>
                         }
                     }
                 />
