@@ -139,7 +139,7 @@ fn Gallery(details: crate::server_fns::ShareDetails) -> impl IntoView {
                 "source": [
                     {
                         "src": format!("/share/video/{}/{}", key, asset.id),
-                        "type": asset.original_mime_type.clone().unwrap_or_else(|| "video/mp4".to_string())
+                        "type": "video/mp4"
                     }
                 ],
                 "attributes": {
@@ -184,7 +184,7 @@ fn Gallery(details: crate::server_fns::ShareDetails) -> impl IntoView {
             <div id="header">
                 <h1>{title}</h1>
                 <div id="download-all" style={if allow_download { "" } else { "display:none" }}>
-                    <a href=format!("/share/{}/download", link.key) title="Download all">
+                    <a href=format!("/share/{}/download", link.key) rel="external" title="Download all">
                         <img src="/images/download-all.svg" height="24" width="24" alt="Download all" />
                     </a>
                 </div>
@@ -215,7 +215,7 @@ fn Gallery(details: crate::server_fns::ShareDetails) -> impl IntoView {
                             "source": [
                                 {
                                     "src": format!("/share/video/{}/{}", key, asset.id),
-                                    "type": asset.original_mime_type.clone().unwrap_or_else(|| "video/mp4".to_string())
+                                    "type": "video/mp4"
                                 }
                             ],
                             "attributes": {
