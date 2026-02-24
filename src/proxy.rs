@@ -209,61 +209,26 @@ pub mod ssr {
         let sanitized_title = title.replace(|c: char| !c.is_alphanumeric() && c != '-', "_");
         let filename = format!("{}.zip", sanitized_title);
 
-        let (w, r) = tokio::io::duplex(64 * 1024);
-        let body = Body::from_stream(tokio_util::io::ReaderStream::new(r));
+        let asset_ids: Vec<String> = share.assets.into_iter().map(|a| a.id).collect();
+        if asset_ids.is_empty() {
+            return IntoResponse::into_response(StatusCode::NOT_FOUND);
+        }
 
-        let params_owned: Vec<(String, String)> = params
-            .into_iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
-        tokio::spawn(async move {
-            use leptos;
-            use tokio_util::compat::TokioAsyncWriteCompatExt;
-            let mut zip = async_zip::tokio::write::ZipFileWriter::new(w.compat_write());
-
-            for asset in share.assets {
-                let mut p = params_owned.clone();
-                p.push(("size".to_string(), "original".to_string()));
-                let p_refs: Vec<(&str, &str)> =
-                    p.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-
-                let original_name = asset.original_file_name.unwrap_or_else(|| asset.id.clone());
-                let ext = if !original_name.contains('.') {
-                    if asset.r#type == "VIDEO" {
-                        ".mp4"
-                    } else {
-                        ".jpg"
-                    }
-                } else {
-                    ""
-                };
-                let file_name = format!("{}{}", original_name, ext);
-
-                let builder = async_zip::ZipEntryBuilder::new(
-                    file_name.into(),
-                    async_zip::Compression::Deflate,
-                );
-
-                let asset_url =
-                    client.build_url(&format!("/assets/{}/original", asset.id), &p_refs);
-                if let Ok(mut asset_res) = client.http_client.get(&asset_url).send().await {
-                    if asset_res.status().is_success() {
-                        if let Ok(mut entry_writer) = zip.write_entry_stream(builder).await {
-                            while let Ok(Some(chunk)) = asset_res.chunk().await {
-                                use futures_util::io::AsyncWriteExt;
-                                if entry_writer.write_all(&chunk).await.is_err() {
-                                    break;
-                                }
-                            }
-                            let _ = entry_writer.close().await;
-                        }
-                    }
-                }
-            }
-            if let Err(e) = zip.close().await {
-                leptos::logging::log!("Zip close error: {:?}", e);
-            }
+        let payload = serde_json::json!({
+            "assetIds": asset_ids
         });
+
+        let download_url = client.build_url("/download/archive", &params);
+        let res = match client
+            .http_client
+            .post(&download_url)
+            .json(&payload)
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => r,
+            _ => return IntoResponse::into_response(StatusCode::INTERNAL_SERVER_ERROR),
+        };
 
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -278,6 +243,6 @@ pub mod ssr {
                 .unwrap(),
         );
 
-        (headers, body).into_response()
+        (headers, Body::from_stream(res.bytes_stream())).into_response()
     }
 }
