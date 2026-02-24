@@ -95,18 +95,13 @@ fn SharePage() -> impl IntoView {
 #[component]
 fn Password(required_key: String) -> impl IntoView {
     view! {
-        <Stylesheet href="/pico.min.css"/>
-        <main class="container">
-            <div class="grid">
-                <div></div>
-                <div>
-                    <form id="unlock" method="post" action="/share/unlock">
-                        <input type="password" name="password" placeholder="Password" aria-label="Password" required autofocus />
-                        <input type="hidden" name="key" value=required_key.clone() />
-                        <button type="submit">"Unlock"</button>
-                    </form>
-                </div>
-                <div></div>
+        <main class="container" style="display:flex;justify-content:center;align-items:center;height:100vh;flex-direction:column;">
+            <div style="background:#333;padding:2rem;border-radius:8px;box-shadow:0 4px 6px rgba(0,0,0,0.1);text-align:center;">
+                <form id="unlock" method="post" action="/share/unlock" style="display:flex;flex-direction:column;gap:1rem;">
+                    <input type="password" name="password" placeholder="Password" aria-label="Password" required autofocus style="padding:0.5rem;font-size:1rem;border:1px solid #555;border-radius:4px;background:#222;color:#fff;" />
+                    <input type="hidden" name="key" value=required_key.clone() />
+                    <button type="submit" style="padding:0.5rem 1rem;font-size:1rem;background:#007bff;color:#fff;border:none;border-radius:4px;cursor:pointer;">"Unlock"</button>
+                </form>
             </div>
         </main>
     }
@@ -139,7 +134,7 @@ fn Gallery(details: crate::server_fns::ShareDetails) -> impl IntoView {
             .to_string();
 
         if asset.r#type == "VIDEO" {
-            download_url = format!("/share/video/{}/{}", key, asset.id);
+            download_url = format!("/share/photo/{}/{}/original", key, asset.id);
             video = serde_json::json!({
                 "source": [
                     {
@@ -233,17 +228,13 @@ fn Gallery(details: crate::server_fns::ShareDetails) -> impl IntoView {
                         "".to_string()
                     };
 
-                    let download_url = if is_video {
-                        format!("/share/video/{}/{}", key, asset.id)
-                    } else {
-                        format!("/share/photo/{}/{}/original", key, asset.id)
-                    };
+                    let download_url = format!("/share/photo/{}/{}/original", key, asset.id);
                     let filename = asset.original_file_name.clone().unwrap_or_else(|| asset.id.clone());
 
                     let item_description_alt = item_description.clone();
                     view! {
                         <a href={if is_video { None } else { Some(preview_url) }} rel="external" data-video={if is_video { Some(video_attr) } else { None }} data-download-url=download_url data-download=filename data-slide-name=asset.id data-sub-html={if !item_description.is_empty() { Some(format!("<p>{}</p>", item_description)) } else { None }}>
-                            <img loading="lazy" src=thumbnail_url alt=item_description_alt />
+                            <img loading="lazy" src=thumbnail_url alt=item_description_alt onerror="this.closest('a').classList.add('thumb-error')" />
                             {if is_video { view!{<div class="play-icon"></div>}.into_any() } else { view!{<span/>}.into_any() }}
                         </a>
                     }

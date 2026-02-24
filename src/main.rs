@@ -20,7 +20,7 @@ async fn main() {
         )
         .route(
             "/share/photo/{key}/{id}",
-            axum::routing::get(rs::proxy::ssr::proxy_photo),
+            axum::routing::get(rs::proxy::ssr::proxy_photo_no_size),
         )
         .route(
             "/share/video/{key}/{id}",
@@ -29,6 +29,10 @@ async fn main() {
         .route(
             "/share/unlock",
             axum::routing::post(rs::proxy::ssr::unlock_share_handler),
+        )
+        .route(
+            "/share/{key}/download",
+            axum::routing::get(rs::proxy::ssr::download_all),
         )
         .leptos_routes(&leptos_options, routes, {
             let leptos_options = leptos_options.clone();

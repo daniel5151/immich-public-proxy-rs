@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 pub struct ShareDetails {
     pub link: SharedLink,
     pub password_required: bool,
+    pub public_base_url: String,
 }
 
 #[server(GetShareDetails, "/api")]
@@ -14,6 +15,24 @@ pub async fn get_share_details(
     password: Option<String>,
 ) -> Result<ShareDetails, ServerFnError> {
     use crate::immich::ssr::ImmichClient;
+
+    let (host, proto) = if let Ok(headers) = leptos_axum::extract::<axum::http::HeaderMap>().await {
+        let h = headers
+            .get("host")
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("localhost")
+            .to_string();
+        let p = headers
+            .get("x-forwarded-proto")
+            .and_then(|p| p.to_str().ok())
+            .unwrap_or("http")
+            .to_string();
+        (h, p)
+    } else {
+        ("localhost".to_string(), "http".to_string())
+    };
+    let public_base_url =
+        std::env::var("PUBLIC_BASE_URL").unwrap_or_else(|_| format!("{}://{}", proto, host));
 
     // Check cookie for password if not provided
     let password = if password.is_none() {
@@ -63,6 +82,7 @@ pub async fn get_share_details(
                         key_type: None,
                     },
                     password_required: true,
+                    public_base_url,
                 });
             }
         }
@@ -109,6 +129,7 @@ pub async fn get_share_details(
         return Ok(ShareDetails {
             link,
             password_required: false,
+            public_base_url,
         });
     }
 
