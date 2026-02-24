@@ -11,6 +11,8 @@ pub struct Asset {
     pub db_id: Option<String>,
     pub file_created_at: Option<String>,
     pub exif_info: Option<serde_json::Value>,
+    pub width: Option<i32>,
+    pub height: Option<i32>,
     // the proxy augments assets:
     #[serde(skip)]
     pub password: Option<String>,

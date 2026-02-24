@@ -1,56 +1,182 @@
-html {
-    background: #191919;
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+
+:root {
+    --bg-color: #000000;
+    --text-color: #ffffff;
+    --accent-color: #3b82f6;
+    --header-height: 80px;
+    --gap: 4px;
 }
 
-body,
-main {
+html,
+body {
+    background: var(--bg-color);
+    color: var(--text-color);
+    font-family: 'Inter', system-ui, -apple-system, sans-serif;
     margin: 0;
     padding: 0;
+}
+
+main {
+    padding-top: var(--header-height);
+}
+
+#header {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: var(--header-height);
+    background: rgba(0, 0, 0, 0.8);
+    backdrop-filter: blur(10px);
+    z-index: 100;
+    display: flex;
+    align-items: center;
+    padding: 0 2rem;
+    box-sizing: border-box;
+}
+
+#header h1 {
+    font-size: 2.5rem;
+    font-weight: 700;
+    margin: 0;
+    letter-spacing: -0.02em;
+}
+
+#album-description {
+    padding: 1rem 2rem;
+    opacity: 0.7;
+}
+
+#album-description h2 {
+    font-size: 1.1rem;
+    font-weight: 400;
+    margin: 0;
+}
+
+#lightgallery {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--gap);
+    padding: var(--gap);
 }
 
 #lightgallery a {
     position: relative;
-    display: inline-block;
-    text-decoration: none;
-    margin: 0;
-    padding: 0;
+    height: 250px;
+    flex-grow: 1;
+    overflow: hidden;
     cursor: pointer;
+    background: #111;
 }
 
 #lightgallery img {
-    max-height: 250px;
-    margin: 4px;
+    height: 100%;
+    width: 100%;
+    object-fit: cover;
+    transition: transform 0.3s ease;
 }
 
-@media (max-width: 800px) {
-    #lightgallery a {
-        width: calc(100vw / 3 - 10px);
-        height: calc(100vw / 3 - 10px);
-        overflow: hidden;
-    }
-
-    #lightgallery img {
-        width: 100%;
-        height: 100%;
-        object-fit: cover;
-        object-position: center;
-    }
+#lightgallery a:hover img {
+    transform: scale(1.05);
 }
 
-@media (min-width: 801px) {
-    #lightgallery a.thumb-error {
-        width: 250px;
-        height: 250px;
-        margin: 4px;
-    }
+/* Selection Bar */
+#selection-bar {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: var(--header-height);
+    background: #2563eb;
+    color: white;
+    z-index: 1000;
+    display: flex;
+    align-items: center;
+    padding: 0 2rem;
+    transform: translateY(-100%);
+    transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
 }
 
-#lightgallery a.thumb-error {
-    background: #2a2a2a;
+#selection-bar.active {
+    transform: translateY(0);
 }
 
-#lightgallery a.thumb-error img {
+.selection-count {
+    font-size: 1.25rem;
+    font-weight: 600;
+    flex-grow: 1;
+}
+
+.selection-actions {
+    display: flex;
+    gap: 1rem;
+}
+
+.icon-btn {
+    background: transparent;
+    border: none;
+    color: white;
+    cursor: pointer;
+    padding: 8px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: background 0.2s;
+}
+
+.icon-btn:hover {
+    background: rgba(255, 255, 255, 0.1);
+}
+
+/* Checkbox overlay */
+.tile-selector {
+    position: absolute;
+    top: 8px;
+    left: 8px;
+    width: 24px;
+    height: 24px;
+    border-radius: 50%;
+    border: 2px solid rgba(255, 255, 255, 0.5);
+    background: rgba(0, 0, 0, 0.2);
+    z-index: 10;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.2s;
+    opacity: 0;
+}
+
+#lightgallery a:hover .tile-selector,
+#lightgallery a.selected .tile-selector {
+    opacity: 1;
+}
+
+#lightgallery a.selected .tile-selector {
+    background: #3b82f6;
+    border-color: #3b82f6;
+}
+
+.tile-selector::after {
+    content: '✓';
+    color: white;
+    font-size: 14px;
     display: none;
+}
+
+#lightgallery a.selected .tile-selector::after {
+    display: block;
+}
+
+#lightgallery a.selected::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background: rgba(59, 130, 246, 0.1);
+    border: 3px solid #3b82f6;
+    pointer-events: none;
 }
 
 .play-icon {
@@ -58,73 +184,57 @@ main {
     top: 50%;
     left: 50%;
     transform: translate(-50%, -50%);
-    width: 50px;
-    height: 50px;
-    background-image: url('/images/play.png');
-    background-size: contain;
-    background-repeat: no-repeat;
-    opacity: 0.5;
-}
-
-#lightgallery a:has(.play-icon):hover .play-icon {
-    opacity: 1;
-}
-
-#password {
-    color: white;
-}
-
-#header,
-#album-description {
-    font-family: system-ui, "Segoe UI", Roboto, Oxygen, Ubuntu, Cantarell, Helvetica, Arial, "Helvetica Neue", sans-serif;
-    color: white;
-}
-
-#header {
-    width: 100%;
+    width: 48px;
+    height: 48px;
+    background: rgba(0, 0, 0, 0.5);
+    border-radius: 50%;
     display: flex;
+    align-items: center;
+    justify-content: center;
+    color: white;
 }
 
-#header h1 {
-    font-size: 18pt;
-    font-weight: bold;
-    margin: 4px;
-}
-
-#album-description h2 {
-    font-size: 12pt;
-    font-weight: normal;
-    font-style: italic;
-    margin: 4px;
-    white-space: pre-wrap;
-}
-
-#download-all {
-    margin: auto 4px auto auto;
+.play-icon::after {
+    content: '';
+    width: 0;
+    height: 0;
+    border-top: 10px solid transparent;
+    border-bottom: 10px solid transparent;
+    border-left: 15px solid white;
+    margin-left: 5px;
 }
 
 #loading-spinner {
-    text-align: center;
-    margin: 75px 0;
+    display: flex;
+    justify-content: center;
+    padding: 4rem;
 }
 
 .loader {
     width: 48px;
     height: 48px;
-    border: 5px solid #888;
-    border-bottom-color: transparent;
+    border: 4px solid #333;
+    border-top-color: #3b82f6;
     border-radius: 50%;
-    display: inline-block;
-    box-sizing: border-box;
-    animation: rotation 1s linear infinite;
+    animation: spin 1s linear infinite;
 }
 
-@keyframes rotation {
-    0% {
-        transform: rotate(0deg);
+@keyframes spin {
+    to {
+        transform: rotate(360deg);
+    }
+}
+
+@media (max-width: 640px) {
+    #header h1 {
+        font-size: 1.5rem;
     }
 
-    100% {
-        transform: rotate(360deg);
+    #header {
+        padding: 0 1rem;
+    }
+
+    #lightgallery a {
+        height: 150px;
     }
 }

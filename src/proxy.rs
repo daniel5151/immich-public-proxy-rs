@@ -168,7 +168,16 @@ pub mod ssr {
         builder.body(Body::from_stream(res.bytes_stream())).unwrap()
     }
 
-    pub async fn download_all(headers: HeaderMap, Path(key): Path<String>) -> impl IntoResponse {
+    #[derive(Deserialize)]
+    pub struct DownloadQuery {
+        pub asset_ids: Option<String>,
+    }
+
+    pub async fn download_all(
+        headers: HeaderMap,
+        Path(key): Path<String>,
+        axum::extract::Query(query): axum::extract::Query<DownloadQuery>,
+    ) -> impl IntoResponse {
         let client = ImmichClient::new();
         let cookie_str = headers
             .get(axum::http::header::COOKIE)
@@ -217,7 +226,12 @@ pub mod ssr {
         let sanitized_title = title.replace(|c: char| !c.is_alphanumeric() && c != '-', "_");
         let filename = format!("{}.zip", sanitized_title);
 
-        let asset_ids: Vec<String> = share.assets.into_iter().map(|a| a.id).collect();
+        let mut asset_ids: Vec<String> = if let Some(ids_str) = query.asset_ids {
+            ids_str.split(',').map(|s| s.to_string()).collect()
+        } else {
+            share.assets.into_iter().map(|a| a.id).collect()
+        };
+
         if asset_ids.is_empty() {
             return IntoResponse::into_response(StatusCode::NOT_FOUND);
         }
