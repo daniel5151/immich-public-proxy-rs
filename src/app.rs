@@ -1,5 +1,5 @@
 use leptos::prelude::*;
-use leptos_meta::{provide_meta_context, Body, MetaTags, Stylesheet, Title};
+use leptos_meta::{provide_meta_context, Body, Meta, MetaTags, Stylesheet, Title};
 use leptos_router::{
     components::{Route, Router, Routes},
     ParamSegment, StaticSegment,
@@ -45,8 +45,8 @@ pub fn App() -> impl IntoView {
             <main>
                 <Routes fallback=|| "Page not found.".into_view()>
                     <Route path=StaticSegment("") view=HomePage/>
-                    <Route path=(StaticSegment("share"), ParamSegment("key")) view=SharePage/>
-                    <Route path=(StaticSegment("s"), ParamSegment("key")) view=SharePage/>
+                    <Route path=(StaticSegment("share"), ParamSegment("key")) view=SharePage ssr=leptos_router::SsrMode::Async/>
+                    <Route path=(StaticSegment("s"), ParamSegment("key")) view=SharePage ssr=leptos_router::SsrMode::Async/>
                 </Routes>
             </main>
         </Router>
@@ -225,6 +225,17 @@ fn Gallery(details: crate::server_fns::ShareDetails) -> impl IntoView {
     };
 
     let album_description = link.album.as_ref().and_then(|a| a.description.clone());
+    let public_base_url = details.public_base_url.trim_end_matches('/').to_string();
+    let current_url = format!("{}/share/{}", public_base_url, share_key);
+    let cover_image_url = assets
+        .first()
+        .map(|a| {
+            format!(
+                "{}/share/photo/{}/{}/preview",
+                public_base_url, share_key, a.id
+            )
+        })
+        .unwrap_or_default();
 
     let selected_assets = RwSignal::new(HashSet::<String>::new());
 
@@ -329,6 +340,18 @@ fn Gallery(details: crate::server_fns::ShareDetails) -> impl IntoView {
     let is_selection_mode = move || !selected_assets.get().is_empty();
 
     view! {
+        <Title text=title.clone() />
+        <Meta name="og:title" content=title.clone() />
+        <Meta name="twitter:title" content=title.clone() />
+        <Meta name="description" content=album_description.clone().unwrap_or_default() />
+        <Meta name="og:description" content=album_description.clone().unwrap_or_default() />
+        <Meta name="twitter:description" content=album_description.clone().unwrap_or_default() />
+        <Meta name="og:image" content=cover_image_url.clone() />
+        <Meta name="twitter:image" content=cover_image_url.clone() />
+        <Meta name="twitter:card" content="summary_large_image".to_string() />
+
+        <Meta name="og:url" content=current_url.clone() />
+
         <Body attr:class=move || if is_selection_mode() { "selection-mode" } else { "" } />
         <div id="gallery-root">
             <div id="selection-bar" class:active=move || !selected_assets.get().is_empty()>
