@@ -1,11 +1,38 @@
 #[cfg(feature = "ssr")]
+mod api;
+mod app;
+mod immich_client;
+#[cfg(feature = "ssr")]
+mod proxy;
+
+#[cfg(feature = "ssr")]
 #[tokio::main]
 async fn main() {
+    use crate::app::*;
+    use crate::proxy::ProxyRoutes as _;
     use axum::Router;
-    use immich_public_proxy_rs::app::*;
     use leptos::logging::log;
     use leptos::prelude::*;
     use leptos_axum::{LeptosRoutes, generate_route_list};
+
+    fn shell(options: LeptosOptions) -> impl IntoView {
+        use leptos_meta::MetaTags;
+        view! {
+            <!DOCTYPE html>
+            <html lang="en">
+                <head>
+                    <meta charset="utf-8"/>
+                    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1.0"/>
+                    <AutoReload options=options.clone() />
+                    <HydrationScripts options/>
+                    <MetaTags/>
+                </head>
+                <body>
+                    <App/>
+                </body>
+            </html>
+        }
+    }
 
     let conf = get_configuration(None).unwrap();
     let addr = conf.leptos_options.site_addr;
@@ -14,26 +41,7 @@ async fn main() {
     let routes = generate_route_list(App);
 
     let app = Router::new()
-        .route(
-            "/share/photo/{key}/{id}/{size}",
-            axum::routing::get(immich_public_proxy_rs::proxy::proxy_photo),
-        )
-        .route(
-            "/share/photo/{key}/{id}",
-            axum::routing::get(immich_public_proxy_rs::proxy::proxy_photo_no_size),
-        )
-        .route(
-            "/share/video/{key}/{id}",
-            axum::routing::get(immich_public_proxy_rs::proxy::proxy_video),
-        )
-        .route(
-            "/share/unlock",
-            axum::routing::post(immich_public_proxy_rs::proxy::unlock_share_handler),
-        )
-        .route(
-            "/share/{key}/download",
-            axum::routing::get(immich_public_proxy_rs::proxy::download_all),
-        )
+        .proxy_routes()
         .leptos_routes(&leptos_options, routes, {
             let leptos_options = leptos_options.clone();
             move || shell(leptos_options.clone())
@@ -51,8 +59,4 @@ async fn main() {
 }
 
 #[cfg(not(feature = "ssr"))]
-pub fn main() {
-    // no client-side main function
-    // unless we want this to work with e.g., Trunk for pure client-side testing
-    // see lib.rs for hydration function instead
-}
+pub fn main() {} // hydration entry via wasm-bindgen in lib.rs

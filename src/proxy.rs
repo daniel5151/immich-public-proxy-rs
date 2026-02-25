@@ -1,4 +1,4 @@
-use crate::immich::{ImmichClient, get_cookie_password};
+use crate::immich_client::client::{ImmichClient, get_cookie_password};
 use axum::{
     body::Body,
     extract::{Form, Path},
@@ -6,6 +6,26 @@ use axum::{
     response::{IntoResponse, Redirect},
 };
 use serde::Deserialize;
+
+pub trait ProxyRoutes {
+    fn proxy_routes(self) -> Self;
+}
+
+impl<T: Clone + Send + Sync + 'static> ProxyRoutes for axum::Router<T> {
+    fn proxy_routes(self) -> Self {
+        self.route(
+            "/share/photo/{key}/{id}/{size}",
+            axum::routing::get(proxy_photo),
+        )
+        .route(
+            "/share/photo/{key}/{id}",
+            axum::routing::get(proxy_photo_no_size),
+        )
+        .route("/share/video/{key}/{id}", axum::routing::get(proxy_video))
+        .route("/share/unlock", axum::routing::post(unlock_share_handler))
+        .route("/share/{key}/download", axum::routing::get(download_all))
+    }
+}
 
 #[derive(Deserialize)]
 pub struct UnlockPayload {
@@ -165,7 +185,7 @@ pub async fn download_all(
 
     let url = client.build_url("/shared-links/me", &params);
     let res = client.http_client.get(&url).send().await;
-    let mut share: crate::immich::SharedLink = match res {
+    let mut share: crate::immich_client::model::SharedLink = match res {
         Ok(r) if r.status().is_success() => match r.json().await {
             Ok(data) => data,
             Err(_) => return IntoResponse::into_response(StatusCode::INTERNAL_SERVER_ERROR),
@@ -179,7 +199,8 @@ pub async fn download_all(
         if let Some(ref album) = share.album {
             let album_url = client.build_url(&format!("/albums/{}", album.id), &params);
             if let Ok(album_res) = client.http_client.get(&album_url).send().await {
-                if let Ok(album_data) = album_res.json::<crate::immich::Album>().await {
+                if let Ok(album_data) = album_res.json::<crate::immich_client::model::Album>().await
+                {
                     share.assets = album_data.assets;
                 }
             }

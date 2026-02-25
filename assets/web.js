@@ -13,6 +13,8 @@ class LGallery {
     const lgConfig = Object.assign({
       plugins: [lgZoom, lgThumbnail, lgVideo, lgFullscreen, lgHash],
       speed: 500,
+      // This license key was graciously provided by LightGallery under their
+      // GPLv3 open-source project license:
       licenseKey: '8FFA6495-676C4D30-8BFC54B6-4D0A6CEC',
       selector: '.gallery-item',
       download: true,

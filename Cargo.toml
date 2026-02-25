@@ -8,6 +8,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 axum = { version = "0.8.0", optional = true, features = ["macros"] }
+cfg-if = "1.0.4"
 chrono = "0.4.44"
 console_error_panic_hook = { version = "0.1", optional = true }
 leptos = { version = "0.8.0" }
@@ -56,7 +57,12 @@ site-root = "target/site"
 # Defaults to pkg
 site-pkg-dir = "pkg"
 
-# Assets source dir. All files found here will be copied and synchronized to site-root.
+# The source style file. If it ends with _.sass_ or _.scss_ then it will be compiled by `dart-sass`
+# into CSS and processed by lightning css. When release is set, then it will also be minified.
+#
+# Optional. Env: LEPTOS_STYLE_FILE.
+style-file = "style/main.css"
+
 # The assets-dir cannot have a sub directory with the same name/path as site-pkg-dir.
 #
 # Optional. Env: LEPTOS_ASSETS_DIR.

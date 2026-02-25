@@ -1,4 +1,5 @@
-use crate::immich::SharedLink;
+use crate::immich_client::model::SharedLink;
+
 use leptos::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -14,8 +15,6 @@ pub async fn get_share_details(
     key: String,
     password: Option<String>,
 ) -> Result<ShareDetails, ServerFnError> {
-    use crate::immich::ImmichClient;
-
     let headers = leptos_axum::extract::<axum::http::HeaderMap>()
         .await
         .map_err(|_| ServerFnError::new("Failed to extract headers"))?;
@@ -34,9 +33,10 @@ pub async fn get_share_details(
         std::env::var("PUBLIC_BASE_URL").unwrap_or_else(|_| format!("{}://{}", proto, host));
 
     // Check cookie for password if not provided
-    let password = password.or_else(|| crate::immich::get_cookie_password(&headers, &key));
+    let password =
+        password.or_else(|| crate::immich_client::client::get_cookie_password(&headers, &key));
 
-    let client = ImmichClient::new();
+    let client = crate::immich_client::client::ImmichClient::new();
     let params = if let Some(p) = &password {
         vec![("key", key.as_str()), ("password", p.as_str())]
     } else {
@@ -61,7 +61,6 @@ pub async fn get_share_details(
                         assets: vec![],
                         album: None,
                         password: None,
-                        key_type: None,
                     },
                     password_required: true,
                     public_base_url,
@@ -79,7 +78,9 @@ pub async fn get_share_details(
                 let album_url = client.build_url(&format!("/albums/{}", album.id), &params);
                 let album_res = client.http_client.get(&album_url).send().await?;
                 if album_res.status().is_success() {
-                    if let Ok(mut album_data) = album_res.json::<crate::immich::Album>().await {
+                    if let Ok(mut album_data) =
+                        album_res.json::<crate::immich_client::model::Album>().await
+                    {
                         for asset in &mut album_data.assets {
                             asset.key = Some(key.clone());
                             asset.password = password.clone();

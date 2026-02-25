@@ -1,28 +1,11 @@
+use crate::api::get_share_details::{ShareDetails, get_share_details};
 use leptos::prelude::*;
-use leptos_meta::{Body, Meta, MetaTags, Stylesheet, Title, provide_meta_context};
+use leptos_meta::{Body, Meta, Stylesheet, Title, provide_meta_context};
 use leptos_router::{
     ParamSegment, StaticSegment,
     components::{Route, Router, Routes},
 };
 use std::collections::HashSet;
-
-pub fn shell(options: LeptosOptions) -> impl IntoView {
-    view! {
-        <!DOCTYPE html>
-        <html lang="en">
-            <head>
-                <meta charset="utf-8"/>
-                <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1.0"/>
-                <AutoReload options=options.clone() />
-                <HydrationScripts options/>
-                <MetaTags/>
-            </head>
-            <body>
-                <App/>
-            </body>
-        </html>
-    }
-}
 
 #[component]
 pub fn App() -> impl IntoView {
@@ -30,10 +13,9 @@ pub fn App() -> impl IntoView {
 
     view! {
         <Stylesheet id="leptos" href="/pkg/immich-public-proxy-rs.css"/>
-        <Stylesheet href="/style.css"/>
+        <script src="/web.js"/>
 
         <Stylesheet href="/lg/lightgallery-bundle.min.css"/>
-        <script src="/web.js"/>
         <script src="/lg/lightgallery.min.js"/>
         <script src="/lg/lg-fullscreen.min.js"/>
         <script src="/lg/lg-thumbnail.min.js"/>
@@ -47,6 +29,7 @@ pub fn App() -> impl IntoView {
             <main>
                 <Routes fallback=|| "Page not found.".into_view()>
                     <Route path=StaticSegment("") view=HomePage/>
+                    <Route path=(StaticSegment("s"), ParamSegment("key")) view=SharePage ssr=leptos_router::SsrMode::Async/>
                     <Route path=(StaticSegment("share"), ParamSegment("key")) view=SharePage ssr=leptos_router::SsrMode::Async/>
                 </Routes>
             </main>
@@ -70,7 +53,7 @@ fn SharePage() -> impl IntoView {
     let params = leptos_router::hooks::use_params_map();
     let key = move || params.with(|p| p.get("key").expect("key must be present"));
 
-    let share_res = Resource::new(key, |k| crate::server_fns::get_share_details(k, None));
+    let share_res = Resource::new(key, |k| get_share_details(k, None));
 
     view! {
         <Suspense fallback=move || view! { <div id="loading-spinner"><span class="loader"></span></div> }>
@@ -111,7 +94,7 @@ fn Password(required_key: String) -> impl IntoView {
 #[component]
 fn AssetTile(
     i: usize,
-    asset: crate::immich::Asset,
+    asset: crate::immich_client::model::Asset,
     share_key: String,
     selected_assets: RwSignal<HashSet<String>>,
     on_toggle: ipp_callback::Callback<String>,
@@ -204,7 +187,7 @@ mod ipp_callback {
 }
 
 #[component]
-fn Gallery(details: crate::server_fns::ShareDetails) -> impl IntoView {
+fn Gallery(details: ShareDetails) -> impl IntoView {
     let link = details.link;
     let share_key = link.key.clone();
     let assets = link.assets.clone();
@@ -243,7 +226,7 @@ fn Gallery(details: crate::server_fns::ShareDetails) -> impl IntoView {
     #[derive(Clone)]
     struct AssetGroup {
         label: String,
-        items: Vec<(usize, crate::immich::Asset)>,
+        items: Vec<(usize, crate::immich_client::model::Asset)>,
     }
 
     let mut groups: Vec<AssetGroup> = Vec::new();
