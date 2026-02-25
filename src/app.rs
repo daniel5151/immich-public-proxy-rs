@@ -1,8 +1,8 @@
 use leptos::prelude::*;
-use leptos_meta::{provide_meta_context, Body, Meta, MetaTags, Stylesheet, Title};
+use leptos_meta::{Body, Meta, MetaTags, Stylesheet, Title, provide_meta_context};
 use leptos_router::{
-    components::{Route, Router, Routes},
     ParamSegment, StaticSegment,
+    components::{Route, Router, Routes},
 };
 use std::collections::HashSet;
 
@@ -29,8 +29,9 @@ pub fn App() -> impl IntoView {
     provide_meta_context();
 
     view! {
-        <Stylesheet id="leptos" href="/pkg/rs.css"/>
+        <Stylesheet id="leptos" href="/pkg/immich-public-proxy-rs.css"/>
         <Stylesheet href="/style.css"/>
+
         <Stylesheet href="/lg/lightgallery-bundle.min.css"/>
         <script src="/web.js"/>
         <script src="/lg/lightgallery.min.js"/>
@@ -39,6 +40,7 @@ pub fn App() -> impl IntoView {
         <script src="/lg/lg-video.min.js"/>
         <script src="/lg/lg-zoom.min.js"/>
         <script src="/lg/lg-hash.min.js"/>
+
         <Title text="Immich Public Proxy"/>
 
         <Router>
@@ -46,7 +48,6 @@ pub fn App() -> impl IntoView {
                 <Routes fallback=|| "Page not found.".into_view()>
                     <Route path=StaticSegment("") view=HomePage/>
                     <Route path=(StaticSegment("share"), ParamSegment("key")) view=SharePage ssr=leptos_router::SsrMode::Async/>
-                    <Route path=(StaticSegment("s"), ParamSegment("key")) view=SharePage ssr=leptos_router::SsrMode::Async/>
                 </Routes>
             </main>
         </Router>
@@ -126,14 +127,14 @@ fn AssetTile(
         Some(w) => w as f32,
         None => {
             return view! { <div class="error-msg">"Error: asset width must be present"</div> }
-                .into_any()
+                .into_any();
         }
     };
     let height = match asset.height {
         Some(h) => h as f32,
         None => {
             return view! { <div class="error-msg">"Error: asset height must be present"</div> }
-                .into_any()
+                .into_any();
         }
     };
     let aspect_ratio = width / height;
@@ -211,7 +212,7 @@ fn Gallery(details: crate::server_fns::ShareDetails) -> impl IntoView {
         Some(a) => a,
         None => {
             return view! { <div class="error-msg">"Error: allow_download must be present"</div> }
-                .into_any()
+                .into_any();
         }
     };
 
@@ -246,10 +247,11 @@ fn Gallery(details: crate::server_fns::ShareDetails) -> impl IntoView {
     }
 
     let mut groups: Vec<AssetGroup> = Vec::new();
-    for (i, asset) in assets.clone().into_iter().enumerate() {
+    for (i, asset) in assets.iter().enumerate() {
         let date_label = match &asset.file_created_at {
             Some(dstr) => {
-                let parsed = chrono::DateTime::parse_from_rfc3339(dstr).ok();
+                let parsed: Option<chrono::DateTime<chrono::FixedOffset>> =
+                    chrono::DateTime::parse_from_rfc3339(dstr).ok();
                 match parsed {
                     Some(dt) => dt.format("%a, %b %-d, %Y").to_string(),
                     None => "Unknown Date".to_string(),
@@ -260,13 +262,13 @@ fn Gallery(details: crate::server_fns::ShareDetails) -> impl IntoView {
 
         if let Some(last) = groups.last_mut() {
             if last.label == date_label {
-                last.items.push((i, asset));
+                last.items.push((i, asset.clone()));
                 continue;
             }
         }
         groups.push(AssetGroup {
             label: date_label,
-            items: vec![(i, asset)],
+            items: vec![(i, asset.clone())],
         });
     }
 

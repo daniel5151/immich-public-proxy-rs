@@ -1,4 +1,4 @@
-use crate::immich::ImmichClient;
+use crate::immich::{ImmichClient, get_cookie_password};
 use axum::{
     body::Body,
     extract::{Form, Path},
@@ -6,20 +6,6 @@ use axum::{
     response::{IntoResponse, Redirect},
 };
 use serde::Deserialize;
-
-fn get_cookie_password(headers: &HeaderMap, key: &str) -> Option<String> {
-    headers
-        .get(axum::http::header::COOKIE)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|cookie_str| {
-            let prefix = format!("immich_pwd_{}=", key);
-            cookie_str
-                .split(';')
-                .map(|s| s.trim())
-                .find(|s| s.starts_with(&prefix))
-                .map(|s| s[prefix.len()..].to_string())
-        })
-}
 
 #[derive(Deserialize)]
 pub struct UnlockPayload {

@@ -1,51 +1,41 @@
 [package]
-name = "rs"
+name = "immich-public-proxy-rs"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-leptos = { version = "0.8.0" }
-leptos_router = { version = "0.8.0" }
 axum = { version = "0.8.0", optional = true, features = ["macros"] }
+chrono = "0.4.44"
 console_error_panic_hook = { version = "0.1", optional = true }
+leptos = { version = "0.8.0" }
 leptos_axum = { version = "0.8.0", optional = true }
 leptos_meta = { version = "0.8.0" }
-tokio = { version = "1", features = ["io-util", "rt-multi-thread"], optional = true }
-wasm-bindgen = { version = "0.2.106", optional = true }
+leptos_router = { version = "0.8.0" }
 reqwest = { version = "0.12", optional = true, features = ["json", "stream"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
-dotenvy = { version = "0.15", optional = true }
-tower-cookies = { version = "0.10", optional = true }
-dayjs = { version = "0.2.2", optional = true }
-chrono = "0.4.44"
-aes-gcm = { version = "0.10.3", optional = true }
-base64 = { version = "0.22", optional = true }
+tokio = { version = "1", features = ["io-util", "rt-multi-thread"], optional = true }
 urlencoding = "2.1.3"
+wasm-bindgen = { version = "0.2.106", optional = true }
 
 [features]
 hydrate = [
-    "leptos/hydrate",
     "dep:console_error_panic_hook",
     "dep:wasm-bindgen",
+    "leptos/hydrate",
 ]
 ssr = [
     "dep:axum",
-    "dep:tokio",
     "dep:leptos_axum",
-    "leptos/ssr",
+    "dep:reqwest",
+    "dep:tokio",
     "leptos_meta/ssr",
     "leptos_router/ssr",
-    "dep:reqwest",
-    "dep:aes-gcm",
-    "dep:base64",
-    "dep:tower-cookies",
-    "dep:dotenvy"
+    "leptos/ssr",
 ]
-dayjs = ["dep:dayjs"]
 
 # Defines a size-optimized profile for the WASM bundle in release mode
 [profile.wasm-release]
@@ -57,7 +47,7 @@ panic = "abort"
 
 [package.metadata.leptos]
 # The name used by wasm-bindgen/cargo-leptos for the JS/WASM bundle. Defaults to the crate name
-output-name = "rs"
+output-name = "immich-public-proxy-rs"
 
 # The site root folder is where cargo-leptos generate all output. WARNING: all content of this folder will be erased on a rebuild. Use it in your server setup.
 site-root = "target/site"
@@ -70,7 +60,7 @@ site-pkg-dir = "pkg"
 # The assets-dir cannot have a sub directory with the same name/path as site-pkg-dir.
 #
 # Optional. Env: LEPTOS_ASSETS_DIR.
-assets-dir = "public"
+assets-dir = "assets"
 
 # The IP and port (ex: 127.0.0.1:3000) where the server serves the content. Use it in your server setup.
 site-addr = "127.0.0.1:3000"
@@ -80,9 +70,6 @@ reload-port = 3001
 
 #  The browserlist query used for optimizing the CSS.
 browserquery = "defaults"
-
-# The environment Leptos will run in, usually either "DEV" or "PROD"
-env = "DEV"
 
 # The features to use when compiling the bin target
 #

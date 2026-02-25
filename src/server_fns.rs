@@ -34,18 +34,7 @@ pub async fn get_share_details(
         std::env::var("PUBLIC_BASE_URL").unwrap_or_else(|_| format!("{}://{}", proto, host));
 
     // Check cookie for password if not provided
-    let password = password.or_else(|| {
-        let cookie_str = headers
-            .get(axum::http::header::COOKIE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        let prefix = format!("immich_pwd_{}=", key);
-        cookie_str
-            .split(';')
-            .map(|s| s.trim())
-            .find(|s| s.starts_with(&prefix))
-            .map(|s| s[prefix.len()..].to_string())
-    });
+    let password = password.or_else(|| crate::immich::get_cookie_password(&headers, &key));
 
     let client = ImmichClient::new();
     let params = if let Some(p) = &password {

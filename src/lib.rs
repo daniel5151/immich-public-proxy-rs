@@ -4,6 +4,7 @@ pub mod server_fns;
 
 #[cfg(feature = "ssr")]
 pub mod proxy;
+
 #[cfg(feature = "hydrate")]
 #[wasm_bindgen::prelude::wasm_bindgen]
 pub fn hydrate() {

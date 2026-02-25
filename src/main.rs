@@ -2,10 +2,10 @@
 #[tokio::main]
 async fn main() {
     use axum::Router;
+    use immich_public_proxy_rs::app::*;
     use leptos::logging::log;
     use leptos::prelude::*;
-    use leptos_axum::{generate_route_list, LeptosRoutes};
-    use rs::app::*;
+    use leptos_axum::{LeptosRoutes, generate_route_list};
 
     let conf = get_configuration(None).unwrap();
     let addr = conf.leptos_options.site_addr;
@@ -16,23 +16,23 @@ async fn main() {
     let app = Router::new()
         .route(
             "/share/photo/{key}/{id}/{size}",
-            axum::routing::get(rs::proxy::proxy_photo),
+            axum::routing::get(immich_public_proxy_rs::proxy::proxy_photo),
         )
         .route(
             "/share/photo/{key}/{id}",
-            axum::routing::get(rs::proxy::proxy_photo_no_size),
+            axum::routing::get(immich_public_proxy_rs::proxy::proxy_photo_no_size),
         )
         .route(
             "/share/video/{key}/{id}",
-            axum::routing::get(rs::proxy::proxy_video),
+            axum::routing::get(immich_public_proxy_rs::proxy::proxy_video),
         )
         .route(
             "/share/unlock",
-            axum::routing::post(rs::proxy::unlock_share_handler),
+            axum::routing::post(immich_public_proxy_rs::proxy::unlock_share_handler),
         )
         .route(
             "/share/{key}/download",
-            axum::routing::get(rs::proxy::download_all),
+            axum::routing::get(immich_public_proxy_rs::proxy::download_all),
         )
         .leptos_routes(&leptos_options, routes, {
             let leptos_options = leptos_options.clone();
