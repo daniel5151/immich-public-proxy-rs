@@ -1,7 +1,7 @@
 use crate::immich_client::client::{ImmichClient, get_cookie_password};
 use axum::{
     body::Body,
-    extract::{Form, Path},
+    extract::{Form, Path, Query},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Redirect},
 };
@@ -28,6 +28,11 @@ impl<T: Clone + Send + Sync + 'static> ProxyRoutes for axum::Router<T> {
 }
 
 #[derive(Deserialize)]
+pub struct ProxyQuery {
+    sk: Option<String>,
+}
+
+#[derive(Deserialize)]
 pub struct UnlockPayload {
     key: String,
     password: String,
@@ -35,23 +40,36 @@ pub struct UnlockPayload {
 
 pub async fn unlock_share_handler(Form(payload): Form<UnlockPayload>) -> impl IntoResponse {
     let client = ImmichClient::new();
-    let param_name = crate::immich_client::client::share_param_name(payload.key.as_str());
-    let params = vec![
-        (param_name, payload.key.as_str()),
+    let mut params = vec![
+        ("key", payload.key.as_str()),
         ("password", payload.password.as_str()),
     ];
-    let url = client.build_url("/shared-links/me", &params);
-    if let Ok(res) = client.http_client.get(&url).send().await {
-        if res.status().is_success() {
-            let cookie = format!(
-                "immich_pwd_{}={}; Path=/; HttpOnly",
-                payload.key, payload.password
-            );
-            let mut resp = Redirect::to(&format!("/share/{}", payload.key)).into_response();
-            resp.headers_mut()
-                .insert(axum::http::header::SET_COOKIE, cookie.parse().unwrap());
-            return resp;
+    let mut url = client.build_url("/shared-links/me", &params);
+    let mut success = false;
+
+    if let Ok(r) = client.http_client.get(&url).send().await {
+        let status = r.status();
+        let text = r.text().await.unwrap_or_default();
+        if status == 401 && text.contains("Invalid share key") {
+            params[0] = ("slug", payload.key.as_str());
+            url = client.build_url("/shared-links/me", &params);
+            if let Ok(r2) = client.http_client.get(&url).send().await {
+                success = r2.status().is_success();
+            }
+        } else {
+            success = status.is_success();
         }
+    }
+
+    if success {
+        let cookie = format!(
+            "immich_pwd_{}={}; Path=/; HttpOnly",
+            payload.key, payload.password
+        );
+        let mut resp = Redirect::to(&format!("/share/{}", payload.key)).into_response();
+        resp.headers_mut()
+            .insert(axum::http::header::SET_COOKIE, cookie.parse().unwrap());
+        return resp;
     }
     Redirect::to(&format!("/share/{}", payload.key)).into_response()
 }
@@ -59,15 +77,17 @@ pub async fn unlock_share_handler(Form(payload): Form<UnlockPayload>) -> impl In
 pub async fn proxy_photo(
     headers: HeaderMap,
     Path((key, id, size)): Path<(String, String, String)>,
+    Query(query): Query<ProxyQuery>,
 ) -> impl IntoResponse {
-    proxy_photo_impl(headers, key, id, size).await
+    proxy_photo_impl(headers, key, id, size, query.sk).await
 }
 
 pub async fn proxy_photo_no_size(
     headers: HeaderMap,
     Path((key, id)): Path<(String, String)>,
+    Query(query): Query<ProxyQuery>,
 ) -> impl IntoResponse {
-    proxy_photo_impl(headers, key, id, "preview".to_string()).await
+    proxy_photo_impl(headers, key, id, "preview".to_string(), query.sk).await
 }
 
 async fn proxy_photo_impl(
@@ -75,12 +95,12 @@ async fn proxy_photo_impl(
     key: String,
     id: String,
     size_str: String,
+    sk: Option<String>,
 ) -> impl IntoResponse {
     let client = ImmichClient::new();
-    let cookie_password = get_cookie_password(&headers, &key);
+    let cookie_password = get_cookie_password(&headers, sk.as_deref().unwrap_or(&key));
 
-    let param_name = crate::immich_client::client::share_param_name(key.as_str());
-    let mut params = vec![(param_name, key.as_str())];
+    let mut params = vec![("key", key.as_str())];
     if let Some(ref pwd) = cookie_password {
         params.push(("password", pwd.as_str()));
     }
@@ -127,12 +147,12 @@ async fn proxy_photo_impl(
 pub async fn proxy_video(
     headers: HeaderMap,
     Path((key, id)): Path<(String, String)>,
+    Query(query): Query<ProxyQuery>,
 ) -> impl IntoResponse {
     let client = ImmichClient::new();
-    let cookie_password = get_cookie_password(&headers, &key);
+    let cookie_password = get_cookie_password(&headers, query.sk.as_deref().unwrap_or(&key));
 
-    let param_name = crate::immich_client::client::share_param_name(key.as_str());
-    let mut params = vec![(param_name, key.as_str())];
+    let mut params = vec![("key", key.as_str())];
     if let Some(ref pwd) = cookie_password {
         params.push(("password", pwd.as_str()));
     }
@@ -176,13 +196,13 @@ pub struct DownloadQuery {
 pub async fn download_all(
     headers: HeaderMap,
     Path(key): Path<String>,
-    axum::extract::Query(query): axum::extract::Query<DownloadQuery>,
+    Query(query): Query<DownloadQuery>,
+    Query(proxy_query): Query<ProxyQuery>,
 ) -> impl IntoResponse {
     let client = ImmichClient::new();
-    let cookie_password = get_cookie_password(&headers, &key);
+    let cookie_password = get_cookie_password(&headers, proxy_query.sk.as_deref().unwrap_or(&key));
 
-    let param_name = crate::immich_client::client::share_param_name(key.as_str());
-    let mut params = vec![(param_name, key.as_str())];
+    let mut params = vec![("key", key.as_str())];
     if let Some(ref pwd) = cookie_password {
         params.push(("password", pwd.as_str()));
     }

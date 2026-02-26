@@ -38,42 +38,49 @@ pub async fn get_share_details(
         password.or_else(|| crate::immich_client::client::get_cookie_password(&headers, &key));
 
     let client = crate::immich_client::client::ImmichClient::new();
-    let param_name = crate::immich_client::client::share_param_name(key.as_str());
-    let params = if let Some(p) = &password {
-        vec![(param_name, key.as_str()), ("password", p.as_str())]
-    } else {
-        vec![(param_name, key.as_str())]
-    };
+    let mut params = vec![("key", key.as_str())];
+    if let Some(p) = &password {
+        params.push(("password", p.as_str()));
+    }
 
-    let url = client.build_url("/shared-links/me", &params);
-    let res = client.http_client.get(&url).send().await?;
+    let mut url = client.build_url("/shared-links/me", &params);
+    let mut res = client.http_client.get(&url).send().await?;
 
-    if res.status() == 401 {
+    let mut status = res.status();
+    let mut text = res.text().await.unwrap_or_default();
+
+    if status == 401 && text.contains("Invalid share key") {
+        params[0] = ("slug", key.as_str());
+        url = client.build_url("/shared-links/me", &params);
+        res = client.http_client.get(&url).send().await?;
+        status = res.status();
+        text = res.text().await.unwrap_or_default();
+    }
+
+    if status == 401 {
         // Assume password required
-        if let Ok(json) = res.json::<serde_json::Value>().await {
-            let msg = json.get("message").and_then(|m| m.as_str());
-            if msg == Some("Invalid password") || msg == Some("Invalid share key") {
-                return Ok(ShareDetails {
-                    link: SharedLink {
-                        key: key.clone(),
-                        description: None,
-                        expires_at: None,
-                        password_required: true,
-                        r#type: None,
-                        allow_download: None,
-                        assets: vec![],
-                        album: None,
-                        password: None,
-                    },
+        if text.contains("Invalid password") || text.contains("Invalid share key") {
+            return Ok(ShareDetails {
+                link: SharedLink {
+                    key: key.clone(),
+                    description: None,
+                    expires_at: None,
                     password_required: true,
-                    public_base_url,
-                    request_key: key,
-                });
-            }
+                    r#type: None,
+                    allow_download: None,
+                    assets: vec![],
+                    album: None,
+                    password: None,
+                },
+                password_required: true,
+                public_base_url,
+                request_key: key,
+            });
         }
         return Err(ServerFnError::new("Unauthorized/Unknown"));
-    } else if res.status().is_success() {
-        let mut link: SharedLink = res.json().await?;
+    } else if status.is_success() {
+        let mut link: SharedLink =
+            serde_json::from_str(&text).map_err(|e| ServerFnError::new(e.to_string()))?;
         link.password = password.clone();
 
         // Populate album assets if it's an album
@@ -123,6 +130,6 @@ pub async fn get_share_details(
 
     Err(ServerFnError::new(format!(
         "Failed with status: {}",
-        res.status()
+        status
     )))
 }

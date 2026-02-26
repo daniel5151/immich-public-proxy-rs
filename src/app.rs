@@ -95,7 +95,7 @@ fn Password(required_key: String) -> impl IntoView {
 fn AssetTile(
     i: usize,
     asset: crate::immich_client::model::Asset,
-    share_key: String,
+    share_key: (String, String),
     selected_assets: RwSignal<HashSet<String>>,
     on_toggle: ipp_callback::Callback<String>,
 ) -> impl IntoView {
@@ -103,7 +103,10 @@ fn AssetTile(
     let id_for_selected = id.clone();
     let id_for_toggle = id.clone();
 
-    let thumbnail_url = format!("/share/photo/{}/{}/thumbnail", share_key, id);
+    let thumbnail_url = format!(
+        "/share/photo/{}/{}/thumbnail?sk={}",
+        share_key.0, id, share_key.1
+    );
     let is_video = asset.r#type == "VIDEO";
 
     let width = match asset.width {
@@ -124,7 +127,10 @@ fn AssetTile(
     let flex_basis = format!("{}px", 250.0 * aspect_ratio);
 
     let is_selected = move || selected_assets.get().contains(&id_for_selected);
-    let preview_url = format!("/share/photo/{}/{}/preview", share_key, id);
+    let preview_url = format!(
+        "/share/photo/{}/{}/preview?sk={}",
+        share_key.0, id, share_key.1
+    );
 
     view! {
         <div
@@ -189,7 +195,9 @@ mod ipp_callback {
 #[component]
 fn Gallery(details: ShareDetails) -> impl IntoView {
     let link = details.link;
-    let share_key = details.request_key.clone();
+    let real_key = link.key.clone();
+    let request_key = details.request_key.clone();
+    let share_key = (real_key.clone(), request_key.clone());
     let assets = link.assets.clone();
     let allow_download = match link.allow_download {
         Some(a) => a,
@@ -210,13 +218,13 @@ fn Gallery(details: ShareDetails) -> impl IntoView {
 
     let album_description = link.album.as_ref().and_then(|a| a.description.clone());
     let public_base_url = details.public_base_url.trim_end_matches('/').to_string();
-    let current_url = format!("{}/share/{}", public_base_url, share_key);
+    let current_url = format!("{}/share/{}", public_base_url, request_key);
     let cover_image_url = assets
         .first()
         .map(|a| {
             format!(
-                "{}/share/photo/{}/{}/preview",
-                public_base_url, share_key, a.id
+                "{}/share/photo/{}/{}/preview?sk={}",
+                public_base_url, real_key, a.id, request_key
             )
         })
         .unwrap_or_default();
@@ -259,17 +267,18 @@ fn Gallery(details: ShareDetails) -> impl IntoView {
     let items_array = assets
         .iter()
         .map(|asset| {
-            let key = share_key.clone();
-            let preview_url = format!("/share/photo/{}/{}/preview", key, asset.id);
-            let thumbnail_url = format!("/share/photo/{}/{}/thumbnail", key, asset.id);
-            let download_url = format!("/share/photo/{}/{}/original", key, asset.id);
+            let key = real_key.clone();
+            let sk = request_key.clone();
+            let preview_url = format!("/share/photo/{}/{}/preview?sk={}", key, asset.id, sk);
+            let thumbnail_url = format!("/share/photo/{}/{}/thumbnail?sk={}", key, asset.id, sk);
+            let download_url = format!("/share/photo/{}/{}/original?sk={}", key, asset.id, sk);
 
             if asset.r#type == "VIDEO" {
                 serde_json::json!({
                     "video": {
                         "source": [
                             {
-                                "src": format!("/share/video/{}/{}", key, asset.id),
+                                "src": format!("/share/video/{}/{}?sk={}", key, asset.id, sk),
                                 "type": "video/mp4"
                             }
                         ],
@@ -316,8 +325,8 @@ fn Gallery(details: ShareDetails) -> impl IntoView {
         } else {
             let ids_str = ids.into_iter().collect::<Vec<_>>().join(",");
             format!(
-                "/share/{}/download?asset_ids={}",
-                s_key_for_download, ids_str
+                "/share/{}/download?asset_ids={}&sk={}",
+                s_key_for_download.0, ids_str, s_key_for_download.1
             )
         }
     };
@@ -355,7 +364,7 @@ fn Gallery(details: ShareDetails) -> impl IntoView {
                 <h1>{title}</h1>
                 <div class="header-actions">
                     <div id="download-all" style={if allow_download { "" } else { "display:none" }}>
-                        <a href=format!("/share/{}/download", share_key) rel="external" title="Download all">
+                        <a href=format!("/share/{}/download?sk={}", share_key.0, share_key.1) rel="external" title="Download all">
                             <img src="/images/download-all.svg" alt="" />
                             <span>"Download all"</span>
                         </a>
