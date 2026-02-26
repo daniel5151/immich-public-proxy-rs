@@ -51,3 +51,12 @@ pub fn get_cookie_password(headers: &axum::http::HeaderMap, key: &str) -> Option
                 .map(|s| s[prefix.len()..].to_string())
         })
 }
+
+pub fn share_param_name(key_or_slug: &str) -> &'static str {
+    // Immich keys are base64url-encoded random strings, usually 69 chars.
+    if key_or_slug.len() == 69 {
+        "key"
+    } else {
+        "slug"
+    }
+}

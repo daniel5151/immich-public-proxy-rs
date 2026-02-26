@@ -35,8 +35,9 @@ pub struct UnlockPayload {
 
 pub async fn unlock_share_handler(Form(payload): Form<UnlockPayload>) -> impl IntoResponse {
     let client = ImmichClient::new();
+    let param_name = crate::immich_client::client::share_param_name(payload.key.as_str());
     let params = vec![
-        ("key", payload.key.as_str()),
+        (param_name, payload.key.as_str()),
         ("password", payload.password.as_str()),
     ];
     let url = client.build_url("/shared-links/me", &params);
@@ -78,7 +79,8 @@ async fn proxy_photo_impl(
     let client = ImmichClient::new();
     let cookie_password = get_cookie_password(&headers, &key);
 
-    let mut params = vec![("key", key.as_str())];
+    let param_name = crate::immich_client::client::share_param_name(key.as_str());
+    let mut params = vec![(param_name, key.as_str())];
     if let Some(ref pwd) = cookie_password {
         params.push(("password", pwd.as_str()));
     }
@@ -129,7 +131,8 @@ pub async fn proxy_video(
     let client = ImmichClient::new();
     let cookie_password = get_cookie_password(&headers, &key);
 
-    let mut params = vec![("key", key.as_str())];
+    let param_name = crate::immich_client::client::share_param_name(key.as_str());
+    let mut params = vec![(param_name, key.as_str())];
     if let Some(ref pwd) = cookie_password {
         params.push(("password", pwd.as_str()));
     }
@@ -178,7 +181,8 @@ pub async fn download_all(
     let client = ImmichClient::new();
     let cookie_password = get_cookie_password(&headers, &key);
 
-    let mut params = vec![("key", key.as_str())];
+    let param_name = crate::immich_client::client::share_param_name(key.as_str());
+    let mut params = vec![(param_name, key.as_str())];
     if let Some(ref pwd) = cookie_password {
         params.push(("password", pwd.as_str()));
     }

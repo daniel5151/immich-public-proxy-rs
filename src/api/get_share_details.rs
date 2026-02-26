@@ -8,6 +8,7 @@ pub struct ShareDetails {
     pub link: SharedLink,
     pub password_required: bool,
     pub public_base_url: String,
+    pub request_key: String,
 }
 
 #[server(GetShareDetails, "/api")]
@@ -37,10 +38,11 @@ pub async fn get_share_details(
         password.or_else(|| crate::immich_client::client::get_cookie_password(&headers, &key));
 
     let client = crate::immich_client::client::ImmichClient::new();
+    let param_name = crate::immich_client::client::share_param_name(key.as_str());
     let params = if let Some(p) = &password {
-        vec![("key", key.as_str()), ("password", p.as_str())]
+        vec![(param_name, key.as_str()), ("password", p.as_str())]
     } else {
-        vec![("key", key.as_str())]
+        vec![(param_name, key.as_str())]
     };
 
     let url = client.build_url("/shared-links/me", &params);
@@ -49,10 +51,11 @@ pub async fn get_share_details(
     if res.status() == 401 {
         // Assume password required
         if let Ok(json) = res.json::<serde_json::Value>().await {
-            if json.get("message").and_then(|m| m.as_str()) == Some("Invalid password") {
+            let msg = json.get("message").and_then(|m| m.as_str());
+            if msg == Some("Invalid password") || msg == Some("Invalid share key") {
                 return Ok(ShareDetails {
                     link: SharedLink {
-                        key,
+                        key: key.clone(),
                         description: None,
                         expires_at: None,
                         password_required: true,
@@ -64,6 +67,7 @@ pub async fn get_share_details(
                     },
                     password_required: true,
                     public_base_url,
+                    request_key: key,
                 });
             }
         }
@@ -113,6 +117,7 @@ pub async fn get_share_details(
             link,
             password_required: false,
             public_base_url,
+            request_key: key,
         });
     }
 
