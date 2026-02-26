@@ -103,6 +103,9 @@ fn AssetTile(
     let id_for_selected = id.clone();
     let id_for_toggle = id.clone();
 
+    // We only need to append the `?sk={request_key}` parameter if the user is using a custom slug
+    // instead of Immich's native base64url encryption key.
+    // Otherwise, we keep the clean format `/share/photo/{real_key}/...`
     let thumbnail_url = if share_key.0 == share_key.1 {
         format!("/share/photo/{}/{}/thumbnail", share_key.0, id)
     } else {
@@ -203,9 +206,16 @@ mod ipp_callback {
 #[component]
 fn Gallery(details: ShareDetails) -> impl IntoView {
     let link = details.link;
+
+    // Immich natively tracks albums via a base64url "real key".
+    // However, the user may have accessed it via a custom slug (e.g. `/share/withpass`).
     let real_key = link.key.clone();
     let request_key = details.request_key.clone();
+
+    // Grouping both keys allows us to intelligently generate proxy routes on the frontend below.
+    // The tuple is (real_key, request_key).
     let share_key = (real_key.clone(), request_key.clone());
+
     let assets = link.assets.clone();
     let allow_download = match link.allow_download {
         Some(a) => a,

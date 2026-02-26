@@ -29,6 +29,12 @@ impl<T: Clone + Send + Sync + 'static> ProxyRoutes for axum::Router<T> {
 
 #[derive(Deserialize)]
 pub struct ProxyQuery {
+    /// The "slug key" (sk). If the user accessed the album via a custom slug (e.g. `withpass`),
+    /// their password is saved in a cookie named `immich_pwd_withpass`.
+    /// The UI natively resolves that slug into Immich's real, internal encryption key,
+    /// so that proxy paths use the direct `key` (e.g. `/share/photo/{real_key}/...`).
+    /// The frontend passes `?sk=withpass` backwards as a hint, indicating to the proxy
+    /// which cookie to check to authenticate the underlying stream.
     sk: Option<String>,
 }
 
@@ -98,6 +104,9 @@ async fn proxy_photo_impl(
     sk: Option<String>,
 ) -> impl IntoResponse {
     let client = ImmichClient::new();
+
+    // Use the `sk` hint from the frontend to look up the password cookie for custom slugs.
+    // If no `sk` was needed or provided, default to looking it up using the real `key` itself.
     let cookie_password = get_cookie_password(&headers, sk.as_deref().unwrap_or(&key));
 
     let mut params = vec![("key", key.as_str())];
@@ -150,6 +159,9 @@ pub async fn proxy_video(
     Query(query): Query<ProxyQuery>,
 ) -> impl IntoResponse {
     let client = ImmichClient::new();
+
+    // Use the `sk` hint from the frontend to look up the password cookie for custom slugs.
+    // If no `sk` was needed or provided, default to looking it up using the real `key` itself.
     let cookie_password = get_cookie_password(&headers, query.sk.as_deref().unwrap_or(&key));
 
     let mut params = vec![("key", key.as_str())];
@@ -200,6 +212,9 @@ pub async fn download_all(
     Query(proxy_query): Query<ProxyQuery>,
 ) -> impl IntoResponse {
     let client = ImmichClient::new();
+
+    // Use the `sk` hint from the frontend to look up the password cookie for custom slugs.
+    // If no `sk` was needed or provided, default to looking it up using the real `key` itself.
     let cookie_password = get_cookie_password(&headers, proxy_query.sk.as_deref().unwrap_or(&key));
 
     let mut params = vec![("key", key.as_str())];
