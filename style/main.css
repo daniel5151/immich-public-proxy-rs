@@ -210,6 +210,7 @@ body.selection-mode .date-selector,
     font-size: 1.25rem;
     font-weight: 600;
     flex-grow: 1;
+    padding-left: 0.5rem;
 }
 
 .selection-actions {
@@ -222,12 +223,15 @@ body.selection-mode .date-selector,
     border: none;
     color: white;
     cursor: pointer;
-    padding: 8px;
+    width: 40px;
+    height: 40px;
+    padding: 0;
     border-radius: 50%;
     display: flex;
     align-items: center;
     justify-content: center;
     transition: background 0.2s;
+    text-decoration: none;
 }
 
 .icon-btn:hover {
