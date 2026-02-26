@@ -28,17 +28,6 @@ impl<T: Clone + Send + Sync + 'static> ProxyRoutes for axum::Router<T> {
 }
 
 #[derive(Deserialize)]
-pub struct ProxyQuery {
-    /// The "slug key" (sk). If the user accessed the album via a custom slug (e.g. `withpass`),
-    /// their password is saved in a cookie named `immich_pwd_withpass`.
-    /// The UI natively resolves that slug into Immich's real, internal encryption key,
-    /// so that proxy paths use the direct `key` (e.g. `/share/photo/{real_key}/...`).
-    /// The frontend passes `?sk=withpass` backwards as a hint, indicating to the proxy
-    /// which cookie to check to authenticate the underlying stream.
-    sk: Option<String>,
-}
-
-#[derive(Deserialize)]
 pub struct UnlockPayload {
     key: String,
     password: String,
@@ -52,6 +41,7 @@ pub async fn unlock_share_handler(Form(payload): Form<UnlockPayload>) -> impl In
     ];
     let mut url = client.build_url("/shared-links/me", &params);
     let mut success = false;
+    let mut real_key = payload.key.clone();
 
     if let Ok(r) = client.http_client.get(&url).send().await {
         let status = r.status();
@@ -60,21 +50,44 @@ pub async fn unlock_share_handler(Form(payload): Form<UnlockPayload>) -> impl In
             params[0] = ("slug", payload.key.as_str());
             url = client.build_url("/shared-links/me", &params);
             if let Ok(r2) = client.http_client.get(&url).send().await {
-                success = r2.status().is_success();
+                if r2.status().is_success() {
+                    success = true;
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(
+                        &r2.text().await.unwrap_or_default(),
+                    ) {
+                        if let Some(k) = json.get("key").and_then(|v| v.as_str()) {
+                            real_key = k.to_string();
+                        }
+                    }
+                }
             }
-        } else {
-            success = status.is_success();
+        } else if status.is_success() {
+            success = true;
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+                if let Some(k) = json.get("key").and_then(|v| v.as_str()) {
+                    real_key = k.to_string();
+                }
+            }
         }
     }
 
     if success {
-        let cookie = format!(
+        let cookie1 = format!(
             "immich_pwd_{}={}; Path=/; HttpOnly",
             payload.key, payload.password
         );
         let mut resp = Redirect::to(&format!("/share/{}", payload.key)).into_response();
         resp.headers_mut()
-            .insert(axum::http::header::SET_COOKIE, cookie.parse().unwrap());
+            .append(axum::http::header::SET_COOKIE, cookie1.parse().unwrap());
+
+        if payload.key != real_key {
+            let cookie2 = format!(
+                "immich_pwd_{}={}; Path=/; HttpOnly",
+                real_key, payload.password
+            );
+            resp.headers_mut()
+                .append(axum::http::header::SET_COOKIE, cookie2.parse().unwrap());
+        }
         return resp;
     }
     Redirect::to(&format!("/share/{}", payload.key)).into_response()
@@ -83,17 +96,15 @@ pub async fn unlock_share_handler(Form(payload): Form<UnlockPayload>) -> impl In
 pub async fn proxy_photo(
     headers: HeaderMap,
     Path((key, id, size)): Path<(String, String, String)>,
-    Query(query): Query<ProxyQuery>,
 ) -> impl IntoResponse {
-    proxy_photo_impl(headers, key, id, size, query.sk).await
+    proxy_photo_impl(headers, key, id, size).await
 }
 
 pub async fn proxy_photo_no_size(
     headers: HeaderMap,
     Path((key, id)): Path<(String, String)>,
-    Query(query): Query<ProxyQuery>,
 ) -> impl IntoResponse {
-    proxy_photo_impl(headers, key, id, "preview".to_string(), query.sk).await
+    proxy_photo_impl(headers, key, id, "preview".to_string()).await
 }
 
 async fn proxy_photo_impl(
@@ -101,13 +112,9 @@ async fn proxy_photo_impl(
     key: String,
     id: String,
     size_str: String,
-    sk: Option<String>,
 ) -> impl IntoResponse {
     let client = ImmichClient::new();
-
-    // Use the `sk` hint from the frontend to look up the password cookie for custom slugs.
-    // If no `sk` was needed or provided, default to looking it up using the real `key` itself.
-    let cookie_password = get_cookie_password(&headers, sk.as_deref().unwrap_or(&key));
+    let cookie_password = get_cookie_password(&headers, &key);
 
     let mut params = vec![("key", key.as_str())];
     if let Some(ref pwd) = cookie_password {
@@ -156,13 +163,9 @@ async fn proxy_photo_impl(
 pub async fn proxy_video(
     headers: HeaderMap,
     Path((key, id)): Path<(String, String)>,
-    Query(query): Query<ProxyQuery>,
 ) -> impl IntoResponse {
     let client = ImmichClient::new();
-
-    // Use the `sk` hint from the frontend to look up the password cookie for custom slugs.
-    // If no `sk` was needed or provided, default to looking it up using the real `key` itself.
-    let cookie_password = get_cookie_password(&headers, query.sk.as_deref().unwrap_or(&key));
+    let cookie_password = get_cookie_password(&headers, &key);
 
     let mut params = vec![("key", key.as_str())];
     if let Some(ref pwd) = cookie_password {
@@ -209,13 +212,9 @@ pub async fn download_all(
     headers: HeaderMap,
     Path(key): Path<String>,
     Query(query): Query<DownloadQuery>,
-    Query(proxy_query): Query<ProxyQuery>,
 ) -> impl IntoResponse {
     let client = ImmichClient::new();
-
-    // Use the `sk` hint from the frontend to look up the password cookie for custom slugs.
-    // If no `sk` was needed or provided, default to looking it up using the real `key` itself.
-    let cookie_password = get_cookie_password(&headers, proxy_query.sk.as_deref().unwrap_or(&key));
+    let cookie_password = get_cookie_password(&headers, &key);
 
     let mut params = vec![("key", key.as_str())];
     if let Some(ref pwd) = cookie_password {

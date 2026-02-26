@@ -95,7 +95,7 @@ fn Password(required_key: String) -> impl IntoView {
 fn AssetTile(
     i: usize,
     asset: crate::immich_client::model::Asset,
-    share_key: (String, String),
+    share_key: String,
     selected_assets: RwSignal<HashSet<String>>,
     on_toggle: ipp_callback::Callback<String>,
 ) -> impl IntoView {
@@ -103,17 +103,7 @@ fn AssetTile(
     let id_for_selected = id.clone();
     let id_for_toggle = id.clone();
 
-    // We only need to append the `?sk={request_key}` parameter if the user is using a custom slug
-    // instead of Immich's native base64url encryption key.
-    // Otherwise, we keep the clean format `/share/photo/{real_key}/...`
-    let thumbnail_url = if share_key.0 == share_key.1 {
-        format!("/share/photo/{}/{}/thumbnail", share_key.0, id)
-    } else {
-        format!(
-            "/share/photo/{}/{}/thumbnail?sk={}",
-            share_key.0, id, share_key.1
-        )
-    };
+    let thumbnail_url = format!("/share/photo/{}/{}/thumbnail", share_key, id);
     let is_video = asset.r#type == "VIDEO";
 
     let width = match asset.width {
@@ -134,14 +124,7 @@ fn AssetTile(
     let flex_basis = format!("{}px", 250.0 * aspect_ratio);
 
     let is_selected = move || selected_assets.get().contains(&id_for_selected);
-    let preview_url = if share_key.0 == share_key.1 {
-        format!("/share/photo/{}/{}/preview", share_key.0, id)
-    } else {
-        format!(
-            "/share/photo/{}/{}/preview?sk={}",
-            share_key.0, id, share_key.1
-        )
-    };
+    let preview_url = format!("/share/photo/{}/{}/preview", share_key, id);
 
     view! {
         <div
@@ -207,14 +190,8 @@ mod ipp_callback {
 fn Gallery(details: ShareDetails) -> impl IntoView {
     let link = details.link;
 
-    // Immich natively tracks albums via a base64url "real key".
-    // However, the user may have accessed it via a custom slug (e.g. `/share/withpass`).
     let real_key = link.key.clone();
     let request_key = details.request_key.clone();
-
-    // Grouping both keys allows us to intelligently generate proxy routes on the frontend below.
-    // The tuple is (real_key, request_key).
-    let share_key = (real_key.clone(), request_key.clone());
 
     let assets = link.assets.clone();
     let allow_download = match link.allow_download {
@@ -240,17 +217,10 @@ fn Gallery(details: ShareDetails) -> impl IntoView {
     let cover_image_url = assets
         .first()
         .map(|a| {
-            if real_key == request_key {
-                format!(
-                    "{}/share/photo/{}/{}/preview",
-                    public_base_url, real_key, a.id
-                )
-            } else {
-                format!(
-                    "{}/share/photo/{}/{}/preview?sk={}",
-                    public_base_url, real_key, a.id, request_key
-                )
-            }
+            format!(
+                "{}/share/photo/{}/{}/preview",
+                public_base_url, real_key, a.id
+            )
         })
         .unwrap_or_default();
 
@@ -293,31 +263,16 @@ fn Gallery(details: ShareDetails) -> impl IntoView {
         .iter()
         .map(|asset| {
             let key = real_key.clone();
-            let sk = request_key.clone();
-            let (preview_url, thumbnail_url, download_url) = if key == sk {
-                (
-                    format!("/share/photo/{}/{}/preview", key, asset.id),
-                    format!("/share/photo/{}/{}/thumbnail", key, asset.id),
-                    format!("/share/photo/{}/{}/original", key, asset.id),
-                )
-            } else {
-                (
-                    format!("/share/photo/{}/{}/preview?sk={}", key, asset.id, sk),
-                    format!("/share/photo/{}/{}/thumbnail?sk={}", key, asset.id, sk),
-                    format!("/share/photo/{}/{}/original?sk={}", key, asset.id, sk),
-                )
-            };
+            let preview_url = format!("/share/photo/{}/{}/preview", key, asset.id);
+            let thumbnail_url = format!("/share/photo/{}/{}/thumbnail", key, asset.id);
+            let download_url = format!("/share/photo/{}/{}/original", key, asset.id);
 
             if asset.r#type == "VIDEO" {
                 serde_json::json!({
                     "video": {
                         "source": [
                             {
-                                "src": if key == sk {
-                                    format!("/share/video/{}/{}", key, asset.id)
-                                } else {
-                                    format!("/share/video/{}/{}?sk={}", key, asset.id, sk)
-                                },
+                                "src": format!("/share/video/{}/{}", key, asset.id),
                                 "type": "video/mp4"
                             }
                         ],
@@ -356,24 +311,17 @@ fn Gallery(details: ShareDetails) -> impl IntoView {
         });
     });
 
-    let s_key_for_download = share_key.clone();
+    let s_key_for_download = real_key.clone();
     let download_selection_url = move || {
         let ids = selected_assets.get();
         if ids.is_empty() {
             "".to_string()
         } else {
             let ids_str = ids.into_iter().collect::<Vec<_>>().join(",");
-            if s_key_for_download.0 == s_key_for_download.1 {
-                format!(
-                    "/share/{}/download?asset_ids={}",
-                    s_key_for_download.0, ids_str
-                )
-            } else {
-                format!(
-                    "/share/{}/download?asset_ids={}&sk={}",
-                    s_key_for_download.0, ids_str, s_key_for_download.1
-                )
-            }
+            format!(
+                "/share/{}/download?asset_ids={}",
+                s_key_for_download, ids_str
+            )
         }
     };
 
@@ -410,11 +358,7 @@ fn Gallery(details: ShareDetails) -> impl IntoView {
                 <h1>{title}</h1>
                 <div class="header-actions">
                     <div id="download-all" style={if allow_download { "" } else { "display:none" }}>
-                        <a href=if share_key.0 == share_key.1 {
-                            format!("/share/{}/download", share_key.0)
-                        } else {
-                            format!("/share/{}/download?sk={}", share_key.0, share_key.1)
-                        } rel="external" title="Download all">
+                        <a href=format!("/share/{}/download", real_key) rel="external" title="Download all">
                             <img src="/images/download-all.svg" alt="" />
                             <span>"Download all"</span>
                         </a>
@@ -436,7 +380,7 @@ fn Gallery(details: ShareDetails) -> impl IntoView {
                     children=move |group| {
                         let label = group.label.clone();
                         let group_items = group.items.clone();
-                        let s_key_for_tile = share_key.clone();
+                        let s_key_for_tile = real_key.clone();
 
                         let has_all_selected = {
                             let items = group_items.clone();
