@@ -36,6 +36,36 @@ impl ImmichClient {
         }
         u.to_string()
     }
+
+    /// Fetches the `/shared-links/me` endpoint.
+    /// It first tries using the provided identifier as a `key`.
+    /// If the server responds with 401 "Invalid share key", it automatically retries with `slug`.
+    pub async fn fetch_share_me(
+        &self,
+        key_or_slug: &str,
+        password: Option<&str>,
+    ) -> Result<(reqwest::StatusCode, String), reqwest::Error> {
+        let mut params = vec![("key", key_or_slug)];
+        if let Some(p) = password {
+            params.push(("password", p));
+        }
+
+        let mut url = self.build_url("/shared-links/me", &params);
+        let mut res = self.http_client.get(&url).send().await?;
+
+        let mut status = res.status();
+        let mut text = res.text().await.unwrap_or_default();
+
+        if status == 401 && text.contains("Invalid share key") {
+            params[0] = ("slug", key_or_slug);
+            url = self.build_url("/shared-links/me", &params);
+            res = self.http_client.get(&url).send().await?;
+            status = res.status();
+            text = res.text().await.unwrap_or_default();
+        }
+
+        Ok((status, text))
+    }
 }
 
 pub fn get_cookie_password(headers: &axum::http::HeaderMap, key: &str) -> Option<String> {

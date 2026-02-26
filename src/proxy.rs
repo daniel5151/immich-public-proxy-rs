@@ -35,38 +35,18 @@ pub struct UnlockPayload {
 
 pub async fn unlock_share_handler(Form(payload): Form<UnlockPayload>) -> impl IntoResponse {
     let client = ImmichClient::new();
-    let mut params = vec![
-        ("key", payload.key.as_str()),
-        ("password", payload.password.as_str()),
-    ];
-    let mut url = client.build_url("/shared-links/me", &params);
     let mut success = false;
     let mut real_key = payload.key.clone();
 
-    if let Ok(r) = client.http_client.get(&url).send().await {
-        let status = r.status();
-        let text = r.text().await.unwrap_or_default();
-        if status == 401 && text.contains("Invalid share key") {
-            params[0] = ("slug", payload.key.as_str());
-            url = client.build_url("/shared-links/me", &params);
-            if let Ok(r2) = client.http_client.get(&url).send().await {
-                if r2.status().is_success() {
-                    success = true;
-                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(
-                        &r2.text().await.unwrap_or_default(),
-                    ) {
-                        if let Some(k) = json.get("key").and_then(|v| v.as_str()) {
-                            real_key = k.to_string();
-                        }
-                    }
-                }
-            }
-        } else if status.is_success() {
+    if let Ok((status, text)) = client
+        .fetch_share_me(&payload.key, Some(&payload.password))
+        .await
+    {
+        if status.is_success() {
             success = true;
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
-                if let Some(k) = json.get("key").and_then(|v| v.as_str()) {
-                    real_key = k.to_string();
-                }
+            if let Ok(link) = serde_json::from_str::<crate::immich_client::model::SharedLink>(&text)
+            {
+                real_key = link.key;
             }
         }
     }

@@ -38,24 +38,7 @@ pub async fn get_share_details(
         password.or_else(|| crate::immich_client::client::get_cookie_password(&headers, &key));
 
     let client = crate::immich_client::client::ImmichClient::new();
-    let mut params = vec![("key", key.as_str())];
-    if let Some(p) = &password {
-        params.push(("password", p.as_str()));
-    }
-
-    let mut url = client.build_url("/shared-links/me", &params);
-    let mut res = client.http_client.get(&url).send().await?;
-
-    let mut status = res.status();
-    let mut text = res.text().await.unwrap_or_default();
-
-    if status == 401 && text.contains("Invalid share key") {
-        params[0] = ("slug", key.as_str());
-        url = client.build_url("/shared-links/me", &params);
-        res = client.http_client.get(&url).send().await?;
-        status = res.status();
-        text = res.text().await.unwrap_or_default();
-    }
+    let (status, text) = client.fetch_share_me(&key, password.as_deref()).await?;
 
     if status == 401 {
         // Assume password required
@@ -86,7 +69,12 @@ pub async fn get_share_details(
         // Populate album assets if it's an album
         if link.r#type.as_deref() == Some("ALBUM") {
             if let Some(ref album) = link.album {
-                let album_url = client.build_url(&format!("/albums/{}", album.id), &params);
+                let mut album_params = vec![("key", link.key.as_str())];
+                if let Some(p) = &password {
+                    album_params.push(("password", p.as_str()));
+                }
+
+                let album_url = client.build_url(&format!("/albums/{}", album.id), &album_params);
                 let album_res = client.http_client.get(&album_url).send().await?;
                 if album_res.status().is_success() {
                     if let Ok(mut album_data) =
