@@ -1,10 +1,16 @@
-use crate::api::get_share_details::{ShareDetails, get_share_details};
+use crate::api::get_share_details::ShareDetails;
+use crate::api::get_share_details::get_share_details;
 use leptos::prelude::*;
-use leptos_meta::{Body, Meta, Stylesheet, Title, provide_meta_context};
-use leptos_router::{
-    ParamSegment, StaticSegment,
-    components::{Route, Router, Routes},
-};
+use leptos_meta::Body;
+use leptos_meta::Meta;
+use leptos_meta::Stylesheet;
+use leptos_meta::Title;
+use leptos_meta::provide_meta_context;
+use leptos_router::ParamSegment;
+use leptos_router::StaticSegment;
+use leptos_router::components::Route;
+use leptos_router::components::Router;
+use leptos_router::components::Routes;
 use std::collections::HashSet;
 
 #[component]

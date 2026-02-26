@@ -1,4 +1,5 @@
-use reqwest::{Client, Url};
+use reqwest::Client;
+use reqwest::Url;
 
 pub struct ImmichClient {
     pub api_url: String,

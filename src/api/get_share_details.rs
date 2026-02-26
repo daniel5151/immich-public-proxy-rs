@@ -1,7 +1,8 @@
 use crate::immich_client::model::SharedLink;
 
 use leptos::prelude::*;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ShareDetails {

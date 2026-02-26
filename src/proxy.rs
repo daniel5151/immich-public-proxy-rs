@@ -1,10 +1,13 @@
-use crate::immich_client::client::{ImmichClient, get_cookie_password};
-use axum::{
-    body::Body,
-    extract::{Form, Path, Query},
-    http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Redirect},
-};
+use crate::immich_client::client::ImmichClient;
+use crate::immich_client::client::get_cookie_password;
+use axum::body::Body;
+use axum::extract::Form;
+use axum::extract::Path;
+use axum::extract::Query;
+use axum::http::HeaderMap;
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
+use axum::response::Redirect;
 use serde::Deserialize;
 
 pub trait ProxyRoutes {
