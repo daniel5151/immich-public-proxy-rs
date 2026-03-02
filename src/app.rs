@@ -103,7 +103,7 @@ fn AssetTile(
     asset: crate::immich_client::model::Asset,
     share_key: String,
     selected_assets: RwSignal<HashSet<String>>,
-    on_toggle: ipp_callback::Callback<String>,
+    on_toggle: Callback<String>,
 ) -> impl IntoView {
     let id = asset.id.clone();
     let id_for_selected = id.clone();
@@ -168,28 +168,6 @@ fn AssetTile(
         </div>
     }
     .into_any()
-}
-
-mod ipp_callback {
-    use leptos::prelude::*;
-    pub struct Callback<T: 'static>(StoredValue<Box<dyn Fn(T) + Send + Sync>>);
-
-    impl<T: 'static> Callback<T> {
-        pub fn new<F: Fn(T) + Send + Sync + 'static>(f: F) -> Self {
-            Self(StoredValue::new(Box::new(f)))
-        }
-        pub fn run(&self, data: T) {
-            self.0.with_value(|f| f(data));
-        }
-    }
-
-    impl<T: 'static> Clone for Callback<T> {
-        fn clone(&self) -> Self {
-            *self
-        }
-    }
-
-    impl<T: 'static> Copy for Callback<T> {}
 }
 
 #[component]
@@ -307,7 +285,7 @@ fn Gallery(details: ShareDetails) -> impl IntoView {
         items_json
     );
 
-    let on_toggle_select = ipp_callback::Callback::new(move |id: String| {
+    let on_toggle_select = Callback::new(move |id: String| {
         selected_assets.update(|set| {
             if set.contains(&id) {
                 set.remove(&id);
