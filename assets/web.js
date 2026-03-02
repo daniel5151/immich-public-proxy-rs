@@ -20,6 +20,7 @@ class LGallery {
       download: true,
       counter: false,
       hideScrollbar: true,
+      preload: 1,
       mobileSettings: { controls: false, showCloseIcon: true, download: true },
     }, params.lgConfig);
 
@@ -28,7 +29,14 @@ class LGallery {
       lgConfig.dynamic = true;
       lgConfig.dynamicEl = params.items;
 
-      this.lightGallery = lightGallery(this.element, lgConfig);
+      const initAndOpen = (index) => {
+        if (!this.lightGallery) {
+          this.lightGallery = lightGallery(this.element, lgConfig);
+        }
+        if (typeof index === 'number') {
+          this.lightGallery.openGallery(index);
+        }
+      };
 
       // Handle clicks on gallery items manually in dynamic mode
       const handleClick = (e) => {
@@ -39,7 +47,7 @@ class LGallery {
           if (!isNaN(index)) {
             e.preventDefault();
             e.stopPropagation();
-            this.lightGallery.openGallery(index);
+            initAndOpen(index);
           }
         }
       };
@@ -48,6 +56,11 @@ class LGallery {
       this.element.removeEventListener('click', this._clickHandler);
       this._clickHandler = handleClick;
       this.element.addEventListener('click', this._clickHandler);
+
+      // If URL has a hash, we must initialize it immediately so lgHash can parse it and open
+      if (window.location.hash.indexOf('lg=1') !== -1) {
+        initAndOpen();
+      }
 
     } else {
       // Selector mode: uses the DOM attributes

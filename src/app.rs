@@ -186,7 +186,7 @@ fn Gallery(details: ShareDetails) -> impl IntoView {
         }
     };
 
-    let title = match link
+    let title: String = match link
         .description
         .clone()
         .or_else(|| link.album.as_ref().and_then(|a| a.album_name.clone()))
@@ -209,6 +209,55 @@ fn Gallery(details: ShareDetails) -> impl IntoView {
         .unwrap_or_default();
 
     let selected_assets = RwSignal::new(HashSet::<String>::new());
+
+    let total_assets = assets.len();
+    let display_count = RwSignal::new(std::cmp::min(50, total_assets));
+    let is_loading_more = RwSignal::new(false);
+
+    #[cfg(feature = "hydrate")]
+    {
+        use wasm_bindgen::JsCast;
+        use wasm_bindgen::closure::Closure;
+
+        // Track whether our event listener has been set up to prevent duplicates across hot reloads if they occur, though hydrate only runs once typically.
+        let handler = Closure::wrap(Box::new(move || {
+            if let Some(window) = web_sys::window() {
+                if let Some(document) = window.document() {
+                    let scroll_y = window.scroll_y().unwrap_or(0.0);
+                    let inner_height = window.inner_height().unwrap().as_f64().unwrap_or(0.0);
+                    let scroll_height = document
+                        .document_element()
+                        .map(|e| e.scroll_height() as f64)
+                        .unwrap_or(0.0);
+
+                    if scroll_y + inner_height >= scroll_height - 1000.0 {
+                        let current = display_count.get_untracked();
+                        if current < total_assets && !is_loading_more.get_untracked() {
+                            is_loading_more.set(true);
+                            let next = std::cmp::min(current + 10, total_assets);
+
+                            let closure = Closure::once(move || {
+                                display_count.set(next);
+                                is_loading_more.set(false);
+                            });
+
+                            let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+                                closure.as_ref().unchecked_ref(),
+                                300,
+                            );
+                            closure.forget();
+                        }
+                    }
+                }
+            }
+        }) as Box<dyn FnMut()>);
+
+        if let Some(window) = web_sys::window() {
+            let _ =
+                window.add_event_listener_with_callback("scroll", handler.as_ref().unchecked_ref());
+            handler.forget();
+        }
+    }
 
     #[derive(Clone)]
     struct AssetGroup {
@@ -362,76 +411,98 @@ fn Gallery(details: ShareDetails) -> impl IntoView {
                     each=move || groups.clone().into_iter()
                     key=|g| g.label.clone()
                     children=move |group| {
-                        let label = group.label.clone();
-                        let group_items = group.items.clone();
-                        let s_key_for_tile = real_key.clone();
-
-                        let has_all_selected = {
-                            let items = group_items.clone();
-                            move || {
-                                let selected = selected_assets.get();
-                                items.iter().all(|(_, a)| selected.contains(&a.id))
-                            }
-                        };
-
-                        let on_group_toggle = {
-                            let items = group_items.clone();
-                            move |_| {
-                                let is_all_selected = selected_assets.with(|set| {
-                                    items.iter().all(|(_, a)| set.contains(&a.id))
-                                });
-
-                                selected_assets.update(|set| {
-                                    if is_all_selected {
-                                        for (_, a) in &items {
-                                            set.remove(&a.id);
-                                        }
-                                    } else {
-                                        for (_, a) in &items {
-                                            set.insert(a.id.clone());
-                                        }
-                                    }
-                                });
-                            }
-                        };
+                        let group_start_index = group.items.first().unwrap().0;
+                        let is_visible = move || display_count.get() > group_start_index;
+                        let real_key_clone = real_key.clone();
 
                         view! {
-                            <div class="gallery-date-group">
-                                <div class="gallery-date-header">
-                                    <span class="date-label">{label}</span>
-                                    <div
-                                        class="date-selector"
-                                        class:selected=has_all_selected
-                                        on:click=on_group_toggle
-                                    >
-                                        <span class="check-icon"></span>
+                            <Show when=is_visible>
+                                {
+                                    let label = group.label.clone();
+                                    let group_items = group.items.clone();
+                                    let s_key_for_tile = real_key_clone.clone();
+
+                                    let has_all_selected = {
+                                        let items = group_items.clone();
+                                        move || {
+                                            let selected = selected_assets.get();
+                                            items.iter().all(|(_, a)| selected.contains(&a.id))
+                                        }
+                                    };
+
+                                    let on_group_toggle = {
+                                        let items = group_items.clone();
+                                        move |_| {
+                                            let is_all_selected = selected_assets.with(|set| {
+                                                items.iter().all(|(_, a)| set.contains(&a.id))
+                                            });
+
+                                            selected_assets.update(|set| {
+                                                if is_all_selected {
+                                                    for (_, a) in &items {
+                                                        set.remove(&a.id);
+                                                    }
+                                                } else {
+                                                    for (_, a) in &items {
+                                                        set.insert(a.id.clone());
+                                                    }
+                                                }
+                                            });
+                                        }
+                                    };
+
+                                    view! {
+                                <div class="gallery-date-group">
+                                    <div class="gallery-date-header">
+                                        <span class="date-label">{label}</span>
+                                        <div
+                                            class="date-selector"
+                                            class:selected=has_all_selected
+                                            on:click=on_group_toggle
+                                        >
+                                            <span class="check-icon"></span>
+                                        </div>
                                     </div>
-                                </div>
-                                <div class="gallery-date-items">
-                                    <For
-                                        each=move || group_items.clone()
-                                        key=|(_, a)| a.id.clone()
-                                        children={
-                                            let key_clone = s_key_for_tile.clone();
-                                            move |(i, asset)| {
-                                                view! {
-                                                    <AssetTile
-                                                        i=i
-                                                        asset=asset
-                                                        share_key=key_clone.clone()
-                                                        selected_assets=selected_assets
-                                                        on_toggle=on_toggle_select
-                                                    />
+                                    <div class="gallery-date-items">
+                                        <For
+                                            each={
+                                                let items = group_items.clone();
+                                                move || {
+                                                    let current = display_count.get();
+                                                    items.iter().filter(|(i, _)| *i < current).cloned().collect::<Vec<_>>()
                                                 }
                                             }
-                                        }
-                                    />
+                                            key=|(_, a)| a.id.clone()
+                                            children={
+                                                let key_clone = s_key_for_tile.clone();
+                                                move |(i, asset)| {
+                                                    view! {
+                                                        <AssetTile
+                                                            i=i
+                                                            asset=asset
+                                                            share_key=key_clone.clone()
+                                                            selected_assets=selected_assets
+                                                            on_toggle=on_toggle_select
+                                                        />
+                                                    }
+                                                }
+                                            }
+                                        />
+                                    </div>
                                 </div>
-                            </div>
+                                    }
+                                }
+                            </Show>
                         }
                     }
                 />
             </div>
+
+            <Show when=move || is_loading_more.get()>
+                <div id="loading-spinner">
+                    <span class="loader"></span>
+                </div>
+            </Show>
 
             <script inner_html=gallery_data />
             <script>
