@@ -213,6 +213,7 @@ fn Gallery(details: ShareDetails) -> impl IntoView {
     let total_assets = assets.len();
     let display_count = RwSignal::new(std::cmp::min(40, total_assets));
     let is_loading_more = RwSignal::new(false);
+    let has_observed = RwSignal::new(false);
 
     #[cfg(feature = "hydrate")]
     {
@@ -230,6 +231,7 @@ fn Gallery(details: ShareDetails) -> impl IntoView {
                     let entry: IntersectionObserverEntry = entry.unchecked_into();
                     is_intersecting.set(entry.is_intersecting());
                 }
+                has_observed.set(true);
             },
         )
             as Box<dyn FnMut(js_sys::Array, IntersectionObserver)>);
@@ -516,7 +518,14 @@ fn Gallery(details: ShareDetails) -> impl IntoView {
             </div>
 
             <div id="loading-observer" style="height: 1px; width: 100%;"></div>
-            <Show when=move || is_loading_more.get()>
+            <Show when=move || {
+                // If we haven't received initial observation yet, fallback to whether we have more items to load
+                if !has_observed.get() {
+                    display_count.get() < total_assets
+                } else {
+                    is_loading_more.get()
+                }
+            }>
                 <div id="loading-spinner">
                     <span class="loader"></span>
                 </div>
