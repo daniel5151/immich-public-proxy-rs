@@ -14,4 +14,4 @@ Cargo.lock
 *.pdb
 
 # has some personal deets
-.agent/skills/prilik-immich
+.agent/skills/
