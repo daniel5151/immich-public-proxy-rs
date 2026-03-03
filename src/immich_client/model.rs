@@ -31,6 +31,7 @@ pub struct Album {
     pub album_name: Option<String>,
     pub description: Option<String>,
     pub order: Option<String>, // 'asc' | 'desc'
+    pub album_thumbnail_asset_id: Option<String>,
     #[serde(default)]
     pub assets: Vec<Asset>,
 }

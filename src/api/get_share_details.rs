@@ -85,7 +85,8 @@ pub async fn get_share_details(
                             asset.key = Some(key.clone());
                             asset.password = password.clone();
                         }
-                        link.assets = album_data.assets;
+                        link.assets = album_data.assets.clone();
+                        link.album = Some(album_data);
                     }
                 }
             }

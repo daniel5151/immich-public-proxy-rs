@@ -198,12 +198,17 @@ fn Gallery(details: ShareDetails) -> impl IntoView {
     let album_description = link.album.as_ref().and_then(|a| a.description.clone());
     let public_base_url = details.public_base_url.trim_end_matches('/').to_string();
     let current_url = format!("{}/share/{}", public_base_url, request_key);
-    let cover_image_url = assets
-        .first()
-        .map(|a| {
+    let cover_asset_id = link
+        .album
+        .as_ref()
+        .and_then(|a| a.album_thumbnail_asset_id.clone())
+        .or_else(|| assets.first().map(|a| a.id.clone()));
+
+    let cover_image_url = cover_asset_id
+        .map(|id| {
             format!(
                 "{}/share/photo/{}/{}/preview",
-                public_base_url, real_key, a.id
+                public_base_url, real_key, id
             )
         })
         .unwrap_or_default();
@@ -381,14 +386,14 @@ fn Gallery(details: ShareDetails) -> impl IntoView {
 
     view! {
         <Title text=title.clone() />
-        <Meta name="og:title" content=title.clone() />
-        <Meta name="twitter:title" content=title.clone() />
         <Meta name="description" content=album_description.clone().unwrap_or_default() />
         <Meta name="og:description" content=album_description.clone().unwrap_or_default() />
-        <Meta name="twitter:description" content=album_description.clone().unwrap_or_default() />
         <Meta name="og:image" content=cover_image_url.clone() />
-        <Meta name="twitter:image" content=cover_image_url.clone() />
+        <Meta name="og:title" content=title.clone() />
         <Meta name="twitter:card" content="summary_large_image".to_string() />
+        <Meta name="twitter:description" content=album_description.clone().unwrap_or_default() />
+        <Meta name="twitter:image" content=cover_image_url.clone() />
+        <Meta name="twitter:title" content=title.clone() />
 
         <Meta name="og:url" content=current_url.clone() />
 
