@@ -211,7 +211,7 @@ fn Gallery(details: ShareDetails) -> impl IntoView {
     let selected_assets = RwSignal::new(HashSet::<String>::new());
 
     let total_assets = assets.len();
-    let display_count = RwSignal::new(std::cmp::min(50, total_assets));
+    let display_count = RwSignal::new(std::cmp::min(40, total_assets));
     let is_loading_more = RwSignal::new(false);
 
     #[cfg(feature = "hydrate")]
@@ -222,45 +222,35 @@ fn Gallery(details: ShareDetails) -> impl IntoView {
         use web_sys::IntersectionObserverEntry;
         use web_sys::IntersectionObserverInit;
 
-        use std::cell::Cell;
-        use std::rc::Rc;
-
-        let is_intersecting = Rc::new(Cell::new(false));
-        let is_int_clone = is_intersecting.clone();
+        let is_intersecting = RwSignal::new(false);
 
         let closure = Closure::wrap(Box::new(
             move |entries: js_sys::Array, _observer: IntersectionObserver| {
                 for entry in entries.iter() {
                     let entry: IntersectionObserverEntry = entry.unchecked_into();
-                    is_int_clone.set(entry.is_intersecting());
+                    is_intersecting.set(entry.is_intersecting());
                 }
             },
         )
             as Box<dyn FnMut(js_sys::Array, IntersectionObserver)>);
 
-        let is_int_clone2 = is_intersecting.clone();
-        let loop_closure = Closure::wrap(Box::new(move || {
-            if is_int_clone2.get() {
-                let current = display_count.get_untracked();
+        Effect::new(move |_| {
+            if is_intersecting.get() {
+                let current = display_count.get();
                 if current < total_assets && !is_loading_more.get_untracked() {
                     is_loading_more.set(true);
                     let next = std::cmp::min(current + 10, total_assets);
 
-                    let closure_inner = Closure::once(move || {
-                        display_count.set(next);
-                        is_loading_more.set(false);
-                    });
-
-                    if let Some(w) = web_sys::window() {
-                        let _ = w.set_timeout_with_callback_and_timeout_and_arguments_0(
-                            closure_inner.as_ref().unchecked_ref(),
-                            400,
-                        );
-                    }
-                    closure_inner.forget();
+                    set_timeout(
+                        move || {
+                            is_loading_more.set(false);
+                            display_count.set(next);
+                        },
+                        std::time::Duration::from_millis(400),
+                    );
                 }
             }
-        }) as Box<dyn FnMut()>);
+        });
 
         if let Some(window) = web_sys::window() {
             if let Some(document) = window.document() {
@@ -283,12 +273,6 @@ fn Gallery(details: ShareDetails) -> impl IntoView {
                     std::time::Duration::from_millis(100),
                 );
             }
-
-            let _ = window.set_interval_with_callback_and_timeout_and_arguments_0(
-                loop_closure.as_ref().unchecked_ref(),
-                100,
-            );
-            loop_closure.forget();
         }
     }
 
