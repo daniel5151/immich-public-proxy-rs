@@ -1,0 +1,53 @@
+name: Release
+
+on:
+  workflow_dispatch:
+
+jobs:
+  release:
+    name: Build and Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-leptos
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-leptos
+
+      - name: Build
+        run: cargo leptos build --release
+
+      - name: Get version
+        id: get_version
+        run: |
+          VERSION=$(grep '^version =' Cargo.toml | head -1 | cut -d '"' -f 2)
+          echo "tag=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Prepare assets
+        run: |
+          mkdir -p release
+          cp target/server/release/immich-public-proxy-rs release/
+          cp -r target/site release/site
+          tar -czf immich-public-proxy-rs-v${{ steps.get_version.outputs.tag }}-x86_64-unknown-linux-gnu.tar.gz -C release .
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.get_version.outputs.tag }}
+          name: Release v${{ steps.get_version.outputs.tag }}
+          files: immich-public-proxy-rs-v${{ steps.get_version.outputs.tag }}-x86_64-unknown-linux-gnu.tar.gz
+          generate_release_notes: true
+          draft: false
+          prerelease: false
