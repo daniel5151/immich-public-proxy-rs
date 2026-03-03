@@ -20,7 +20,7 @@ class LGallery {
       download: true,
       counter: false,
       hideScrollbar: true,
-      preload: 1,
+      preload: 2,
       mobileSettings: { controls: false, showCloseIcon: true, download: true },
     }, params.lgConfig);
 

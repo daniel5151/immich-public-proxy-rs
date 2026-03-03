@@ -218,44 +218,77 @@ fn Gallery(details: ShareDetails) -> impl IntoView {
     {
         use wasm_bindgen::JsCast;
         use wasm_bindgen::closure::Closure;
+        use web_sys::IntersectionObserver;
+        use web_sys::IntersectionObserverEntry;
+        use web_sys::IntersectionObserverInit;
 
-        // Track whether our event listener has been set up to prevent duplicates across hot reloads if they occur, though hydrate only runs once typically.
-        let handler = Closure::wrap(Box::new(move || {
-            if let Some(window) = web_sys::window() {
-                if let Some(document) = window.document() {
-                    let scroll_y = window.scroll_y().unwrap_or(0.0);
-                    let inner_height = window.inner_height().unwrap().as_f64().unwrap_or(0.0);
-                    let scroll_height = document
-                        .document_element()
-                        .map(|e| e.scroll_height() as f64)
-                        .unwrap_or(0.0);
+        use std::cell::Cell;
+        use std::rc::Rc;
 
-                    if scroll_y + inner_height >= scroll_height - 1000.0 {
-                        let current = display_count.get_untracked();
-                        if current < total_assets && !is_loading_more.get_untracked() {
-                            is_loading_more.set(true);
-                            let next = std::cmp::min(current + 10, total_assets);
+        let is_intersecting = Rc::new(Cell::new(false));
+        let is_int_clone = is_intersecting.clone();
 
-                            let closure = Closure::once(move || {
-                                display_count.set(next);
-                                is_loading_more.set(false);
-                            });
+        let closure = Closure::wrap(Box::new(
+            move |entries: js_sys::Array, _observer: IntersectionObserver| {
+                for entry in entries.iter() {
+                    let entry: IntersectionObserverEntry = entry.unchecked_into();
+                    is_int_clone.set(entry.is_intersecting());
+                }
+            },
+        )
+            as Box<dyn FnMut(js_sys::Array, IntersectionObserver)>);
 
-                            let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
-                                closure.as_ref().unchecked_ref(),
-                                300,
-                            );
-                            closure.forget();
-                        }
+        let is_int_clone2 = is_intersecting.clone();
+        let loop_closure = Closure::wrap(Box::new(move || {
+            if is_int_clone2.get() {
+                let current = display_count.get_untracked();
+                if current < total_assets && !is_loading_more.get_untracked() {
+                    is_loading_more.set(true);
+                    let next = std::cmp::min(current + 10, total_assets);
+
+                    let closure_inner = Closure::once(move || {
+                        display_count.set(next);
+                        is_loading_more.set(false);
+                    });
+
+                    if let Some(w) = web_sys::window() {
+                        let _ = w.set_timeout_with_callback_and_timeout_and_arguments_0(
+                            closure_inner.as_ref().unchecked_ref(),
+                            400,
+                        );
                     }
+                    closure_inner.forget();
                 }
             }
         }) as Box<dyn FnMut()>);
 
         if let Some(window) = web_sys::window() {
-            let _ =
-                window.add_event_listener_with_callback("scroll", handler.as_ref().unchecked_ref());
-            handler.forget();
+            if let Some(document) = window.document() {
+                // Initialize observer only once during hydrate mounting cycle
+                set_timeout(
+                    move || {
+                        if let Some(target) = document.get_element_by_id("loading-observer") {
+                            let options = IntersectionObserverInit::new();
+                            options.set_root_margin("1000px 0px 1000px 0px"); // margin to eagerly start loading items offscreen
+
+                            if let Ok(observer) = IntersectionObserver::new_with_options(
+                                closure.as_ref().unchecked_ref(),
+                                &options,
+                            ) {
+                                observer.observe(&target);
+                                closure.forget();
+                            }
+                        }
+                    },
+                    std::time::Duration::from_millis(100),
+                );
+            }
+
+            let _ = window.set_interval_with_callback_and_timeout_and_arguments_0(
+                loop_closure.as_ref().unchecked_ref(),
+                100,
+            );
+            loop_closure.forget();
         }
     }
 
@@ -498,6 +531,7 @@ fn Gallery(details: ShareDetails) -> impl IntoView {
                 />
             </div>
 
+            <div id="loading-observer" style="height: 1px; width: 100%;"></div>
             <Show when=move || is_loading_more.get()>
                 <div id="loading-spinner">
                     <span class="loader"></span>
