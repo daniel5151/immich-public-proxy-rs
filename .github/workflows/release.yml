@@ -38,7 +38,7 @@ jobs:
       - name: Prepare assets
         run: |
           mkdir -p release
-          cp target/server/release/immich-public-proxy-rs release/
+          cp target/release/immich-public-proxy-rs release/
           cp -r target/site release/site
           tar -czf immich-public-proxy-rs-v${{ steps.get_version.outputs.tag }}-x86_64-unknown-linux-gnu.tar.gz -C release .
 
