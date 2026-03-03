@@ -36,7 +36,36 @@ pub struct UnlockPayload {
     password: String,
 }
 
-pub async fn unlock_share_handler(Form(payload): Form<UnlockPayload>) -> impl IntoResponse {
+fn is_safe_param(s: &str) -> bool {
+    s.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+pub async fn unlock_share_handler(
+    headers: HeaderMap,
+    Form(payload): Form<UnlockPayload>,
+) -> impl IntoResponse {
+    if !is_safe_param(&payload.key) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
+    if let Some(site) = headers.get("sec-fetch-site") {
+        if site != "same-origin" {
+            return StatusCode::FORBIDDEN.into_response();
+        }
+    } else if let (Some(o), Some(h)) = (
+        headers
+            .get(axum::http::header::ORIGIN)
+            .and_then(|v| v.to_str().ok()),
+        headers
+            .get(axum::http::header::HOST)
+            .and_then(|v| v.to_str().ok()),
+    ) {
+        if !o.ends_with(&format!("://{}", h)) {
+            return StatusCode::FORBIDDEN.into_response();
+        }
+    }
+
     let client = ImmichClient::new();
     let mut success = false;
     let mut real_key = payload.key.clone();
@@ -55,18 +84,23 @@ pub async fn unlock_share_handler(Form(payload): Form<UnlockPayload>) -> impl In
     }
 
     if success {
+        use base64::Engine;
+        let b64_pwd = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&payload.password);
+        let b64_key = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&payload.key);
+
         let cookie1 = format!(
-            "immich_pwd_{}={}; Path=/; HttpOnly",
-            payload.key, payload.password
+            "immich_pwd_{}={}; Path=/; HttpOnly; Secure; SameSite=Lax",
+            b64_key, b64_pwd
         );
         let mut resp = Redirect::to(&format!("/share/{}", payload.key)).into_response();
         resp.headers_mut()
             .append(axum::http::header::SET_COOKIE, cookie1.parse().unwrap());
 
         if payload.key != real_key {
+            let b64_real_key = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&real_key);
             let cookie2 = format!(
-                "immich_pwd_{}={}; Path=/; HttpOnly",
-                real_key, payload.password
+                "immich_pwd_{}={}; Path=/; HttpOnly; Secure; SameSite=Lax",
+                b64_real_key, b64_pwd
             );
             resp.headers_mut()
                 .append(axum::http::header::SET_COOKIE, cookie2.parse().unwrap());
@@ -96,6 +130,9 @@ async fn proxy_photo_impl(
     id: String,
     size_str: String,
 ) -> impl IntoResponse {
+    if !is_safe_param(&key) || !is_safe_param(&id) || !is_safe_param(&size_str) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
     let client = ImmichClient::new();
     let cookie_password = get_cookie_password(&headers, &key);
 
@@ -147,6 +184,9 @@ pub async fn proxy_video(
     headers: HeaderMap,
     Path((key, id)): Path<(String, String)>,
 ) -> impl IntoResponse {
+    if !is_safe_param(&key) || !is_safe_param(&id) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
     let client = ImmichClient::new();
     let cookie_password = get_cookie_password(&headers, &key);
 
@@ -196,6 +236,9 @@ pub async fn download_all(
     Path(key): Path<String>,
     Query(query): Query<DownloadQuery>,
 ) -> impl IntoResponse {
+    if !is_safe_param(&key) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
     let client = ImmichClient::new();
     let cookie_password = get_cookie_password(&headers, &key);
 
@@ -237,7 +280,11 @@ pub async fn download_all(
     let filename = format!("{}.zip", sanitized_title);
 
     let asset_ids: Vec<String> = if let Some(ids_str) = query.asset_ids {
-        ids_str.split(',').map(|s| s.to_string()).collect()
+        ids_str
+            .split(',')
+            .filter(|s| is_safe_param(s))
+            .map(|s| s.to_string())
+            .collect()
     } else {
         share.assets.into_iter().map(|a| a.id).collect()
     };

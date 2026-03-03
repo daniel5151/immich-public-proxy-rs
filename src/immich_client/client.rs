@@ -70,15 +70,24 @@ impl ImmichClient {
 }
 
 pub fn get_cookie_password(headers: &axum::http::HeaderMap, key: &str) -> Option<String> {
+    use base64::Engine;
+    let b64_key = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key);
+    let prefix = format!("immich_pwd_{}=", b64_key);
+
     headers
         .get(axum::http::header::COOKIE)
         .and_then(|v| v.to_str().ok())
         .and_then(|cookie_str| {
-            let prefix = format!("immich_pwd_{}=", key);
             cookie_str
                 .split(';')
                 .map(|s| s.trim())
                 .find(|s| s.starts_with(&prefix))
-                .map(|s| s[prefix.len()..].to_string())
+                .and_then(|s| {
+                    let encoded = &s[prefix.len()..];
+                    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                        .decode(encoded)
+                        .ok()?;
+                    String::from_utf8(decoded).ok()
+                })
         })
 }
