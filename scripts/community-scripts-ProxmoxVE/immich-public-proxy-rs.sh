@@ -73,22 +73,34 @@ function uninstall() {
   msg_ok "${APP} has been uninstalled"
 }
 
-function get_source_dir() {
-  while true; do
-    read -rp "${TAB3}Enter the path to the directory containing immich-public-proxy-rs and site/: " SOURCE_DIR
-    if [[ -d "$SOURCE_DIR" && -f "$SOURCE_DIR/immich-public-proxy-rs" && -d "$SOURCE_DIR/site" ]]; then
-      break
-    else
-      msg_warn "Directory must contain immich-public-proxy-rs binary and site/ directory! Please try again."
-    fi
-  done
+function download_latest_release() {
+  msg_info "Fetching latest release from GitHub"
+  RELEASE_DATA=$(curl -s https://api.github.com/repos/daniel5151/immich-public-proxy-rs/releases/latest)
+  RELEASE_TAG=$(echo "$RELEASE_DATA" | grep '"tag_name":' | head -1 | cut -d '"' -f 4)
+  DOWNLOAD_URL=$(echo "$RELEASE_DATA" | grep '"browser_download_url":' | grep 'x86_64-unknown-linux-gnu.tar.gz' | head -1 | cut -d '"' -f 4)
+
+  if [[ -z "$DOWNLOAD_URL" ]]; then
+    msg_error "Failed to find download URL for the latest release. Make sure a release exists on GitHub."
+    exit 1
+  fi
+
+  msg_info "Downloading release: $RELEASE_TAG"
+  TEMP_DIR=$(mktemp -d)
+  curl -L "$DOWNLOAD_URL" -o "$TEMP_DIR/release.tar.gz"
+  msg_ok "Downloaded release"
+
+  msg_info "Extracting release"
+  mkdir -p "$TEMP_DIR/extracted"
+  tar -xzf "$TEMP_DIR/release.tar.gz" -C "$TEMP_DIR/extracted"
+  SOURCE_DIR="$TEMP_DIR/extracted"
+  msg_ok "Extracted release"
 }
 
 # ==============================================================================
 # UPDATE
 # ==============================================================================
 function update() {
-  get_source_dir
+  download_latest_release
 
   msg_info "Stopping service"
   systemctl stop immich-proxy-rs.service &>/dev/null || true
@@ -117,8 +129,10 @@ function update() {
   msg_ok "Updated service"
 
   msg_info "Starting service"
-  systemctl start immich-proxy
+  systemctl start immich-proxy-rs
   msg_ok "Started service"
+
+  rm -rf "$TEMP_DIR"
   msg_ok "Updated successfully"
   exit
 }
@@ -148,7 +162,7 @@ EOF
 # INSTALL
 # ==============================================================================
 function install() {
-  get_source_dir
+  download_latest_release
 
   msg_info "Installing ${APP}"
   mkdir -p "$CONFIG_PATH"
@@ -204,8 +218,10 @@ EOF
 
   msg_info "Creating service"
   create_service
-  systemctl enable -q --now immich-proxy
+  systemctl enable -q --now immich-proxy-rs
   msg_ok "Created and started service"
+
+  rm -rf "$TEMP_DIR"
 
   # Create update script (simple wrapper that calls the local script with type=update)
   msg_info "Creating update script"
