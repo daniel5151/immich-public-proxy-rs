@@ -12,6 +12,15 @@ use leptos_router::components::Route;
 use leptos_router::components::Router;
 use leptos_router::components::Routes;
 use std::collections::HashSet;
+#[cfg(target_arch = "wasm32")]
+use web_sys::{FormData, HtmlInputElement, Request, RequestInit};
+
+#[derive(Clone)]
+#[allow(dead_code)]
+enum UploadResult {
+    Success,
+    Failed(String),
+}
 
 #[component]
 pub fn App() -> impl IntoView {
@@ -186,6 +195,8 @@ fn Gallery(details: ShareDetails) -> impl IntoView {
         }
     };
 
+    let allow_upload = link.allow_upload.unwrap_or(false);
+
     let title: String = match link
         .description
         .clone()
@@ -219,6 +230,97 @@ fn Gallery(details: ShareDetails) -> impl IntoView {
     let display_count = RwSignal::new(std::cmp::min(40, total_assets));
     let is_loading_more = RwSignal::new(false);
     let has_observed = RwSignal::new(false);
+
+    let is_uploading = RwSignal::new(false);
+    let upload_progress = RwSignal::new((0, 0)); // (completed, total)
+    let upload_status = RwSignal::new(Option::<UploadResult>::None);
+
+    let on_upload_change = {
+        let real_key_signal = RwSignal::new(real_key.clone());
+        move |ev: leptos::ev::Event| {
+            cfg_if::cfg_if! {
+                if #[cfg(target_arch = "wasm32")] {
+                    use wasm_bindgen::JsCast;
+                    let Some(target) = ev.target() else { return };
+                    let input = target.unchecked_into::<HtmlInputElement>();
+                    let files = input.files();
+                    let Some(file_list) = files else { return };
+                    let count = file_list.length();
+                    if count == 0 { return; }
+
+                    is_uploading.set(true);
+                    upload_progress.set((0, count as usize));
+                    upload_status.set(None);
+
+                    let real_key = real_key_signal.get();
+
+                    leptos::task::spawn_local(async move {
+                        let mut success = true;
+                        let mut failed_name = String::new();
+
+                        for i in 0..count {
+                            let Some(file) = file_list.item(i) else { continue };
+                            let file_name = file.name();
+
+                            let form_data = FormData::new().unwrap();
+                            let file_date = js_sys::Reflect::get(&file, &"lastModified".into())
+                                .ok()
+                                .and_then(|v| v.as_f64())
+                                .and_then(|ms| chrono::DateTime::from_timestamp_millis(ms as i64))
+                                .unwrap_or_else(chrono::Utc::now)
+                                .to_rfc3339();
+
+                            let blob = file.unchecked_ref::<web_sys::Blob>();
+                            form_data.append_with_blob_and_filename("assetData", blob, &file_name).unwrap();
+                            form_data.append_with_str("deviceAssetId", &file_name).unwrap();
+                            form_data.append_with_str("deviceId", "immich-public-proxy").unwrap();
+                            form_data.append_with_str("fileCreatedAt", &file_date).unwrap();
+                            form_data.append_with_str("fileModifiedAt", &file_date).unwrap();
+
+                            let opts = RequestInit::new();
+                            opts.set_method("POST");
+                            opts.set_body(&form_data);
+
+                            let url = format!("/share/{}/upload", real_key);
+                            let request = Request::new_with_str_and_init(&url, &opts).unwrap();
+
+                            let window = web_sys::window().unwrap();
+                            let resp_value: Result<wasm_bindgen::JsValue, wasm_bindgen::JsValue> =
+                                wasm_bindgen_futures::JsFuture::from(window.fetch_with_request(&request)).await;
+
+                            match resp_value {
+                                Ok(v) => {
+                                    let resp: web_sys::Response = v.unchecked_into();
+                                    if !resp.ok() {
+                                        success = false;
+                                        failed_name = file_name.clone();
+                                        break;
+                                    }
+                                }
+                                Err(_) => {
+                                    success = false;
+                                    failed_name = file_name.clone();
+                                    break;
+                                }
+                            }
+
+                            upload_progress.update(|p| p.0 += 1);
+                        }
+
+                        if success {
+                            upload_status.set(Some(UploadResult::Success));
+                        } else {
+                            upload_status.set(Some(UploadResult::Failed(failed_name)));
+                        }
+                        is_uploading.set(false);
+                    });
+                } else {
+                    let _ = ev;
+                    let _ = real_key_signal;
+                }
+            }
+        }
+    };
 
     #[cfg(feature = "hydrate")]
     {
@@ -383,6 +485,7 @@ fn Gallery(details: ShareDetails) -> impl IntoView {
     };
 
     let is_selection_mode = move || !selected_assets.get().is_empty();
+    let real_key_header = real_key.clone();
 
     view! {
         <Title text=title.clone() />
@@ -414,12 +517,23 @@ fn Gallery(details: ShareDetails) -> impl IntoView {
             <div id="header">
                 <h1>{title}</h1>
                 <div class="header-actions">
-                    <div id="download-all" style={if allow_download { "" } else { "display:none" }}>
-                        <a href=format!("/share/{}/download", real_key) rel="external" title="Download all">
-                            <img src="/images/download-all.svg" alt="" />
-                            <span>"Download all"</span>
-                        </a>
-                    </div>
+                    <Show when=move || allow_upload>
+                        <div id="upload-action">
+                            <label class={move || if is_uploading.get() { "header-btn disabled" } else { "header-btn" }}>
+                                <img src="/images/align-top-svgrepo-com.svg" alt="" class="header-icon" />
+                                <span>"Upload"</span>
+                                <input type="file" multiple accept="image/*,video/*" class="hidden-file-input" disabled=move || is_uploading.get() on:change=on_upload_change />
+                            </label>
+                        </div>
+                    </Show>
+                    <Show when=move || allow_download>
+                        <div id="download-all">
+                            <a href=format!("/share/{}/download", real_key_header) rel="external" title="Download all" class="header-btn">
+                                <img src="/images/align-bottom-svgrepo-com.svg" alt="" class="header-icon" />
+                                <span>"Download all"</span>
+                            </a>
+                        </div>
+                    </Show>
                 </div>
             </div>
             {album_description.map(|desc| {
@@ -546,6 +660,33 @@ fn Gallery(details: ShareDetails) -> impl IntoView {
                 if (document.readyState === 'complete') window.initLG();
                 else document.addEventListener('DOMContentLoaded', window.initLG);"
             </script>
+
+            <Show when=move || is_uploading.get() || upload_status.get().is_some()>
+                <div id="upload-toast">
+                    <Show when=move || is_uploading.get()>
+                        <div class="toast-content uploading">
+                            <span class="loader-small"></span>
+                            <span>"Uploading " {move || upload_progress.get().0} "/" {move || upload_progress.get().1}</span>
+                        </div>
+                    </Show>
+                    <Show when=move || !is_uploading.get() && matches!(upload_status.get(), Some(UploadResult::Success))>
+                        <div class="toast-content success">
+                            <div style="display:flex;flex-direction:column;gap:4px">
+                                <span>"✅ Upload complete"</span>
+                                <span style="font-size:0.8rem;opacity:0.75">"Reload the page to see your new photos."</span>
+                            </div>
+                        </div>
+                    </Show>
+                    <Show when=move || !is_uploading.get() && matches!(upload_status.get(), Some(UploadResult::Failed(_)))>
+                        <div class="toast-content failed">
+                            <span>"❌ Failed to upload: " {move || match upload_status.get() {
+                                Some(UploadResult::Failed(name)) => name,
+                                _ => String::new(),
+                            }}</span>
+                        </div>
+                    </Show>
+                </div>
+            </Show>
         </div>
     }.into_any()
 }

@@ -46,6 +46,7 @@ pub struct SharedLink {
     pub password_required: bool,
     pub r#type: Option<String>, // "ALBUM" or "INDIVIDUAL"
     pub allow_download: Option<bool>,
+    pub allow_upload: Option<bool>,
     #[serde(default)]
     pub assets: Vec<Asset>,
     pub album: Option<Album>,

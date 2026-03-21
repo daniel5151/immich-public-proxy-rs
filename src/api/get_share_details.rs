@@ -52,6 +52,7 @@ pub async fn get_share_details(
                     password_required: true,
                     r#type: None,
                     allow_download: None,
+                    allow_upload: None,
                     assets: vec![],
                     album: None,
                     password: None,
