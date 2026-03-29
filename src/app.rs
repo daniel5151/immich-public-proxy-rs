@@ -20,6 +20,7 @@ use web_sys::{FormData, HtmlInputElement, Request, RequestInit};
 enum UploadResult {
     Success,
     Failed(String),
+    NameRequired,
 }
 
 #[component]
@@ -234,6 +235,35 @@ fn Gallery(details: ShareDetails) -> impl IntoView {
     let is_uploading = RwSignal::new(false);
     let upload_progress = RwSignal::new((0, 0)); // (completed, total)
     let upload_status = RwSignal::new(Option::<UploadResult>::None);
+    #[allow(unused_variables)]
+    let uploader_name_signal = RwSignal::new(String::new());
+    let file_input_ref = NodeRef::<leptos::html::Input>::new();
+
+    // Click handler on the upload button: prompt for name BEFORE opening the file picker.
+    let on_upload_click = move |ev: leptos::ev::MouseEvent| {
+        ev.prevent_default();
+        cfg_if::cfg_if! {
+            if #[cfg(target_arch = "wasm32")] {
+                if is_uploading.get_untracked() { return; }
+                let window = web_sys::window().unwrap();
+                let name = window.prompt_with_message("Enter your name to associate with this upload:");
+                match name {
+                    Ok(Some(ref n)) if !n.trim().is_empty() => {
+                        uploader_name_signal.set(n.trim().to_string());
+                        // Now programmatically open the file picker
+                        if let Some(input) = file_input_ref.get() {
+                            input.click();
+                        }
+                    }
+                    _ => {
+                        upload_status.set(Some(UploadResult::NameRequired));
+                    }
+                }
+            } else {
+                let _ = ev;
+            }
+        }
+    };
 
     let on_upload_change = {
         let real_key_signal = RwSignal::new(real_key.clone());
@@ -248,6 +278,9 @@ fn Gallery(details: ShareDetails) -> impl IntoView {
                     let count = file_list.length();
                     if count == 0 { return; }
 
+                    // Name was already captured by on_upload_click
+                    let uploader_name = uploader_name_signal.get_untracked();
+
                     is_uploading.set(true);
                     upload_progress.set((0, count as usize));
                     upload_status.set(None);
@@ -257,6 +290,8 @@ fn Gallery(details: ShareDetails) -> impl IntoView {
                     leptos::task::spawn_local(async move {
                         let mut success = true;
                         let mut failed_name = String::new();
+
+                        let encoded_name = js_sys::encode_uri_component(&uploader_name);
 
                         for i in 0..count {
                             let Some(file) = file_list.item(i) else { continue };
@@ -281,7 +316,7 @@ fn Gallery(details: ShareDetails) -> impl IntoView {
                             opts.set_method("POST");
                             opts.set_body(&form_data);
 
-                            let url = format!("/share/{}/upload", real_key);
+                            let url = format!("/share/{}/upload?uploader_name={}", real_key, encoded_name);
                             let request = Request::new_with_str_and_init(&url, &opts).unwrap();
 
                             let window = web_sys::window().unwrap();
@@ -519,11 +554,23 @@ fn Gallery(details: ShareDetails) -> impl IntoView {
                 <div class="header-actions">
                     <Show when=move || allow_upload>
                         <div id="upload-action">
-                            <label class={move || if is_uploading.get() { "header-btn disabled" } else { "header-btn" }}>
+                            <button
+                                class={move || if is_uploading.get() { "header-btn disabled" } else { "header-btn" }}
+                                disabled=move || is_uploading.get()
+                                on:click=on_upload_click
+                            >
                                 <img src="/images/align-top-svgrepo-com.svg" alt="" class="header-icon" />
                                 <span>"Upload"</span>
-                                <input type="file" multiple accept="image/*,video/*" class="hidden-file-input" disabled=move || is_uploading.get() on:change=on_upload_change />
-                            </label>
+                            </button>
+                            <input
+                                type="file"
+                                multiple
+                                accept="image/*,video/*"
+                                class="hidden-file-input"
+                                disabled=move || is_uploading.get()
+                                node_ref=file_input_ref
+                                on:change=on_upload_change
+                            />
                         </div>
                     </Show>
                     <Show when=move || allow_download>
@@ -683,6 +730,11 @@ fn Gallery(details: ShareDetails) -> impl IntoView {
                                 Some(UploadResult::Failed(name)) => name,
                                 _ => String::new(),
                             }}</span>
+                        </div>
+                    </Show>
+                    <Show when=move || !is_uploading.get() && matches!(upload_status.get(), Some(UploadResult::NameRequired))>
+                        <div class="toast-content failed">
+                            <span>"⚠️ Please enter your name before uploading."</span>
                         </div>
                     </Show>
                 </div>
