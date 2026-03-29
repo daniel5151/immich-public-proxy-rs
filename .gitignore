@@ -14,5 +14,5 @@ Cargo.lock
 *.pdb
 
 # has some personal deets
-.agent/skills/
+.agents/skills/
 deploy.sh
