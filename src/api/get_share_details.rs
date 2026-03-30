@@ -53,6 +53,7 @@ pub async fn get_share_details(
                     r#type: None,
                     allow_download: None,
                     allow_upload: None,
+                    show_metadata: None,
                     assets: vec![],
                     album: None,
                     password: None,
@@ -68,6 +69,9 @@ pub async fn get_share_details(
             serde_json::from_str(&text).map_err(|e| ServerFnError::new(e.to_string()))?;
         link.password = password.clone();
 
+        let allow_download = link.allow_download.unwrap_or(false);
+        let show_metadata = link.show_metadata.unwrap_or(true);
+
         // Populate album assets if it's an album
         if link.r#type.as_deref() == Some("ALBUM") {
             if let Some(ref album) = link.album {
@@ -82,46 +86,45 @@ pub async fn get_share_details(
                     if let Ok(mut album_data) =
                         album_res.json::<crate::immich_client::model::Album>().await
                     {
-                        if let Some(ref admin_api_key) = client.admin_api_key {
-                            let tags_url = client.build_url("/tags", &[]);
-                            if let Ok(tags_res) = client
-                                .http_client
-                                .get(&tags_url)
-                                .header("x-api-key", admin_api_key)
-                                .send()
-                                .await
-                            {
-                                if let Ok(tags) = tags_res
-                                    .json::<Vec<crate::immich_client::model::Tag>>()
+                        if show_metadata {
+                            if let Some(ref admin_api_key) = client.admin_api_key {
+                                let tags_url = client.build_url("/tags", &[]);
+                                if let Ok(tags_res) = client
+                                    .http_client
+                                    .get(&tags_url)
+                                    .header("x-api-key", admin_api_key)
+                                    .send()
                                     .await
                                 {
-                                    let shared_by_tag = tags
-                                        .iter()
-                                        .find(|t| t.name == "SharedBy" && t.parent_id.is_none());
+                                    if let Ok(tags) = tags_res
+                                        .json::<Vec<crate::immich_client::model::Tag>>()
+                                        .await
+                                    {
+                                        let shared_by_tag = tags.iter().find(|t| {
+                                            t.name == "SharedBy" && t.parent_id.is_none()
+                                        });
 
-                                    if let Some(parent) = shared_by_tag {
-                                        for tag in tags
-                                            .iter()
-                                            .filter(|t| t.parent_id.as_ref() == Some(&parent.id))
-                                        {
-                                            let username = tag.name.clone();
-                                            let mut page = 1u32;
-                                            let search_url =
-                                                client.build_url("/search/metadata", &[]);
-                                            loop {
-                                                let search_req = crate::immich_client::model::MetadataSearchRequest {
+                                        if let Some(parent) = shared_by_tag {
+                                            for tag in tags.iter().filter(|t| {
+                                                t.parent_id.as_ref() == Some(&parent.id)
+                                            }) {
+                                                let username = tag.name.clone();
+                                                let mut page = 1u32;
+                                                let search_url =
+                                                    client.build_url("/search/metadata", &[]);
+                                                loop {
+                                                    let search_req = crate::immich_client::model::MetadataSearchRequest {
                                                     album_ids: Some(vec![album.id.clone()]),
                                                     tag_ids: Some(vec![tag.id.clone()]),
                                                     page: Some(page),
                                                 };
-                                                match client
+                                                    match client
                                                     .http_client
                                                     .post(&search_url)
                                                     .header("x-api-key", admin_api_key)
                                                     .json(&search_req)
                                                     .send()
                                                     .await
-                                                    .and_then(|r| Ok(r))
                                                 {
                                                     Ok(search_res) => {
                                                         if let Ok(search_data) = search_res.json::<crate::immich_client::model::SearchResponse>().await {
@@ -137,43 +140,49 @@ pub async fn get_share_details(
                                                     }
                                                     Err(_) => break,
                                                 }
+                                                }
                                             }
                                         }
                                     }
                                 }
-                            }
-                        }
+                            } // end admin_api_key
+                        } // end show_metadata
 
                         // Fetch owner info per-asset via admin key (search/metadata doesn't return owner)
-                        if let Some(ref admin_api_key) = client.admin_api_key {
-                            for asset in &mut album_data.assets {
-                                asset.key = Some(key.clone());
-                                asset.password = password.clone();
-                                if asset.uploader_name.is_none() {
-                                    let asset_url =
-                                        client.build_url(&format!("/assets/{}", asset.id), &[]);
-                                    if let Ok(res) = client
-                                        .http_client
-                                        .get(&asset_url)
-                                        .header("x-api-key", admin_api_key)
-                                        .send()
-                                        .await
-                                    {
-                                        if let Ok(full_asset) =
-                                            res.json::<crate::immich_client::model::Asset>().await
+                        if show_metadata {
+                            if let Some(ref admin_api_key) = client.admin_api_key {
+                                for asset in &mut album_data.assets {
+                                    asset.key = Some(key.clone());
+                                    asset.password = password.clone();
+                                    if asset.uploader_name.is_none() {
+                                        let asset_url =
+                                            client.build_url(&format!("/assets/{}", asset.id), &[]);
+                                        if let Ok(res) = client
+                                            .http_client
+                                            .get(&asset_url)
+                                            .header("x-api-key", admin_api_key)
+                                            .send()
+                                            .await
                                         {
-                                            asset.uploader_name =
-                                                full_asset.owner.as_ref().map(|o| o.name.clone());
-                                            asset.uploader_is_fallback = true;
+                                            if let Ok(full_asset) = res
+                                                .json::<crate::immich_client::model::Asset>()
+                                                .await
+                                            {
+                                                asset.uploader_name = full_asset
+                                                    .owner
+                                                    .as_ref()
+                                                    .map(|o| o.name.clone());
+                                                asset.uploader_is_fallback = true;
+                                            }
                                         }
                                     }
                                 }
-                            }
-                        } else {
-                            for asset in &mut album_data.assets {
-                                asset.key = Some(key.clone());
-                                asset.password = password.clone();
-                            }
+                            } // end admin_api_key
+                        } // end show_metadata
+
+                        for asset in &mut album_data.assets {
+                            asset.key = Some(key.clone());
+                            asset.password = password.clone();
                         }
 
                         link.assets = album_data.assets.clone();
@@ -185,26 +194,28 @@ pub async fn get_share_details(
             for asset in &mut link.assets {
                 asset.key = Some(key.clone());
                 asset.password = password.clone();
-                if asset.uploader_name.is_none() {
-                    if let Some(ref admin_api_key) = client.admin_api_key {
-                        let asset_url = client.build_url(&format!("/assets/{}", asset.id), &[]);
-                        if let Ok(res) = client
-                            .http_client
-                            .get(&asset_url)
-                            .header("x-api-key", admin_api_key)
-                            .send()
-                            .await
-                        {
-                            if let Ok(full_asset) =
-                                res.json::<crate::immich_client::model::Asset>().await
+                if show_metadata {
+                    if asset.uploader_name.is_none() {
+                        if let Some(ref admin_api_key) = client.admin_api_key {
+                            let asset_url = client.build_url(&format!("/assets/{}", asset.id), &[]);
+                            if let Ok(res) = client
+                                .http_client
+                                .get(&asset_url)
+                                .header("x-api-key", admin_api_key)
+                                .send()
+                                .await
                             {
-                                asset.uploader_name =
-                                    full_asset.owner.as_ref().map(|o| o.name.clone());
-                                asset.uploader_is_fallback = true;
+                                if let Ok(full_asset) =
+                                    res.json::<crate::immich_client::model::Asset>().await
+                                {
+                                    asset.uploader_name =
+                                        full_asset.owner.as_ref().map(|o| o.name.clone());
+                                    asset.uploader_is_fallback = true;
+                                }
                             }
                         }
-                    }
-                }
+                    } // end uploader_name.is_none
+                } // end show_metadata
             }
         }
 
@@ -237,6 +248,15 @@ pub async fn get_share_details(
                     for asset in &mut album.assets {
                         asset.uploader_name = None;
                     }
+                }
+            }
+        }
+
+        // Stamp download_url server-side when downloads are allowed
+        for asset in &mut link.assets {
+            if allow_download {
+                if let Some(ref k) = asset.key {
+                    asset.download_url = Some(format!("/share/photo/{}/{}/original", k, asset.id));
                 }
             }
         }

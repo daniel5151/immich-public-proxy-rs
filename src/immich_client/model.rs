@@ -53,6 +53,8 @@ pub struct Asset {
     pub uploader_name: Option<String>,
     #[serde(default)]
     pub uploader_is_fallback: bool,
+    #[serde(default)]
+    pub download_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -86,6 +88,7 @@ pub struct SharedLink {
     pub r#type: Option<String>, // "ALBUM" or "INDIVIDUAL"
     pub allow_download: Option<bool>,
     pub allow_upload: Option<bool>,
+    pub show_metadata: Option<bool>,
     #[serde(default)]
     pub assets: Vec<Asset>,
     pub album: Option<Album>,

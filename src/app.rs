@@ -432,10 +432,9 @@ fn Gallery(details: ShareDetails) -> impl IntoView {
             let key = real_key.clone();
             let preview_url = format!("/share/photo/{}/{}/preview", key, asset.id);
             let thumbnail_url = format!("/share/photo/{}/{}/thumbnail", key, asset.id);
-            let download_url = format!("/share/photo/{}/{}/original", key, asset.id);
 
             if asset.r#type == "VIDEO" {
-                serde_json::json!({
+                let mut item = serde_json::json!({
                     "video": {
                         "source": [
                             {
@@ -449,15 +448,21 @@ fn Gallery(details: ShareDetails) -> impl IntoView {
                         }
                     },
                     "poster": preview_url,
-                    "thumb": thumbnail_url,
-                    "downloadUrl": download_url
-                })
+                    "thumb": thumbnail_url
+                });
+                if let Some(ref dl) = asset.download_url {
+                    item["downloadUrl"] = serde_json::json!(dl);
+                }
+                item
             } else {
-                serde_json::json!({
+                let mut item = serde_json::json!({
                     "src": preview_url,
-                    "thumb": thumbnail_url,
-                    "downloadUrl": download_url
-                })
+                    "thumb": thumbnail_url
+                });
+                if let Some(ref dl) = asset.download_url {
+                    item["downloadUrl"] = serde_json::json!(dl);
+                }
+                item
             }
         })
         .collect::<Vec<_>>();
