@@ -17,10 +17,13 @@ Share photos and albums from [Immich](https://github.com/immich-app/immich) with
 - **Download Management**:
     - **Download All**: Allows downloading the entire share as a ZIP archive.
     - **Selection-based Downloads**: Users can select specific assets in the gallery to download as a custom ZIP.
+- **Upload Support**: Users can upload media directly to shared albums via the proxy.
+    - NOTE: at the moment, uploads are attributed to the user who created the share. In the future, this will be tweaked to upload images with an uploader-defined tag of `SharedBy/{name}` instead, and/or uploading files under a dedicated "Public-Uploader" service account.
 - **Gallery UI**:
     - Chronological grouping of assets by date.
     - Lazy loading of grid tiles using `IntersectionObserver` for performance in large albums.
     - Responsive layout for desktop and mobile browsers.
+    - Render Uploader Attribution Badges (pulled from `SharedBy/{name}` tags).
 - **SEO/Metadata**: Server-side rendering (SSR) provides OpenGraph meta tags for link previews.
 
 ---
@@ -31,12 +34,12 @@ This project implements the core functionality of the original Node.js proxy wit
 
 ### Differences in this Implementation (Rust)
 
-| Feature | Details |
-| :--- | :--- |
+| Feature                   | Details                                                                                          |
+| :------------------------ | :----------------------------------------------------------------------------------------------- |
 | **Server-Side Rendering** | Uses Leptos for SSR, allowing for SEO-friendly link previews without client-side-only rendering. |
-| **Bulk Selection** | Native UI for selecting and downloading a subset of assets as a ZIP. |
-| **Lazy Loading** | Explicit `IntersectionObserver` implementation for large grids. |
-| **Single Binary** | Compiles to a single binary for easier deployment outside of Docker. |
+| **Bulk Selection**        | Native UI for selecting and downloading a subset of assets as a ZIP.                             |
+| **Lazy Loading**          | Explicit `IntersectionObserver` implementation for large grids.                                  |
+| **Single Binary**         | Compiles to a single binary for easier deployment outside of Docker.                             |
 
 ### Upstream Features Not Currently Implemented
 
@@ -77,13 +80,22 @@ bash -c "$(wget -qLO - https://raw.githubusercontent.com/daniel5151/immich-publi
 
 Configuration is handled via environment variables.
 
-| Variable | Required | Description |
-| :--- | :---: | :--- |
-| `IMMICH_URL` | Yes | The internal URL of your Immich instance (e.g., `http://192.168.1.50:2283`). |
-| `LEPTOS_SITE_ROOT` | Yes | Path to the `site` directory containing static assets. |
-| `LEPTOS_SITE_ADDR` | Yes | Address and port to bind to. |
-| `LEPTOS_OUTPUT_NAME` | Yes | The name of the compiled project. |
-| `RUST_LOG` | No | Logging level (e.g., `info`, `debug`, `warn`). |
+| Variable             | Required | Description                                                                  |
+| :------------------- | :------: | :--------------------------------------------------------------------------- |
+| `IMMICH_URL`         |   Yes    | The internal URL of your Immich instance (e.g., `http://192.168.1.50:2283`). |
+| `LEPTOS_SITE_ROOT`   |   Yes    | Path to the `site` directory containing static assets.                       |
+| `LEPTOS_SITE_ADDR`   |   Yes    | Address and port to bind to.                                                 |
+| `LEPTOS_OUTPUT_NAME` |   Yes    | The name of the compiled project.                                            |
+| `RUST_LOG`           |    No    | Logging level (e.g., `info`, `debug`, `warn`).                               |
+| `IMMICH_API_KEY`     |    No    | API key, optionally enabling extra functionality (see below).                |
+
+### `IMMICH_API_KEY` Features and Permissions
+
+Certain features require configuring a `IMMICH_API_KEY` with the appropriate permissions:
+
+| Feature                                                                       | Required Permissions     |
+| :---------------------------------------------------------------------------- | :----------------------- |
+| **Uploader Attribution Badges** (displaying `SharedBy/{name}` tags on assets) | `tag.read`, `asset.read` |
 
 ### Systemd Service Example
 

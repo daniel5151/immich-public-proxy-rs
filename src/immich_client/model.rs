@@ -3,6 +3,36 @@ use serde::Serialize;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct Tag {
+    pub id: String,
+    pub name: String,
+    pub value: String,
+    pub parent_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MetadataSearchRequest {
+    pub album_ids: Option<Vec<String>>,
+    pub tag_ids: Option<Vec<String>>,
+    pub page: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchResponse {
+    pub assets: SearchResponseAssets,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchResponseAssets {
+    pub items: Vec<Asset>,
+    pub next_page: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Asset {
     pub id: String,
     pub original_file_name: Option<String>,
@@ -14,14 +44,22 @@ pub struct Asset {
     pub exif_info: Option<serde_json::Value>,
     pub width: Option<i32>,
     pub height: Option<i32>,
+    pub owner: Option<User>,
 
     // the proxy augments assets:
-    #[serde(skip)]
-    #[allow(dead_code)]
     pub password: Option<String>,
-    #[serde(skip)]
-    #[allow(dead_code)]
     pub key: Option<String>,
+    #[serde(default)]
+    pub uploader_name: Option<String>,
+    #[serde(default)]
+    pub uploader_is_fallback: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct User {
+    pub id: String,
+    pub name: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -32,6 +70,7 @@ pub struct Album {
     pub description: Option<String>,
     pub order: Option<String>, // 'asc' | 'desc'
     pub album_thumbnail_asset_id: Option<String>,
+    pub owner: Option<User>,
     #[serde(default)]
     pub assets: Vec<Asset>,
 }
@@ -52,7 +91,5 @@ pub struct SharedLink {
     pub album: Option<Album>,
 
     // Proxy augments:
-    #[serde(skip)]
-    #[allow(dead_code)]
     pub password: Option<String>,
 }

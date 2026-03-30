@@ -141,6 +141,9 @@ fn AssetTile(
     let is_selected = move || selected_assets.get().contains(&id_for_selected);
     let preview_url = format!("/share/photo/{}/{}/preview", share_key, id);
 
+    let uploader = asset.uploader_name.clone();
+    let is_uploader_fallback = asset.uploader_is_fallback;
+
     view! {
         <div
             class="tile-wrapper"
@@ -168,6 +171,11 @@ fn AssetTile(
                     alt=""
                     onerror="this.closest('a').classList.add('thumb-error')"
                 />
+                {if let Some(u) = uploader {
+                    view! { <div class="uploader-badge" class:using-owner-data=is_uploader_fallback>{u}</div> }.into_any()
+                } else {
+                    view! { <span style="display:none" /> }.into_any()
+                }}
                 {if is_video {
                     view! { <div class="play-icon"></div> }.into_any()
                 } else {

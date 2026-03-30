@@ -82,10 +82,100 @@ pub async fn get_share_details(
                     if let Ok(mut album_data) =
                         album_res.json::<crate::immich_client::model::Album>().await
                     {
-                        for asset in &mut album_data.assets {
-                            asset.key = Some(key.clone());
-                            asset.password = password.clone();
+                        if let Some(ref admin_api_key) = client.admin_api_key {
+                            let tags_url = client.build_url("/tags", &[]);
+                            if let Ok(tags_res) = client
+                                .http_client
+                                .get(&tags_url)
+                                .header("x-api-key", admin_api_key)
+                                .send()
+                                .await
+                            {
+                                if let Ok(tags) = tags_res
+                                    .json::<Vec<crate::immich_client::model::Tag>>()
+                                    .await
+                                {
+                                    let shared_by_tag = tags
+                                        .iter()
+                                        .find(|t| t.name == "SharedBy" && t.parent_id.is_none());
+
+                                    if let Some(parent) = shared_by_tag {
+                                        for tag in tags
+                                            .iter()
+                                            .filter(|t| t.parent_id.as_ref() == Some(&parent.id))
+                                        {
+                                            let username = tag.name.clone();
+                                            let mut page = 1u32;
+                                            let search_url =
+                                                client.build_url("/search/metadata", &[]);
+                                            loop {
+                                                let search_req = crate::immich_client::model::MetadataSearchRequest {
+                                                    album_ids: Some(vec![album.id.clone()]),
+                                                    tag_ids: Some(vec![tag.id.clone()]),
+                                                    page: Some(page),
+                                                };
+                                                match client
+                                                    .http_client
+                                                    .post(&search_url)
+                                                    .header("x-api-key", admin_api_key)
+                                                    .json(&search_req)
+                                                    .send()
+                                                    .await
+                                                    .and_then(|r| Ok(r))
+                                                {
+                                                    Ok(search_res) => {
+                                                        if let Ok(search_data) = search_res.json::<crate::immich_client::model::SearchResponse>().await {
+                                                            let has_next = search_data.assets.next_page.is_some();
+                                                            let tagged_asset_ids: std::collections::HashSet<_> = search_data.assets.items.into_iter().map(|a| a.id).collect();
+                                                            for asset in &mut album_data.assets {
+                                                                if tagged_asset_ids.contains(&asset.id) {
+                                                                    asset.uploader_name = Some(username.clone());
+                                                                }
+                                                            }
+                                                            if has_next { page += 1; } else { break; }
+                                                        } else { break; }
+                                                    }
+                                                    Err(_) => break,
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
+
+                        // Fetch owner info per-asset via admin key (search/metadata doesn't return owner)
+                        if let Some(ref admin_api_key) = client.admin_api_key {
+                            for asset in &mut album_data.assets {
+                                asset.key = Some(key.clone());
+                                asset.password = password.clone();
+                                if asset.uploader_name.is_none() {
+                                    let asset_url =
+                                        client.build_url(&format!("/assets/{}", asset.id), &[]);
+                                    if let Ok(res) = client
+                                        .http_client
+                                        .get(&asset_url)
+                                        .header("x-api-key", admin_api_key)
+                                        .send()
+                                        .await
+                                    {
+                                        if let Ok(full_asset) =
+                                            res.json::<crate::immich_client::model::Asset>().await
+                                        {
+                                            asset.uploader_name =
+                                                full_asset.owner.as_ref().map(|o| o.name.clone());
+                                            asset.uploader_is_fallback = true;
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            for asset in &mut album_data.assets {
+                                asset.key = Some(key.clone());
+                                asset.password = password.clone();
+                            }
+                        }
+
                         link.assets = album_data.assets.clone();
                         link.album = Some(album_data);
                     }
@@ -95,6 +185,26 @@ pub async fn get_share_details(
             for asset in &mut link.assets {
                 asset.key = Some(key.clone());
                 asset.password = password.clone();
+                if asset.uploader_name.is_none() {
+                    if let Some(ref admin_api_key) = client.admin_api_key {
+                        let asset_url = client.build_url(&format!("/assets/{}", asset.id), &[]);
+                        if let Ok(res) = client
+                            .http_client
+                            .get(&asset_url)
+                            .header("x-api-key", admin_api_key)
+                            .send()
+                            .await
+                        {
+                            if let Ok(full_asset) =
+                                res.json::<crate::immich_client::model::Asset>().await
+                            {
+                                asset.uploader_name =
+                                    full_asset.owner.as_ref().map(|o| o.name.clone());
+                                asset.uploader_is_fallback = true;
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -107,6 +217,26 @@ pub async fn get_share_details(
                 } else if order == "desc" {
                     link.assets
                         .sort_by(|a, b| b.file_created_at.cmp(&a.file_created_at));
+                }
+            }
+        }
+
+        // If all assets have the exact same uploader, omit the badges
+        if !link.assets.is_empty() {
+            let first_uploader = link.assets[0].uploader_name.clone();
+            let all_same = link
+                .assets
+                .iter()
+                .all(|a| a.uploader_name == first_uploader);
+
+            if all_same {
+                for asset in &mut link.assets {
+                    asset.uploader_name = None;
+                }
+                if let Some(ref mut album) = link.album {
+                    for asset in &mut album.assets {
+                        asset.uploader_name = None;
+                    }
                 }
             }
         }

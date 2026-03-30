@@ -27,7 +27,10 @@ impl<T: Clone + Send + Sync + 'static> ProxyRoutes for axum::Router<T> {
         .route("/share/video/{key}/{id}", axum::routing::get(proxy_video))
         .route("/share/unlock", axum::routing::post(unlock_share_handler))
         .route("/share/{key}/download", axum::routing::get(download_all))
-        .route("/share/{key}/upload", axum::routing::post(upload_asset_handler))
+        .route(
+            "/share/{key}/upload",
+            axum::routing::post(upload_asset_handler),
+        )
     }
 }
 
@@ -393,7 +396,13 @@ pub async fn upload_asset_handler(
 
     // Upload the asset to Immich
     let url = client.build_url("/assets", &params);
-    let res = match client.http_client.post(&url).multipart(request_form).send().await {
+    let res = match client
+        .http_client
+        .post(&url)
+        .multipart(request_form)
+        .send()
+        .await
+    {
         Ok(r) if r.status().is_success() => r,
         Ok(r) => return r.status().into_response(),
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
@@ -429,8 +438,7 @@ pub async fn upload_asset_handler(
         .and_then(|link| link.album.as_ref())
         .map(|album| album.id.as_str())
     {
-        let album_url =
-            client.build_url(&format!("/albums/{}/assets", album_id), &params);
+        let album_url = client.build_url(&format!("/albums/{}/assets", album_id), &params);
         let album_res = client
             .http_client
             .put(&album_url)
@@ -439,10 +447,12 @@ pub async fn upload_asset_handler(
             .await;
 
         if let Err(e) = &album_res {
-            eprintln!("failed to add asset {} to album {}: {}", asset_id, album_id, e);
+            eprintln!(
+                "failed to add asset {} to album {}: {}",
+                asset_id, album_id, e
+            );
         }
     }
 
     StatusCode::OK.into_response()
 }
-

@@ -4,6 +4,7 @@ use reqwest::Url;
 pub struct ImmichClient {
     pub api_url: String,
     pub http_client: Client,
+    pub admin_api_key: Option<String>,
 }
 
 impl ImmichClient {
@@ -22,9 +23,15 @@ impl ImmichClient {
         static CLIENT: std::sync::OnceLock<Client> = std::sync::OnceLock::new();
         let http_client = CLIENT.get_or_init(Client::new).clone();
 
+        static ADMIN_API_KEY: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        let admin_api_key = ADMIN_API_KEY
+            .get_or_init(|| std::env::var("IMMICH_API_KEY").ok())
+            .clone();
+
         Self {
             api_url,
             http_client,
+            admin_api_key,
         }
     }
 
