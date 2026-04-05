@@ -211,7 +211,17 @@ fn Gallery(details: ShareDetails) -> impl IntoView {
         .or_else(|| link.album.as_ref().and_then(|a| a.album_name.clone()))
     {
         Some(t) => t,
-        None => return view! { <div class="error-msg">"Error: gallery title/description must be present"</div> }.into_any(),
+        None => {
+            if link.r#type.as_deref() == Some("INDIVIDUAL") {
+                if assets.len() == 1 {
+                    assets.first().and_then(|a| a.original_file_name.clone()).unwrap_or_else(|| "Shared File".to_string())
+                } else {
+                    "Shared Files".to_string()
+                }
+            } else {
+                return view! { <div class="error-msg">"Error: gallery title/description must be present"</div> }.into_any();
+            }
+        }
     };
 
     let album_description = link.album.as_ref().and_then(|a| a.description.clone());
