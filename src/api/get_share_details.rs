@@ -42,11 +42,28 @@ pub async fn get_share_details(
     let (status, text) = client.fetch_share_me(&key, password.as_deref()).await?;
 
     if status == 401 {
-        // Assume password required
-        if text.contains("Invalid password") || text.contains("Invalid share key") {
+        let mut needs_password = false;
+        let mut is_invalid = false;
+
+        match client.get_admin_shared_link(&key).await {
+            Ok(Some(link)) => {
+                // Determine if password is set via the admin API
+                needs_password = link.password.is_some();
+            }
+            Ok(None) => {
+                is_invalid = true;
+            }
+            Err(_) => {
+                // Admin API check failed (e.g., missing permissions or offline)
+                needs_password = true;
+            }
+        }
+
+        if needs_password {
             return Ok(ShareDetails {
                 link: SharedLink {
                     key: key.clone(),
+                    slug: None,
                     description: None,
                     expires_at: None,
                     password_required: true,
@@ -63,7 +80,11 @@ pub async fn get_share_details(
                 request_key: key,
             });
         }
-        return Err(ServerFnError::new("Unauthorized/Unknown"));
+        return Err(ServerFnError::ServerError(if is_invalid {
+            "Invalid share key".to_string()
+        } else {
+            "Share is not accessible".to_string()
+        }));
     } else if status.is_success() {
         let mut link: SharedLink =
             serde_json::from_str(&text).map_err(|e| ServerFnError::new(e.to_string()))?;

@@ -214,7 +214,10 @@ fn Gallery(details: ShareDetails) -> impl IntoView {
         None => {
             if link.r#type.as_deref() == Some("INDIVIDUAL") {
                 if assets.len() == 1 {
-                    assets.first().and_then(|a| a.original_file_name.clone()).unwrap_or_else(|| "Shared File".to_string())
+                    assets
+                        .first()
+                        .and_then(|a| a.original_file_name.clone())
+                        .unwrap_or_else(|| "Shared File".to_string())
                 } else {
                     "Shared Files".to_string()
                 }

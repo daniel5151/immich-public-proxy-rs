@@ -81,6 +81,7 @@ pub struct Album {
 #[serde(rename_all = "camelCase")]
 pub struct SharedLink {
     pub key: String,
+    pub slug: Option<String>,
     pub description: Option<String>,
     pub expires_at: Option<String>,
     #[serde(default)]
