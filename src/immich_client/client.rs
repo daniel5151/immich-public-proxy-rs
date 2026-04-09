@@ -85,15 +85,20 @@ impl ImmichClient {
             return Ok(None);
         };
 
-        if !res.status().is_success() {
-            return Ok(None);
-        }
+        // error_for_status() converts non-2xx into Err(reqwest::Error),
+        // so callers can distinguish "link not found" from "API forbidden/unavailable"
+        let res = res.error_for_status().map_err(|e| {
+            static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+            WARN_ONCE.call_once(|| {
+                eprintln!("warning: Admin API /shared-links failed: {} — slug and password detection will use fallback heuristics", e);
+            });
+            e
+        })?;
 
-        let links: Vec<crate::immich_client::model::SharedLink> =
-            match res.json().await {
-                Ok(l) => l,
-                Err(_) => return Ok(None),
-            };
+        let links: Vec<crate::immich_client::model::SharedLink> = match res.json().await {
+            Ok(l) => l,
+            Err(_) => return Ok(None),
+        };
 
         Ok(links
             .into_iter()
@@ -122,13 +127,17 @@ impl ImmichClient {
 
         // On 401, check whether the identifier is actually a slug
         if status == 401 {
-            if let Ok(Some(link)) = self.get_admin_shared_link(key_or_slug).await {
-                if link.slug.as_deref() == Some(key_or_slug) {
-                    params[0] = ("slug", key_or_slug);
-                    let slug_url = self.build_url("/shared-links/me", &params);
-                    if let Ok(r) = self.http_client.get(&slug_url).send().await {
-                        return Ok((r.status(), r.text().await.unwrap_or_default()));
-                    }
+            let is_slug = match self.get_admin_shared_link(key_or_slug).await {
+                Ok(Some(link)) => link.slug.as_deref() == Some(key_or_slug),
+                // No admin key or API error — fall back to text-based detection
+                _ => text.contains("Invalid share key"),
+            };
+
+            if is_slug {
+                params[0] = ("slug", key_or_slug);
+                let slug_url = self.build_url("/shared-links/me", &params);
+                if let Ok(r) = self.http_client.get(&slug_url).send().await {
+                    return Ok((r.status(), r.text().await.unwrap_or_default()));
                 }
             }
         }

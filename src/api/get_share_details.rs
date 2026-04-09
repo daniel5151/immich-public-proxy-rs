@@ -50,6 +50,7 @@ pub async fn get_share_details(
     }
 
     if !status.is_success() {
+        eprintln!("fetch_share_me failed for key '{}': {} — {}", key, status, text);
         return Err(ServerFnError::new(format!(
             "Failed with status: {}",
             status
@@ -73,27 +74,44 @@ pub async fn get_share_details(
 
             let album_url = client.build_url(&format!("/albums/{}", album.id), &album_params);
             let album_res = client.http_client.get(&album_url).send().await?;
-            if album_res.status().is_success() {
-                if let Ok(mut album_data) =
-                    album_res.json::<crate::immich_client::model::Album>().await
-                {
-                    if show_metadata {
-                        server_helpers::resolve_uploader_names(
-                            &client,
-                            &album.id,
-                            &mut album_data.assets,
-                        )
-                        .await;
-                    }
 
-                    server_helpers::stamp_asset_credentials(
-                        &mut album_data.assets,
-                        &key,
-                        &password,
-                    );
-                    link.assets = album_data.assets.clone();
-                    link.album = Some(album_data);
+            if !album_res.status().is_success() {
+                let status = album_res.status();
+                let body = album_res.text().await.unwrap_or_default();
+                eprintln!(
+                    "Failed to fetch album {}: {} — {}",
+                    album.id, status, body
+                );
+                if status == 403 {
+                    return Err(ServerFnError::new(
+                        "Permission denied fetching album. Ensure the shared link key has the 'album.read' permission.",
+                    ));
                 }
+                return Err(ServerFnError::new(format!(
+                    "Failed to fetch album: {}",
+                    status
+                )));
+            }
+
+            if let Ok(mut album_data) =
+                album_res.json::<crate::immich_client::model::Album>().await
+            {
+                if show_metadata {
+                    server_helpers::resolve_uploader_names(
+                        &client,
+                        &album.id,
+                        &mut album_data.assets,
+                    )
+                    .await;
+                }
+
+                server_helpers::stamp_asset_credentials(
+                    &mut album_data.assets,
+                    &key,
+                    &password,
+                );
+                link.assets = album_data.assets.clone();
+                link.album = Some(album_data);
             }
         }
     } else {
@@ -149,14 +167,27 @@ mod server_helpers {
     ) -> Result<ShareDetails, ServerFnError> {
         match client.get_admin_shared_link(key).await {
             Ok(Some(link)) if link.password.is_some() => {
+                eprintln!("Share '{}' requires a password", key);
                 Ok(password_required_response(key, public_base_url))
             }
-            Ok(Some(_)) => Err(ServerFnError::ServerError(
-                "Share is not accessible".to_string(),
-            )),
-            Ok(None) => Err(ServerFnError::ServerError("Invalid share key".to_string())),
-            Err(_) => {
-                // Admin API unreachable — assume password required as a safe fallback
+            Ok(Some(_)) => {
+                eprintln!("Share '{}' returned 401 but has no password set — share is not accessible", key);
+                Err(ServerFnError::ServerError(
+                    "Share is not accessible".to_string(),
+                ))
+            }
+            Ok(None) if client.admin_api_key.is_some() => {
+                // Admin API is available but the link wasn't found
+                eprintln!("Share '{}' not found via admin API — invalid share key", key);
+                Err(ServerFnError::ServerError("Invalid share key".to_string()))
+            }
+            _ => {
+                // No admin key or API error — can't determine the cause,
+                // so assume password required as a safe fallback
+                eprintln!(
+                    "Share '{}' returned 401 and admin API is unavailable — assuming password required",
+                    key
+                );
                 Ok(password_required_response(key, public_base_url))
             }
         }
@@ -233,6 +264,16 @@ mod server_helpers {
         let Some(tags_res): Option<reqwest::Response> = client.admin_get("/tags").await else {
             return;
         };
+        if !tags_res.status().is_success() {
+            static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+            WARN_ONCE.call_once(|| {
+                eprintln!(
+                    "warning: Admin API /tags failed: {} — uploader attribution via SharedBy/ tags will be unavailable",
+                    tags_res.status()
+                );
+            });
+            return;
+        }
         let Ok(tags) = tags_res
             .json::<Vec<crate::immich_client::model::Tag>>()
             .await
@@ -306,6 +347,18 @@ mod server_helpers {
             else {
                 continue;
             };
+
+            if !res.status().is_success() {
+                static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+                WARN_ONCE.call_once(|| {
+                    eprintln!(
+                        "warning: Admin API /assets/{{id}} failed: {} — owner name fallback will be unavailable",
+                        res.status()
+                    );
+                });
+                continue;
+            }
+
             if let Ok(full_asset) = res.json::<Asset>().await {
                 asset.uploader_name = full_asset.owner.as_ref().map(|o| o.name.clone());
                 asset.uploader_is_fallback = true;

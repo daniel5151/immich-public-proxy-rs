@@ -84,7 +84,7 @@ fn SharePage() -> impl IntoView {
                         }.into_any()
                     }
                 },
-                Some(Err(_)) => view! { <div>"Failed to load."</div> }.into_any(),
+                Some(Err(e)) => view! { <div class="error-msg">{format!("Error: {}", e)}</div> }.into_any(),
                 None => view! { <div>"Loading..."</div> }.into_any(),
             }}
         </Suspense>
