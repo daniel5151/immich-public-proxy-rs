@@ -86,16 +86,19 @@ Configuration is handled via environment variables.
 | `LEPTOS_SITE_ROOT`   |   Yes    | Path to the `site` directory containing static assets.                       |
 | `LEPTOS_SITE_ADDR`   |   Yes    | Address and port to bind to.                                                 |
 | `LEPTOS_OUTPUT_NAME` |   Yes    | The name of the compiled project.                                            |
+| `IMMICH_API_KEY`     |    No    | API key of the shared album owner (permissions determine proxy features)     |
 | `RUST_LOG`           |    No    | Logging level (e.g., `info`, `debug`, `warn`).                               |
-| `IMMICH_API_KEY`     |    No    | API key, optionally enabling extra functionality (see below).                |
 
 ### `IMMICH_API_KEY` Features and Permissions
 
-Certain features require configuring a `IMMICH_API_KEY` with the appropriate permissions:
+Certain features require configuring an `IMMICH_API_KEY` with the appropriate permissions.
 
-| Feature                                                                       | Required Permissions     |
-| :---------------------------------------------------------------------------- | :----------------------- |
-| **Uploader Attribution Badges** (displaying `SharedBy/{name}` tags on assets) | `tag.read`, `asset.read` |
+NOTE: At the moment, only a single API key is supported, corresponding to the album share owner. In the future, support for multiple API keys (to allow multiple users to use the proxy) may be added.
+
+| Feature                         | Required Permissions     | Notes
+| :------------------------------ | :----------------------- | -----
+| **Password Protected Shares**   | `sharedLink.read`        | Used to query if a passwd is required for a share
+| **Uploader Attribution Badges** | `tag.read`, `asset.read` | Relies on photos having tags with format `SharedBy/{name}`
 
 ### Systemd Service Example
 

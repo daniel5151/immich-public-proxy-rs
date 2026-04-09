@@ -171,16 +171,12 @@ fn AssetTile(
                     alt=""
                     onerror="this.closest('a').classList.add('thumb-error')"
                 />
-                {if let Some(u) = uploader {
-                    view! { <div class="uploader-badge" class:using-owner-data=is_uploader_fallback>{u}</div> }.into_any()
-                } else {
-                    view! { <span style="display:none" /> }.into_any()
-                }}
-                {if is_video {
-                    view! { <div class="play-icon"></div> }.into_any()
-                } else {
-                    view! { <span style="display:none" /> }.into_any()
-                }}
+                {uploader.map(|u| view! {
+                    <div class="uploader-badge" class:using-owner-data=is_uploader_fallback>{u}</div>
+                })}
+                {is_video.then(|| view! {
+                    <div class="play-icon"></div>
+                })}
             </a>
         </div>
     }
