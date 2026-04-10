@@ -1,3 +1,5 @@
+use crate::dto::SafeSharedLink;
+#[cfg(feature = "ssr")]
 use crate::immich_client::model::SharedLink;
 
 #[cfg(feature = "ssr")]
@@ -10,7 +12,7 @@ use serde::Serialize;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ShareDetails {
-    pub link: SharedLink,
+    pub link: SafeSharedLink,
     pub password_required: bool,
     pub public_base_url: String,
     pub request_key: String,
@@ -50,19 +52,22 @@ pub async fn get_share_details(
     }
 
     if !status.is_success() {
-        eprintln!("fetch_share_me failed for key '{}': {} — {}", key, status, text);
+        eprintln!(
+            "fetch_share_me failed for key '{}': {} — {}",
+            key, status, text
+        );
         return Err(ServerFnError::new(format!(
             "Failed with status: {}",
             status
         )));
     }
 
-    let mut link: SharedLink =
+    let link: SharedLink =
         serde_json::from_str(&text).map_err(|e| ServerFnError::new(e.to_string()))?;
-    link.password = password.clone();
 
     let allow_download = link.allow_download.unwrap_or(false);
     let show_metadata = link.show_metadata.unwrap_or(true);
+    let mut safe_link = SafeSharedLink::from_base(link.clone());
 
     // Populate album assets if it's an album share
     if link.r#type.as_deref() == Some("ALBUM") {
@@ -78,10 +83,7 @@ pub async fn get_share_details(
             if !album_res.status().is_success() {
                 let status = album_res.status();
                 let body = album_res.text().await.unwrap_or_default();
-                eprintln!(
-                    "Failed to fetch album {}: {} — {}",
-                    album.id, status, body
-                );
+                eprintln!("Failed to fetch album {}: {} — {}", album.id, status, body);
                 if status == 403 {
                     return Err(ServerFnError::new(
                         "Permission denied fetching album. Ensure the shared link key has the 'album.read' permission.",
@@ -93,41 +95,35 @@ pub async fn get_share_details(
                 )));
             }
 
-            if let Ok(mut album_data) =
-                album_res.json::<crate::immich_client::model::Album>().await
-            {
+            if let Ok(album_data) = album_res.json::<crate::immich_client::model::Album>().await {
+                let mut safe_album = crate::dto::SafeAlbum::from_base(album_data);
+
                 if show_metadata {
                     server_helpers::resolve_uploader_names(
                         &client,
                         &album.id,
-                        &mut album_data.assets,
+                        &mut safe_album.assets,
                     )
                     .await;
                 }
 
-                server_helpers::stamp_asset_credentials(
-                    &mut album_data.assets,
-                    &key,
-                    &password,
-                );
-                link.assets = album_data.assets.clone();
-                link.album = Some(album_data);
+                safe_link.assets = safe_album.assets.clone();
+                safe_link.album = Some(safe_album);
             }
         }
     } else {
         if show_metadata {
-            server_helpers::resolve_owner_fallback(&client, &mut link.assets).await;
+            server_helpers::resolve_owner_fallback(&client, &mut safe_link.assets).await;
         }
-        server_helpers::stamp_asset_credentials(&mut link.assets, &key, &password);
     }
 
     // Sort album assets if there is a sort order specified
     if let Some(ref album) = link.album {
         match album.order.as_deref() {
-            Some("asc") => link
+            Some("asc") => safe_link
                 .assets
                 .sort_by(|a, b| a.file_created_at.cmp(&b.file_created_at)),
-            Some("desc") => link
+            Some("desc") => safe_link
                 .assets
                 .sort_by(|a, b| b.file_created_at.cmp(&a.file_created_at)),
             _ => {}
@@ -135,19 +131,17 @@ pub async fn get_share_details(
     }
 
     // If all assets have the exact same uploader, omit the badges
-    server_helpers::strip_uniform_uploader(&mut link);
+    server_helpers::strip_uniform_uploader(&mut safe_link);
 
     // Stamp download_url server-side when downloads are allowed
     if allow_download {
-        for asset in &mut link.assets {
-            if let Some(ref k) = asset.key {
-                asset.download_url = Some(format!("/share/photo/{}/{}/original", k, asset.id));
-            }
+        for asset in &mut safe_link.assets {
+            asset.download_url = Some(format!("/share/photo/{}/{}/original", key, asset.id));
         }
     }
 
     Ok(ShareDetails {
-        link,
+        link: safe_link,
         password_required: false,
         public_base_url,
         request_key: key,
@@ -171,14 +165,20 @@ mod server_helpers {
                 Ok(password_required_response(key, public_base_url))
             }
             Ok(Some(_)) => {
-                eprintln!("Share '{}' returned 401 but has no password set — share is not accessible", key);
+                eprintln!(
+                    "Share '{}' returned 401 but has no password set — share is not accessible",
+                    key
+                );
                 Err(ServerFnError::ServerError(
                     "Share is not accessible".to_string(),
                 ))
             }
             Ok(None) if client.admin_api_key.is_some() => {
                 // Admin API is available but the link wasn't found
-                eprintln!("Share '{}' not found via admin API — invalid share key", key);
+                eprintln!(
+                    "Share '{}' not found via admin API — invalid share key",
+                    key
+                );
                 Err(ServerFnError::ServerError("Invalid share key".to_string()))
             }
             _ => {
@@ -196,19 +196,14 @@ mod server_helpers {
     /// Builds a `ShareDetails` indicating a password is required.
     fn password_required_response(key: &str, public_base_url: String) -> ShareDetails {
         ShareDetails {
-            link: SharedLink {
+            link: SafeSharedLink {
                 key: key.to_string(),
-                slug: None,
                 description: None,
-                expires_at: None,
-                password_required: true,
                 r#type: None,
                 allow_download: None,
                 allow_upload: None,
-                show_metadata: None,
                 assets: vec![],
                 album: None,
-                password: None,
             },
             password_required: true,
             public_base_url,
@@ -216,17 +211,9 @@ mod server_helpers {
         }
     }
 
-    /// Sets `key` and `password` on every asset.
-    pub fn stamp_asset_credentials(assets: &mut [Asset], key: &str, password: &Option<String>) {
-        for asset in assets.iter_mut() {
-            asset.key = Some(key.to_string());
-            asset.password = password.clone();
-        }
-    }
-
     /// If every asset has the exact same uploader name, clear all badges
     /// (since a uniform badge adds no information).
-    pub fn strip_uniform_uploader(link: &mut SharedLink) {
+    pub fn strip_uniform_uploader(link: &mut SafeSharedLink) {
         if link.assets.is_empty() {
             return;
         }
@@ -252,7 +239,7 @@ mod server_helpers {
     pub async fn resolve_uploader_names(
         client: &ImmichClient,
         album_id: &str,
-        assets: &mut [Asset],
+        assets: &mut [crate::dto::SafeAsset],
     ) {
         resolve_shared_by_tags(client, album_id, assets).await;
         resolve_owner_fallback(client, assets).await;
@@ -260,7 +247,11 @@ mod server_helpers {
 
     /// Looks up `SharedBy/{name}` tags via the admin API and stamps matching
     /// assets with the tag name as `uploader_name`.
-    async fn resolve_shared_by_tags(client: &ImmichClient, album_id: &str, assets: &mut [Asset]) {
+    async fn resolve_shared_by_tags(
+        client: &ImmichClient,
+        album_id: &str,
+        assets: &mut [crate::dto::SafeAsset],
+    ) {
         let Some(tags_res): Option<reqwest::Response> = client.admin_get("/tags").await else {
             return;
         };
@@ -337,7 +328,10 @@ mod server_helpers {
 
     /// For assets that still have no `uploader_name`, fetches the asset's
     /// owner via the admin API and uses the owner name as a fallback.
-    pub async fn resolve_owner_fallback(client: &ImmichClient, assets: &mut [Asset]) {
+    pub async fn resolve_owner_fallback(
+        client: &ImmichClient,
+        assets: &mut [crate::dto::SafeAsset],
+    ) {
         for asset in assets.iter_mut() {
             if asset.uploader_name.is_some() {
                 continue;

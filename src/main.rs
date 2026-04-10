@@ -1,5 +1,6 @@
 mod api;
 mod app;
+mod dto;
 mod immich_client;
 #[cfg(feature = "ssr")]
 mod proxy;

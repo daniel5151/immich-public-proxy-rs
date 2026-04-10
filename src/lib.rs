@@ -2,6 +2,7 @@ cfg_if::cfg_if! {
     if #[cfg(feature = "hydrate")] {
         mod api;
         mod app;
+        mod dto;
         mod immich_client;
 
         #[wasm_bindgen::prelude::wasm_bindgen]

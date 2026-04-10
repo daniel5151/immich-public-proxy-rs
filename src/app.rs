@@ -119,7 +119,7 @@ fn Password(required_key: String) -> impl IntoView {
 #[component]
 fn AssetTile(
     i: usize,
-    asset: crate::immich_client::model::Asset,
+    asset: crate::dto::SafeAsset,
     share_key: String,
     selected_assets: RwSignal<HashSet<String>>,
     on_toggle: Callback<String>,
@@ -433,7 +433,7 @@ fn Gallery(details: ShareDetails) -> impl IntoView {
     #[derive(Clone)]
     struct AssetGroup {
         label: String,
-        items: Vec<(usize, crate::immich_client::model::Asset)>,
+        items: Vec<(usize, crate::dto::SafeAsset)>,
     }
 
     let mut groups: Vec<AssetGroup> = Vec::new();

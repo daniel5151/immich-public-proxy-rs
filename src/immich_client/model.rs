@@ -45,16 +45,6 @@ pub struct Asset {
     pub width: Option<i32>,
     pub height: Option<i32>,
     pub owner: Option<User>,
-
-    // the proxy augments assets:
-    pub password: Option<String>,
-    pub key: Option<String>,
-    #[serde(default)]
-    pub uploader_name: Option<String>,
-    #[serde(default)]
-    pub uploader_is_fallback: bool,
-    #[serde(default)]
-    pub download_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -93,7 +83,5 @@ pub struct SharedLink {
     #[serde(default)]
     pub assets: Vec<Asset>,
     pub album: Option<Album>,
-
-    // Proxy augments:
     pub password: Option<String>,
 }
