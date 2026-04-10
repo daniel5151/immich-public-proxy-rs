@@ -41,13 +41,53 @@ async fn main() {
 
     let app = Router::new()
         .proxy_routes()
-        .layer(axum::extract::DefaultBodyLimit::disable())
+        .layer(axum::extract::DefaultBodyLimit::max(4 * 1024 * 1024 * 1024)) // 4 GiB
         .leptos_routes(&leptos_options, routes, {
             let leptos_options = leptos_options.clone();
             move || shell(leptos_options.clone())
         })
         .fallback(leptos_axum::file_and_error_handler(shell))
-        .with_state(leptos_options);
+        .with_state(leptos_options)
+        .layer(axum::middleware::map_response(
+            |mut response: axum::response::Response| async move {
+                // Content-Security-Policy:
+                // - script-src: 'unsafe-inline' is required by Leptos HydrationScripts.
+                //   Our own code has no inline scripts (moved to web.js), so this can
+                //   be replaced with nonce-based CSP once Leptos nonce support is configured.
+                //   'wasm-unsafe-eval' is required for Leptos WASM hydration.
+                // - style-src 'unsafe-inline': Leptos hydration injects inline style attrs
+                // - img-src data:: LightGallery uses data: URIs for some icons
+                // - frame-ancestors 'none': prevents clickjacking via iframing
+                //
+                // In debug builds, Leptos AutoReload creates a blob: Web Worker and
+                // connects to ws://127.0.0.1:<reload-port>, so the dev CSP relaxes
+                // worker-src and connect-src accordingly.
+                let connect_src = if cfg!(debug_assertions) {
+                    "'self' ws://127.0.0.1:3001"
+                } else {
+                    "'self'"
+                };
+
+                let csp = format!(
+                    "default-src 'none'; \
+                     script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; \
+                     worker-src 'self' blob:; \
+                     style-src 'self' 'unsafe-inline'; \
+                     img-src 'self' data:; \
+                     media-src 'self'; \
+                     font-src 'self'; \
+                     connect-src {connect_src}; \
+                     frame-ancestors 'none'; \
+                     base-uri 'self'; \
+                     form-action 'self'"
+                );
+                response.headers_mut().insert(
+                    axum::http::header::CONTENT_SECURITY_POLICY,
+                    axum::http::HeaderValue::from_str(&csp).unwrap(),
+                );
+                response
+            },
+        ));
 
     // run our app with hyper
     // `axum::Server` is a re-export of `hyper::Server`

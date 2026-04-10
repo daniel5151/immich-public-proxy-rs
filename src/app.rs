@@ -169,7 +169,6 @@ fn AssetTile(
                     loading="lazy"
                     src=thumbnail_url
                     alt=""
-                    onerror="this.closest('a').classList.add('thumb-error')"
                 />
                 {uploader.map(|u| view! {
                     <div class="uploader-badge" class:using-owner-data=is_uploader_fallback>{u}</div>
@@ -477,10 +476,6 @@ fn Gallery(details: ShareDetails) -> impl IntoView {
         .collect::<Vec<_>>();
 
     let items_json = serde_json::to_string(&items_array).unwrap();
-    let gallery_data = format!(
-        "window.GALLERY_DATA = {{ lgConfig: {{ }}, items: {} }};",
-        items_json
-    );
 
     let on_toggle_select = Callback::new(move |id: String| {
         selected_assets.update(|set| {
@@ -566,7 +561,7 @@ fn Gallery(details: ShareDetails) -> impl IntoView {
                 }
             })}
 
-            <div id="lightgallery">
+            <div id="lightgallery" data-gallery-items=items_json>
                 <For
                     each=move || groups.clone().into_iter()
                     key=|g| g.label.clone()
@@ -672,16 +667,6 @@ fn Gallery(details: ShareDetails) -> impl IntoView {
                 </div>
             </Show>
 
-            <script inner_html=gallery_data />
-            <script>
-                "window.initLG = () => {
-                    if (window.lgallery && window.GALLERY_DATA) {
-                        window.lgallery.init(window.GALLERY_DATA);
-                    }
-                };
-                if (document.readyState === 'complete') window.initLG();
-                else document.addEventListener('DOMContentLoaded', window.initLG);"
-            </script>
 
             <Show when=move || is_uploading.get() || upload_status.get().is_some()>
                 <div id="upload-toast">

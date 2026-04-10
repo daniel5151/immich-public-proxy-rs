@@ -45,6 +45,38 @@ fn is_safe_param(s: &str) -> bool {
         .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
+/// Validate that the request origin matches the host, for CSRF protection.
+/// Returns true if the request passes the CSRF check (i.e., is same-origin).
+fn check_csrf(headers: &HeaderMap) -> bool {
+    // Prefer the Sec-Fetch-Site header (set by modern browsers, unforgeable)
+    if let Some(site) = headers.get("sec-fetch-site") {
+        return site == "same-origin";
+    }
+
+    // Fallback: compare parsed Origin host against the Host header
+    let origin = headers
+        .get(axum::http::header::ORIGIN)
+        .and_then(|v| v.to_str().ok());
+    let host = headers
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok());
+
+    match (origin, host) {
+        (Some(o), Some(h)) => {
+            // Parse the Origin as a URI and extract its authority (host:port)
+            match o.parse::<axum::http::Uri>() {
+                Ok(uri) => match uri.authority() {
+                    Some(auth) => auth.as_str() == h,
+                    None => false,
+                },
+                Err(_) => false,
+            }
+        }
+        // If neither header is present, we can't validate - deny by default
+        _ => false,
+    }
+}
+
 pub async fn unlock_share_handler(
     headers: HeaderMap,
     Form(payload): Form<UnlockPayload>,
@@ -53,21 +85,8 @@ pub async fn unlock_share_handler(
         return StatusCode::BAD_REQUEST.into_response();
     }
 
-    if let Some(site) = headers.get("sec-fetch-site") {
-        if site != "same-origin" {
-            return StatusCode::FORBIDDEN.into_response();
-        }
-    } else if let (Some(o), Some(h)) = (
-        headers
-            .get(axum::http::header::ORIGIN)
-            .and_then(|v| v.to_str().ok()),
-        headers
-            .get(axum::http::header::HOST)
-            .and_then(|v| v.to_str().ok()),
-    ) {
-        if !o.ends_with(&format!("://{}", h)) {
-            return StatusCode::FORBIDDEN.into_response();
-        }
+    if !check_csrf(&headers) {
+        return StatusCode::FORBIDDEN.into_response();
     }
 
     let client = ImmichClient::new();
@@ -161,7 +180,10 @@ async fn proxy_photo_impl(
 
     let res = match req.send().await {
         Ok(res) => res,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        Err(e) => {
+            eprintln!("proxy_photo: upstream request failed for asset {}: {}", id, e);
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
     };
 
     let mut builder = axum::response::Response::builder().status(res.status());
@@ -208,7 +230,10 @@ pub async fn proxy_video(
 
     let res = match req.send().await {
         Ok(res) => res,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        Err(e) => {
+            eprintln!("proxy_video: upstream request failed for asset {}: {}", id, e);
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
     };
 
     let mut builder = axum::response::Response::builder().status(res.status());
@@ -256,10 +281,18 @@ pub async fn download_all(
     let mut share: crate::immich_client::model::SharedLink = match res {
         Ok(r) if r.status().is_success() => match r.json().await {
             Ok(data) => data,
-            Err(_) => return IntoResponse::into_response(StatusCode::INTERNAL_SERVER_ERROR),
+            Err(e) => {
+                eprintln!("download_all: failed to parse share link response for key '{}': {}", key, e);
+                return IntoResponse::into_response(StatusCode::INTERNAL_SERVER_ERROR);
+            }
         },
-        _ => {
+        Ok(r) => {
+            eprintln!("download_all: share link request failed for key '{}': {}", key, r.status());
             return IntoResponse::into_response(StatusCode::UNAUTHORIZED);
+        }
+        Err(e) => {
+            eprintln!("download_all: upstream request failed for key '{}': {}", key, e);
+            return IntoResponse::into_response(StatusCode::INTERNAL_SERVER_ERROR);
         }
     };
 
@@ -310,7 +343,14 @@ pub async fn download_all(
         .await
     {
         Ok(r) if r.status().is_success() => r,
-        _ => return IntoResponse::into_response(StatusCode::INTERNAL_SERVER_ERROR),
+        Ok(r) => {
+            eprintln!("download_all: archive download failed for key '{}': {}", key, r.status());
+            return IntoResponse::into_response(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+        Err(e) => {
+            eprintln!("download_all: upstream archive request failed for key '{}': {}", key, e);
+            return IntoResponse::into_response(StatusCode::INTERNAL_SERVER_ERROR);
+        }
     };
 
     let mut headers = HeaderMap::new();
@@ -338,28 +378,18 @@ pub async fn upload_asset_handler(
         return StatusCode::BAD_REQUEST.into_response();
     }
 
-    // CSRF check (same as unlock_share_handler)
-    if let Some(site) = headers.get("sec-fetch-site") {
-        if site != "same-origin" {
-            return StatusCode::FORBIDDEN.into_response();
-        }
-    } else if let (Some(o), Some(h)) = (
-        headers
-            .get(axum::http::header::ORIGIN)
-            .and_then(|v| v.to_str().ok()),
-        headers
-            .get(axum::http::header::HOST)
-            .and_then(|v| v.to_str().ok()),
-    ) {
-        if !o.ends_with(&format!("://{}", h)) {
-            return StatusCode::FORBIDDEN.into_response();
-        }
+    if !check_csrf(&headers) {
+        return StatusCode::FORBIDDEN.into_response();
     }
 
     let client = ImmichClient::new();
     let cookie_password = get_cookie_password(&headers, &key);
 
-    // Re-stream multipart fields into a reqwest multipart form
+    // Forward multipart fields into the outgoing reqwest form.
+    // NOTE: The assetData field is buffered in memory before forwarding because
+    // reqwest's multipart form requires owned 'static data, and axum's Field
+    // borrows from the Multipart extractor. The global body limit in main.rs
+    // (4 GiB) bounds the maximum memory usage.
     let mut request_form = reqwest::multipart::Form::new();
     while let Ok(Some(field)) = multipart.next_field().await {
         let name = field.name().unwrap_or("").to_string();
@@ -372,10 +402,14 @@ pub async fn upload_asset_handler(
                 .to_string();
             let data = match field.bytes().await {
                 Ok(b) => b,
-                Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+                Err(e) => {
+                    eprintln!("upload: failed to read multipart field bytes: {}", e);
+                    return StatusCode::BAD_REQUEST.into_response();
+                }
             };
 
-            let part = reqwest::multipart::Part::bytes(data.to_vec())
+            // Use Into<Vec<u8>> for Bytes to avoid an extra copy
+            let part = reqwest::multipart::Part::bytes(Vec::from(data))
                 .file_name(file_name)
                 .mime_str(&content_type)
                 .unwrap_or_else(|_| {
@@ -404,8 +438,16 @@ pub async fn upload_asset_handler(
         .await
     {
         Ok(r) if r.status().is_success() => r,
-        Ok(r) => return r.status().into_response(),
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        Ok(r) => {
+            let status = r.status();
+            let body = r.text().await.unwrap_or_default();
+            eprintln!("upload: upstream rejected asset for key '{}': {} — {}", key, status, body);
+            return status.into_response();
+        }
+        Err(e) => {
+            eprintln!("upload: upstream request failed for key '{}': {}", key, e);
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
     };
 
     // Parse the uploaded asset ID from the response
@@ -416,7 +458,10 @@ pub async fn upload_asset_handler(
 
     let upload_resp: AssetUploadResponse = match res.json().await {
         Ok(v) => v,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        Err(e) => {
+            eprintln!("upload: failed to parse upload response for key '{}': {}", key, e);
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
     };
     let asset_id = upload_resp.id;
 
