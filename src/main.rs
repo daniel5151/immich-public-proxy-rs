@@ -41,7 +41,7 @@ async fn main() {
 
     let app = Router::new()
         .proxy_routes()
-        .layer(axum::extract::DefaultBodyLimit::max(4 * 1024 * 1024 * 1024)) // 4 GiB
+        .layer(axum::extract::DefaultBodyLimit::disable())
         .leptos_routes(&leptos_options, routes, {
             let leptos_options = leptos_options.clone();
             move || shell(leptos_options.clone())

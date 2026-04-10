@@ -4,6 +4,7 @@ use axum::body::Body;
 use axum::extract::Form;
 use axum::extract::Path;
 use axum::extract::Query;
+use axum::extract::Request;
 use axum::http::HeaderMap;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -181,7 +182,10 @@ async fn proxy_photo_impl(
     let res = match req.send().await {
         Ok(res) => res,
         Err(e) => {
-            eprintln!("proxy_photo: upstream request failed for asset {}: {}", id, e);
+            eprintln!(
+                "proxy_photo: upstream request failed for asset {}: {}",
+                id, e
+            );
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
@@ -231,7 +235,10 @@ pub async fn proxy_video(
     let res = match req.send().await {
         Ok(res) => res,
         Err(e) => {
-            eprintln!("proxy_video: upstream request failed for asset {}: {}", id, e);
+            eprintln!(
+                "proxy_video: upstream request failed for asset {}: {}",
+                id, e
+            );
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
@@ -282,16 +289,26 @@ pub async fn download_all(
         Ok(r) if r.status().is_success() => match r.json().await {
             Ok(data) => data,
             Err(e) => {
-                eprintln!("download_all: failed to parse share link response for key '{}': {}", key, e);
+                eprintln!(
+                    "download_all: failed to parse share link response for key '{}': {}",
+                    key, e
+                );
                 return IntoResponse::into_response(StatusCode::INTERNAL_SERVER_ERROR);
             }
         },
         Ok(r) => {
-            eprintln!("download_all: share link request failed for key '{}': {}", key, r.status());
+            eprintln!(
+                "download_all: share link request failed for key '{}': {}",
+                key,
+                r.status()
+            );
             return IntoResponse::into_response(StatusCode::UNAUTHORIZED);
         }
         Err(e) => {
-            eprintln!("download_all: upstream request failed for key '{}': {}", key, e);
+            eprintln!(
+                "download_all: upstream request failed for key '{}': {}",
+                key, e
+            );
             return IntoResponse::into_response(StatusCode::INTERNAL_SERVER_ERROR);
         }
     };
@@ -344,11 +361,18 @@ pub async fn download_all(
     {
         Ok(r) if r.status().is_success() => r,
         Ok(r) => {
-            eprintln!("download_all: archive download failed for key '{}': {}", key, r.status());
+            eprintln!(
+                "download_all: archive download failed for key '{}': {}",
+                key,
+                r.status()
+            );
             return IntoResponse::into_response(StatusCode::INTERNAL_SERVER_ERROR);
         }
         Err(e) => {
-            eprintln!("download_all: upstream archive request failed for key '{}': {}", key, e);
+            eprintln!(
+                "download_all: upstream archive request failed for key '{}': {}",
+                key, e
+            );
             return IntoResponse::into_response(StatusCode::INTERNAL_SERVER_ERROR);
         }
     };
@@ -372,7 +396,7 @@ pub async fn download_all(
 pub async fn upload_asset_handler(
     headers: HeaderMap,
     Path(key): Path<String>,
-    mut multipart: axum::extract::Multipart,
+    req: Request,
 ) -> impl IntoResponse {
     if !is_safe_param(&key) {
         return StatusCode::BAD_REQUEST.into_response();
@@ -385,63 +409,41 @@ pub async fn upload_asset_handler(
     let client = ImmichClient::new();
     let cookie_password = get_cookie_password(&headers, &key);
 
-    // Forward multipart fields into the outgoing reqwest form.
-    // NOTE: The assetData field is buffered in memory before forwarding because
-    // reqwest's multipart form requires owned 'static data, and axum's Field
-    // borrows from the Multipart extractor. The global body limit in main.rs
-    // (4 GiB) bounds the maximum memory usage.
-    let mut request_form = reqwest::multipart::Form::new();
-    while let Ok(Some(field)) = multipart.next_field().await {
-        let name = field.name().unwrap_or("").to_string();
-
-        if name == "assetData" {
-            let file_name = field.file_name().unwrap_or("unknown").to_string();
-            let content_type = field
-                .content_type()
-                .unwrap_or("application/octet-stream")
-                .to_string();
-            let data = match field.bytes().await {
-                Ok(b) => b,
-                Err(e) => {
-                    eprintln!("upload: failed to read multipart field bytes: {}", e);
-                    return StatusCode::BAD_REQUEST.into_response();
-                }
-            };
-
-            // Use Into<Vec<u8>> for Bytes to avoid an extra copy
-            let part = reqwest::multipart::Part::bytes(Vec::from(data))
-                .file_name(file_name)
-                .mime_str(&content_type)
-                .unwrap_or_else(|_| {
-                    reqwest::multipart::Part::bytes(vec![]) // unreachable in practice
-                });
-
-            request_form = request_form.part(name, part);
-        } else {
-            let text = field.text().await.unwrap_or_default();
-            request_form = request_form.text(name, text);
-        }
-    }
-
     let mut params = vec![("key", key.as_str())];
     if let Some(ref pwd) = cookie_password {
         params.push(("password", pwd.as_str()));
     }
 
-    // Upload the asset to Immich
+    // Extract crucial headers from the incoming request.
+    // Content-Type is mandatory because it contains the `boundary=---...` string.
+    let content_type = headers.get(axum::http::header::CONTENT_TYPE).cloned();
+    let content_length = headers.get(axum::http::header::CONTENT_LENGTH).cloned();
+
+    // Stream the raw axum body directly into the reqwest body.
+    // This streams the payload chunk-by-chunk without loading the whole file into RAM.
+    let stream = req.into_body().into_data_stream();
+    let reqwest_body = reqwest::Body::wrap_stream(stream);
+
+    // Forward the streamed request to Immich
     let url = client.build_url("/assets", &params);
-    let res = match client
-        .http_client
-        .post(&url)
-        .multipart(request_form)
-        .send()
-        .await
-    {
+    let mut out_req = client.http_client.post(&url).body(reqwest_body);
+
+    if let Some(ct) = content_type {
+        out_req = out_req.header(reqwest::header::CONTENT_TYPE, ct);
+    }
+    if let Some(cl) = content_length {
+        out_req = out_req.header(reqwest::header::CONTENT_LENGTH, cl);
+    }
+
+    let res = match out_req.send().await {
         Ok(r) if r.status().is_success() => r,
         Ok(r) => {
             let status = r.status();
             let body = r.text().await.unwrap_or_default();
-            eprintln!("upload: upstream rejected asset for key '{}': {} — {}", key, status, body);
+            eprintln!(
+                "upload: upstream rejected asset for key '{}': {} — {}",
+                key, status, body
+            );
             return status.into_response();
         }
         Err(e) => {
@@ -459,7 +461,10 @@ pub async fn upload_asset_handler(
     let upload_resp: AssetUploadResponse = match res.json().await {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("upload: failed to parse upload response for key '{}': {}", key, e);
+            eprintln!(
+                "upload: failed to parse upload response for key '{}': {}",
+                key, e
+            );
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
