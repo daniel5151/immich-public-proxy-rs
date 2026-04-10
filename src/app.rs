@@ -15,6 +15,16 @@ use std::collections::HashSet;
 #[cfg(target_arch = "wasm32")]
 use web_sys::{FormData, HtmlInputElement, Request, RequestInit};
 
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen::prelude::wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen::prelude::wasm_bindgen(js_namespace = window)]
+    fn initLightGallery();
+
+    #[wasm_bindgen::prelude::wasm_bindgen(js_namespace = window)]
+    fn destroyLightGallery();
+}
+
 #[derive(Clone)]
 #[allow(dead_code)]
 enum UploadResult {
@@ -399,6 +409,25 @@ fn Gallery(details: ShareDetails) -> impl IntoView {
                 );
             }
         }
+
+        // 1. Initialize LightGallery ONCE when the component mounts
+        #[cfg(target_arch = "wasm32")]
+        Effect::new(move |_| {
+            // We use a small timeout to guarantee Leptos has fully flushed
+            // the DOM nodes and 'data-gallery-items' string to the browser
+            set_timeout(
+                move || {
+                    initLightGallery();
+                },
+                std::time::Duration::from_millis(50),
+            );
+        });
+
+        // 2. Destroy the instance when the component unmounts (e.g., navigating away)
+        #[cfg(target_arch = "wasm32")]
+        on_cleanup(move || {
+            destroyLightGallery();
+        });
     }
 
     #[derive(Clone)]
@@ -523,7 +552,7 @@ fn Gallery(details: ShareDetails) -> impl IntoView {
                 <button class="icon-btn" on:click=move |_| selected_assets.set(HashSet::new())>
                     "✕"
                 </button>
-                <div class="selection-count">{move || selected_assets.get().len()} " selected"</div>
+                <div class="selection-count">{move || format!("{} selected", selected_assets.get().len())}</div>
                 <div class="selection-actions">
                     <a class="icon-btn" href=download_selection_url rel="external" title="Download selection">
                         "↓"
@@ -673,7 +702,7 @@ fn Gallery(details: ShareDetails) -> impl IntoView {
                     <Show when=move || is_uploading.get()>
                         <div class="toast-content uploading">
                             <span class="loader-small"></span>
-                            <span>"Uploading " {move || upload_progress.get().0} "/" {move || upload_progress.get().1}</span>
+                            <span>{move || format!("Uploading {}/{}", upload_progress.get().0, upload_progress.get().1)}</span>
                         </div>
                     </Show>
                     <Show when=move || !is_uploading.get() && matches!(upload_status.get(), Some(UploadResult::Success))>
@@ -686,9 +715,9 @@ fn Gallery(details: ShareDetails) -> impl IntoView {
                     </Show>
                     <Show when=move || !is_uploading.get() && matches!(upload_status.get(), Some(UploadResult::Failed(_)))>
                         <div class="toast-content failed">
-                            <span>"❌ Failed to upload: " {move || match upload_status.get() {
-                                Some(UploadResult::Failed(name)) => name,
-                                _ => String::new(),
+                            <span>{move || match upload_status.get() {
+                                Some(UploadResult::Failed(name)) => format!("❌ Failed to upload: {}", name),
+                                _ => "❌ Failed to upload: ".to_string(),
                             }}</span>
                         </div>
                     </Show>

@@ -78,55 +78,28 @@ document.addEventListener('error', function (e) {
   }
 }, true);
 
-window.lgallery = new LGallery()
+window.lgallery = new LGallery();
 
-// Auto-initialize LightGallery by reading gallery items from the
-// data-gallery-items attribute on #lightgallery. This avoids inline scripts,
-// allowing the app to use a strict Content-Security-Policy.
-;(function () {
-  function tryInit() {
-    var el = document.getElementById('lightgallery');
-    if (!el || !window.lgallery) return;
+// Expose an explicit init function for Leptos to call
+window.initLightGallery = function () {
+  var el = document.getElementById('lightgallery');
+  if (!el || !window.lgallery) return;
 
-    var raw = el.getAttribute('data-gallery-items');
-    if (!raw) return;
+  var raw = el.getAttribute('data-gallery-items');
+  if (!raw) return;
 
-    try {
-      var items = JSON.parse(raw);
-      window.lgallery.init({ lgConfig: {}, items: items });
-    } catch (e) {
-      console.error('Failed to parse gallery items:', e);
-    }
+  try {
+    var items = JSON.parse(raw);
+    window.lgallery.init({ lgConfig: {}, items: items });
+  } catch (e) {
+    console.error('Failed to parse gallery items:', e);
   }
+};
 
-  // If the element is already present (e.g., full SSR page load), init immediately
-  if (document.readyState === 'complete') {
-    tryInit();
-  } else {
-    document.addEventListener('DOMContentLoaded', tryInit);
+// Expose a clean-up function to prevent memory leaks on navigation
+window.destroyLightGallery = function () {
+  if (window.lgallery && window.lgallery.lightGallery) {
+    window.lgallery.lightGallery.destroy();
+    window.lgallery.lightGallery = null;
   }
-
-  // For Leptos hydration / SPA navigations: the #lightgallery element may be
-  // added or have its attributes set after DOMContentLoaded.
-  var observer = new MutationObserver(function (mutations) {
-    for (var i = 0; i < mutations.length; i++) {
-      var m = mutations[i];
-      // Check newly added nodes for the gallery element
-      if (m.type === 'childList') {
-        for (var j = 0; j < m.addedNodes.length; j++) {
-          var node = m.addedNodes[j];
-          if (node.id === 'lightgallery' || (node.querySelector && node.querySelector('#lightgallery'))) {
-            tryInit();
-            return;
-          }
-        }
-      }
-      // Check attribute changes on the gallery element
-      if (m.type === 'attributes' && m.attributeName === 'data-gallery-items' && m.target.id === 'lightgallery') {
-        tryInit();
-        return;
-      }
-    }
-  });
-  observer.observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ['data-gallery-items'] });
-})();
+};
