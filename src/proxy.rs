@@ -329,7 +329,17 @@ pub async fn download_all(
         .description
         .clone()
         .or_else(|| share.album.as_ref().and_then(|a| a.album_name.clone()))
-        .expect("share link missing title/description for download");
+        .unwrap_or_else(|| {
+            if share.r#type.as_deref() == Some("INDIVIDUAL") {
+                share
+                    .assets
+                    .first()
+                    .and_then(|a| a.original_file_name.clone())
+                    .unwrap_or_else(|| "shared_assets".to_string())
+            } else {
+                "shared_assets".to_string()
+            }
+        });
     let sanitized_title = title.replace(|c: char| !c.is_alphanumeric() && c != '-', "_");
     let filename = format!("{}.zip", sanitized_title);
 
@@ -469,6 +479,48 @@ pub async fn upload_asset_handler(
         }
     };
     let asset_id = upload_resp.id;
+
+    // Check if the asset is currently in the trash, and restore it if so.
+    if let Some(asset_res) = client.admin_get(&format!("/assets/{}", asset_id)).await {
+        if asset_res.status().is_success() {
+            if let Ok(asset_info) = asset_res.json::<crate::immich_client::model::Asset>().await {
+                if asset_info.is_trashed.unwrap_or(false) {
+                    println!(
+                        "upload: asset '{}' is in trash, attempting to restore...",
+                        asset_id
+                    );
+                    let restore_body = serde_json::json!({ "ids": [asset_id] });
+                    if let Some(restore_res) = client
+                        .admin_post("/trash/restore/assets", &restore_body)
+                        .await
+                    {
+                        if restore_res.status().is_success() {
+                            println!(
+                                "upload: successfully restored asset '{}' from trash",
+                                asset_id
+                            );
+                        } else if restore_res.status() == StatusCode::FORBIDDEN {
+                            eprintln!(
+                                "upload: failed to restore asset '{}' from trash: Forbidden (403). The configured IMMICH_API_KEY lacks the 'asset.delete' permission.",
+                                asset_id
+                            );
+                        } else {
+                            eprintln!(
+                                "upload: failed to restore asset '{}' from trash: status {}",
+                                asset_id,
+                                restore_res.status()
+                            );
+                        }
+                    } else {
+                        eprintln!(
+                            "upload: failed to send restore request for asset '{}' (admin key missing)",
+                            asset_id
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     // For album shares, add the uploaded asset to the album
     let share_link: Option<crate::immich_client::model::SharedLink> = client

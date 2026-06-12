@@ -80,14 +80,14 @@ bash -c "$(wget -qLO - https://raw.githubusercontent.com/daniel5151/immich-publi
 
 Configuration is handled via environment variables.
 
-| Variable             | Required | Description                                                                  |
-| :------------------- | :------: | :--------------------------------------------------------------------------- |
-| `IMMICH_URL`         |   Yes    | The internal URL of your Immich instance (e.g., `http://192.168.1.50:2283`). |
-| `LEPTOS_SITE_ROOT`   |   Yes    | Path to the `site` directory containing static assets.                       |
-| `LEPTOS_SITE_ADDR`   |   Yes    | Address and port to bind to.                                                 |
-| `LEPTOS_OUTPUT_NAME` |   Yes    | The name of the compiled project.                                            |
-| `IMMICH_API_KEY`     |    No    | API key of the shared album owner (permissions determine proxy features)     |
-| `RUST_LOG`           |    No    | Logging level (e.g., `info`, `debug`, `warn`).                               |
+| Variable             | Required | Description                                                                                                     |
+| :------------------- | :------: | :-------------------------------------------------------------------------------------------------------------- |
+| `IMMICH_URL`         |   Yes    | The internal URL of your Immich instance (e.g., `http://192.168.1.50:2283`).                                    |
+| `LEPTOS_SITE_ROOT`   |   Yes    | Path to the `site` directory containing static assets.                                                          |
+| `LEPTOS_SITE_ADDR`   |   Yes    | Address and port to bind to.                                                                                    |
+| `LEPTOS_OUTPUT_NAME` |   Yes    | The name of the compiled project.                                                                               |
+| `IMMICH_API_KEY`     |    No    | API key of the shared album owner (required for proper "Link not found" page resolution and password detection) |
+| `RUST_LOG`           |    No    | Logging level (e.g., `info`, `debug`, `warn`).                                                                  |
 
 ### `IMMICH_API_KEY` Features and Permissions
 
@@ -95,10 +95,13 @@ Certain features require configuring an `IMMICH_API_KEY` with the appropriate pe
 
 NOTE: At the moment, only a single API key is supported, corresponding to the album share owner. In the future, support for multiple API keys (to allow multiple users to use the proxy) may be added.
 
-| Feature                         | Required Permissions     | Notes
-| :------------------------------ | :----------------------- | -----
-| **Password Protected Shares**   | `sharedLink.read`        | Used to query if a passwd is required for a share
-| **Uploader Attribution Badges** | `tag.read`, `asset.read` | Relies on photos having tags with format `SharedBy/{name}`
+| Feature                         | Required Permissions     | Notes                                                                                                             |
+| :------------------------------ | :----------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| **Password Protected Shares**   | `sharedLink.read`        | Used to query if a password is required for a share                                                               |
+| **Link Not Found Resolution**   | `sharedLink.read`        | Required to distinguish invalid keys from password-protected keys, avoiding infinite password prompt loops        |
+| **Uploader Attribution Badges** | `tag.read`, `asset.read` | Relies on photos having tags with format `SharedBy/{name}`                                                        |
+| **Efficient User Resolution**   | `user.read`              | Recommended; allows fetching all users at once to resolve owner fallback names, avoiding slow sequential requests |
+| **Restore Trashed Duplicates**  | `asset.delete`           | Automatically restores duplicate uploads from the trash if they were manually trashed previously                  |
 
 ### Systemd Service Example
 

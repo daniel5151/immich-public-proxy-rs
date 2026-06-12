@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 pub struct SafeAsset {
     pub id: String,
     pub original_file_name: Option<String>,
@@ -12,17 +13,20 @@ pub struct SafeAsset {
     pub uploader_name: Option<String>,
     #[serde(default)]
     pub uploader_is_fallback: bool,
+    #[serde(skip_serializing)]
+    pub owner_id: Option<String>,
     pub download_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 pub struct SafeAlbum {
     pub id: String,
     pub album_name: Option<String>,
     pub description: Option<String>,
     pub album_thumbnail_asset_id: Option<String>,
-    #[serde(default)]
+    #[serde(skip_serializing, default)]
     pub assets: Vec<SafeAsset>,
 }
 
@@ -51,6 +55,7 @@ impl SafeAsset {
             height: asset.height,
             uploader_name: None,
             uploader_is_fallback: false,
+            owner_id: asset.owner_id,
             download_url: None,
         }
     }

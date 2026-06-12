@@ -136,7 +136,7 @@ pub async fn get_share_details(
     // Stamp download_url server-side when downloads are allowed
     if allow_download {
         for asset in &mut safe_link.assets {
-            asset.download_url = Some(format!("/share/photo/{}/{}/original", key, asset.id));
+            asset.download_url = Some(format!("/share/photo/{}/{}/original", safe_link.key, asset.id));
         }
     }
 
@@ -332,10 +332,45 @@ mod server_helpers {
         client: &ImmichClient,
         assets: &mut [crate::dto::SafeAsset],
     ) {
+        let mut users_map = std::collections::HashMap::new();
+        let mut users_fetched = false;
+
+        if assets.iter().any(|a| a.uploader_name.is_none()) {
+            if let Some(res) = client.admin_get("/users").await {
+                if res.status().is_success() {
+                    if let Ok(users) = res.json::<Vec<crate::immich_client::model::User>>().await {
+                        for u in users {
+                            users_map.insert(u.id, u.name);
+                        }
+                        users_fetched = true;
+                    }
+                } else {
+                    static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+                    WARN_ONCE.call_once(|| {
+                        eprintln!(
+                            "warning: Admin API /users failed: {} — falling back to sequential /assets/{{id}} requests",
+                            res.status()
+                        );
+                    });
+                }
+            }
+        }
+
         for asset in assets.iter_mut() {
             if asset.uploader_name.is_some() {
                 continue;
             }
+
+            if users_fetched {
+                if let Some(ref owner_id) = asset.owner_id {
+                    if let Some(name) = users_map.get(owner_id) {
+                        asset.uploader_name = Some(name.clone());
+                        asset.uploader_is_fallback = true;
+                        continue;
+                    }
+                }
+            }
+
             let Some(res): Option<reqwest::Response> =
                 client.admin_get(&format!("/assets/{}", asset.id)).await
             else {
