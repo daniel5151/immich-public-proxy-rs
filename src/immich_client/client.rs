@@ -45,9 +45,9 @@ impl ImmichClient {
 
     /// Fetches the user ID associated with the upload API key, caching the result thread-safely.
     pub async fn get_upload_user_id(&self) -> Option<String> {
-        static UPLOAD_USER_ID: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        static UPLOAD_USER_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
         if let Some(cached) = UPLOAD_USER_ID.get() {
-            return cached.clone();
+            return Some(cached.clone());
         }
 
         let upload_key = self.upload_api_key.as_ref()?;
@@ -60,17 +60,15 @@ impl ImmichClient {
             .await
             .ok()?;
 
-        let user_id = if res.status().is_success() {
-            res.json::<crate::immich_client::model::User>()
-                .await
-                .ok()
-                .map(|u| u.id)
-        } else {
-            None
-        };
+        if res.status().is_success() {
+            if let Ok(user) = res.json::<crate::immich_client::model::User>().await {
+                let user_id = user.id;
+                UPLOAD_USER_ID.get_or_init(|| user_id.clone());
+                return Some(user_id);
+            }
+        }
 
-        UPLOAD_USER_ID.get_or_init(|| user_id.clone());
-        user_id
+        None
     }
 
     pub fn build_url(&self, path: &str, params: &[(&str, &str)]) -> String {
