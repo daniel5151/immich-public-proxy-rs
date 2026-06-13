@@ -79,8 +79,7 @@ async fn serve_share_html(Path(key): Path<String>, headers: HeaderMap) -> Respon
                 .unwrap_or_default();
 
             let meta_tags = format!(
-                r#"<title>{}</title>
-<meta name="description" content="{}" />
+                r#"<meta name="description" content="{}" />
 <meta property="og:title" content="{}" />
 <meta property="og:description" content="{}" />
 <meta property="og:image" content="{}" />
@@ -90,7 +89,6 @@ async fn serve_share_html(Path(key): Path<String>, headers: HeaderMap) -> Respon
 <meta name="twitter:title" content="{}" />
 <meta name="twitter:description" content="{}" />
 <meta name="twitter:image" content="{}" />"#,
-                title,
                 description,
                 title,
                 description,
@@ -100,6 +98,12 @@ async fn serve_share_html(Path(key): Path<String>, headers: HeaderMap) -> Respon
                 description,
                 cover_image_url
             );
+
+            if let (Some(start), Some(end)) = (html_content.find("<title>"), html_content.find("</title>")) {
+                if start < end {
+                    html_content.replace_range(start..end + 8, &format!("<title>{}</title>", title));
+                }
+            }
 
             if let Some(pos) = html_content.find("</head>") {
                 html_content.insert_str(pos, &meta_tags);

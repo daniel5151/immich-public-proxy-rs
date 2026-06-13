@@ -478,6 +478,7 @@ function GalleryPage({ details }: GalleryPageProps) {
 
   return (
     <div id="gallery-root">
+      <title>{title}</title>
       {/* Selection floating bar */}
       <div id="selection-bar" className={selectedAssets.size > 0 ? 'active' : ''}>
         <button className="icon-btn" onClick={() => setSelectedAssets(new Set())}>
