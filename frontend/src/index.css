@@ -6,6 +6,7 @@
     font-display: swap;
     src: url('/fonts/inter-400.ttf') format('truetype');
 }
+
 @font-face {
     font-family: 'Inter';
     font-style: normal;
@@ -13,6 +14,7 @@
     font-display: swap;
     src: url('/fonts/inter-500.ttf') format('truetype');
 }
+
 @font-face {
     font-family: 'Inter';
     font-style: normal;
@@ -20,6 +22,7 @@
     font-display: swap;
     src: url('/fonts/inter-600.ttf') format('truetype');
 }
+
 @font-face {
     font-family: 'Inter';
     font-style: normal;
@@ -466,7 +469,7 @@ body.selection-mode .tile-selector {
     bottom: 2rem;
     right: 2rem;
     z-index: 2000;
-    width: 260px;
+    width: 320px;
 }
 
 #upload-toast .toast-content {
@@ -495,6 +498,22 @@ body.selection-mode .tile-selector {
     font-weight: 500;
     border: 1px solid rgba(255, 255, 255, 0.1);
     color: white;
+}
+
+.toast-text {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.toast-progress {
+    font-size: 0.95rem;
+}
+
+.toast-warning {
+    font-size: 0.9rem;
+    color: #f3f4f6;
+    white-space: nowrap;
 }
 
 .toast-content.success {
@@ -626,9 +645,13 @@ body.selection-mode .tile-selector {
 }
 
 @keyframes fadeIn {
-    to { opacity: 1; }
+    to {
+        opacity: 1;
+    }
 }
 
 @keyframes slideUp {
-    to { transform: scale(1) translateY(0); }
+    to {
+        transform: scale(1) translateY(0);
+    }
 }

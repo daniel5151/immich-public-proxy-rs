@@ -705,7 +705,10 @@ function GalleryPage({ details }: GalleryPageProps) {
           {isUploading && (
             <div className="toast-content uploading">
               <span className="loader-small"></span>
-              <span>Uploading {uploadProgress.completed}/{uploadProgress.total}</span>
+              <div className="toast-text">
+                <span className="toast-progress">Uploading {uploadProgress.completed}/{uploadProgress.total}</span>
+                <span className="toast-warning">⚠️ Don't close this window! ⚠️</span>
+              </div>
             </div>
           )}
           {!isUploading && uploadStatus?.type === 'success' && (
