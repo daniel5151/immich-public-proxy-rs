@@ -32,6 +32,117 @@ enum UploadResult {
     Failed(String),
 }
 
+#[allow(dead_code)]
+fn start_upload_process(
+    files: Vec<web_sys::File>,
+    name: String,
+    real_key: String,
+    is_uploading: RwSignal<bool>,
+    upload_progress: RwSignal<(usize, usize)>,
+    upload_status: RwSignal<Option<UploadResult>>,
+) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        use wasm_bindgen::JsCast;
+
+        let count = files.len();
+        if count == 0 {
+            return;
+        }
+
+        is_uploading.set(true);
+        upload_progress.set((0, count));
+        upload_status.set(None);
+
+        let encoded_name_str = String::from(js_sys::encode_uri_component(&name));
+
+        leptos::task::spawn_local(async move {
+            let mut success = true;
+            let mut failed_name = String::new();
+
+            for file in files {
+                let file_name = file.name();
+
+                let form_data = FormData::new().unwrap();
+                let file_date = js_sys::Reflect::get(&file, &"lastModified".into())
+                    .ok()
+                    .and_then(|v| v.as_f64())
+                    .and_then(|ms| chrono::DateTime::from_timestamp_millis(ms as i64))
+                    .unwrap_or_else(chrono::Utc::now)
+                    .to_rfc3339();
+
+                let blob = file.unchecked_ref::<web_sys::Blob>();
+                form_data
+                    .append_with_blob_and_filename("assetData", blob, &file_name)
+                    .unwrap();
+                form_data
+                    .append_with_str("deviceAssetId", &file_name)
+                    .unwrap();
+                form_data
+                    .append_with_str("deviceId", "immich-public-proxy")
+                    .unwrap();
+                form_data
+                    .append_with_str("fileCreatedAt", &file_date)
+                    .unwrap();
+                form_data
+                    .append_with_str("fileModifiedAt", &file_date)
+                    .unwrap();
+
+                let opts = RequestInit::new();
+                opts.set_method("POST");
+                opts.set_body(&form_data);
+
+                let headers = web_sys::Headers::new().unwrap();
+                headers
+                    .append("x-uploader-name", &encoded_name_str)
+                    .unwrap();
+                opts.set_headers(&headers);
+
+                let url = format!("/share/{}/upload", real_key);
+                let request = Request::new_with_str_and_init(&url, &opts).unwrap();
+
+                let window = web_sys::window().unwrap();
+                let resp_value: Result<wasm_bindgen::JsValue, wasm_bindgen::JsValue> =
+                    wasm_bindgen_futures::JsFuture::from(window.fetch_with_request(&request)).await;
+
+                match resp_value {
+                    Ok(v) => {
+                        let resp: web_sys::Response = v.unchecked_into();
+                        if !resp.ok() {
+                            success = false;
+                            failed_name = file_name.clone();
+                            break;
+                        }
+                    }
+                    Err(_) => {
+                        success = false;
+                        failed_name = file_name.clone();
+                        break;
+                    }
+                }
+
+                upload_progress.update(|p| p.0 += 1);
+            }
+
+            if success {
+                upload_status.set(Some(UploadResult::Success));
+            } else {
+                upload_status.set(Some(UploadResult::Failed(failed_name)));
+            }
+            is_uploading.set(false);
+        });
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = files;
+        let _ = name;
+        let _ = real_key;
+        let _ = is_uploading;
+        let _ = upload_progress;
+        let _ = upload_status;
+    }
+}
+
 #[component]
 pub fn App() -> impl IntoView {
     provide_meta_context();
@@ -257,97 +368,100 @@ fn Gallery(details: ShareDetails) -> impl IntoView {
     let is_loading_more = RwSignal::new(false);
     let has_observed = RwSignal::new(false);
 
+    let file_input_ref = NodeRef::<leptos::html::Input>::new();
+    let show_name_modal = RwSignal::new(false);
+    let uploader_name = RwSignal::new(String::new());
+
     let is_uploading = RwSignal::new(false);
     let upload_progress = RwSignal::new((0, 0)); // (completed, total)
     let upload_status = RwSignal::new(Option::<UploadResult>::None);
 
-    let on_upload_change = {
-        let real_key_signal = RwSignal::new(real_key.clone());
-        move |ev: leptos::ev::Event| {
-            cfg_if::cfg_if! {
-                if #[cfg(target_arch = "wasm32")] {
-                    use wasm_bindgen::JsCast;
-                    let Some(target) = ev.target() else { return };
-                    let input = target.unchecked_into::<HtmlInputElement>();
-                    let files = input.files();
-                    let Some(file_list) = files else { return };
-                    let count = file_list.length();
-                    if count == 0 { return; }
+    let real_key_signal = RwSignal::new(real_key.clone());
 
-                    is_uploading.set(true);
-                    upload_progress.set((0, count as usize));
-                    upload_status.set(None);
+    let on_upload_change = move |ev: leptos::ev::Event| {
+        #[cfg(target_arch = "wasm32")]
+        {
+            use wasm_bindgen::JsCast;
+            let Some(target) = ev.target() else { return };
+            let input = target.unchecked_into::<HtmlInputElement>();
+            let files = input.files();
+            let Some(file_list) = files else { return };
+            let count = file_list.length();
+            if count == 0 {
+                return;
+            }
 
-                    let real_key = real_key_signal.get();
-
-                    leptos::task::spawn_local(async move {
-                        let mut success = true;
-                        let mut failed_name = String::new();
-
-                        for i in 0..count {
-                            let Some(file) = file_list.item(i) else { continue };
-                            let file_name = file.name();
-
-                            let form_data = FormData::new().unwrap();
-                            let file_date = js_sys::Reflect::get(&file, &"lastModified".into())
-                                .ok()
-                                .and_then(|v| v.as_f64())
-                                .and_then(|ms| chrono::DateTime::from_timestamp_millis(ms as i64))
-                                .unwrap_or_else(chrono::Utc::now)
-                                .to_rfc3339();
-
-                            let blob = file.unchecked_ref::<web_sys::Blob>();
-                            form_data.append_with_blob_and_filename("assetData", blob, &file_name).unwrap();
-                            form_data.append_with_str("deviceAssetId", &file_name).unwrap();
-                            form_data.append_with_str("deviceId", "immich-public-proxy").unwrap();
-                            form_data.append_with_str("fileCreatedAt", &file_date).unwrap();
-                            form_data.append_with_str("fileModifiedAt", &file_date).unwrap();
-
-                            let opts = RequestInit::new();
-                            opts.set_method("POST");
-                            opts.set_body(&form_data);
-
-                            let url = format!("/share/{}/upload", real_key);
-                            let request = Request::new_with_str_and_init(&url, &opts).unwrap();
-
-                            let window = web_sys::window().unwrap();
-                            let resp_value: Result<wasm_bindgen::JsValue, wasm_bindgen::JsValue> =
-                                wasm_bindgen_futures::JsFuture::from(window.fetch_with_request(&request)).await;
-
-                            match resp_value {
-                                Ok(v) => {
-                                    let resp: web_sys::Response = v.unchecked_into();
-                                    if !resp.ok() {
-                                        success = false;
-                                        failed_name = file_name.clone();
-                                        break;
-                                    }
-                                }
-                                Err(_) => {
-                                    success = false;
-                                    failed_name = file_name.clone();
-                                    break;
-                                }
-                            }
-
-                            upload_progress.update(|p| p.0 += 1);
-                        }
-
-                        if success {
-                            upload_status.set(Some(UploadResult::Success));
-                        } else {
-                            upload_status.set(Some(UploadResult::Failed(failed_name)));
-                        }
-                        is_uploading.set(false);
-                    });
-                } else {
-                    let _ = ev;
-                    let _ = real_key_signal;
+            let mut file_vec = Vec::new();
+            for i in 0..count {
+                if let Some(file) = file_list.item(i) {
+                    file_vec.push(file);
                 }
+            }
+
+            input.set_value("");
+
+            let name = uploader_name.get().trim().to_string();
+            if !name.is_empty() {
+                start_upload_process(
+                    file_vec,
+                    name,
+                    real_key_signal.get(),
+                    is_uploading,
+                    upload_progress,
+                    upload_status,
+                );
+            }
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = ev;
+            let _ = real_key_signal;
+        }
+    };
+
+    let on_upload_click = move |ev: leptos::ev::MouseEvent| {
+        ev.prevent_default();
+        let name = uploader_name.get().trim().to_string();
+        if name.is_empty() {
+            show_name_modal.set(true);
+        } else {
+            #[cfg(target_arch = "wasm32")]
+            {
+                if let Some(input) = file_input_ref.get() {
+                    input.click();
+                }
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let _ = file_input_ref;
             }
         }
     };
 
+    let cancel_upload = move |ev: leptos::ev::MouseEvent| {
+        ev.prevent_default();
+        show_name_modal.set(false);
+    };
+    let confirm_upload = move |ev: leptos::ev::MouseEvent| {
+        ev.prevent_default();
+        let name = uploader_name.get().trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+
+        show_name_modal.set(false);
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            if let Some(input) = file_input_ref.get() {
+                input.click();
+            }
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = file_input_ref;
+        }
+    };
     #[cfg(feature = "hydrate")]
     {
         use wasm_bindgen::JsCast;
@@ -565,11 +679,22 @@ fn Gallery(details: ShareDetails) -> impl IntoView {
                 <div class="header-actions">
                     <Show when=move || allow_upload>
                         <div id="upload-action">
-                            <label class={move || if is_uploading.get() { "header-btn disabled" } else { "header-btn" }}>
+                            <button
+                                class={move || if is_uploading.get() { "header-btn disabled" } else { "header-btn" }}
+                                disabled=move || is_uploading.get()
+                                on:click=on_upload_click
+                            >
                                 <img src="/images/align-top-svgrepo-com.svg" alt="" class="header-icon" />
                                 <span>"Upload"</span>
-                                <input type="file" multiple accept="image/*,video/*" class="hidden-file-input" disabled=move || is_uploading.get() on:change=on_upload_change />
-                            </label>
+                            </button>
+                            <input
+                                type="file"
+                                multiple
+                                accept="image/*,video/*"
+                                class="hidden-file-input"
+                                node_ref=file_input_ref
+                                on:change=on_upload_change
+                            />
                         </div>
                     </Show>
                     <Show when=move || allow_download>
@@ -721,6 +846,34 @@ fn Gallery(details: ShareDetails) -> impl IntoView {
                             }}</span>
                         </div>
                     </Show>
+                </div>
+            </Show>
+
+            <Show when=move || show_name_modal.get()>
+                <div class="modal-overlay" on:click=cancel_upload>
+                    <div class="modal-container" on:click=move |ev| ev.stop_propagation()>
+                        <h3 class="modal-title">"Uploader Name"</h3>
+                        <p class="modal-desc">"Please enter your name to attribute your uploaded photos."</p>
+                        <input
+                            type="text"
+                            class="modal-input"
+                            placeholder="Your Name"
+                            prop:value=move || uploader_name.get()
+                            on:input=move |ev| {
+                                uploader_name.set(event_target_value(&ev));
+                            }
+                        />
+                        <div class="modal-actions">
+                            <button class="header-btn" on:click=cancel_upload>"Cancel"</button>
+                            <button
+                                class="modal-btn-confirm"
+                                disabled=move || uploader_name.get().trim().is_empty()
+                                on:click=confirm_upload
+                            >
+                                "Confirm"
+                            </button>
+                        </div>
+                    </div>
                 </div>
             </Show>
         </div>

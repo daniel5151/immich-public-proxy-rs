@@ -403,6 +403,110 @@ pub async fn download_all(
     (headers, Body::from_stream(res.bytes_stream())).into_response()
 }
 
+static ADDED_ALBUMS: std::sync::OnceLock<parking_lot::RwLock<std::collections::HashSet<String>>> =
+    std::sync::OnceLock::new();
+static TAG_CACHE: std::sync::OnceLock<
+    parking_lot::RwLock<std::collections::HashMap<String, String>>,
+> = std::sync::OnceLock::new();
+
+async fn get_or_create_tag(
+    client: &ImmichClient,
+    name: &str,
+    parent_id: Option<&str>,
+) -> Option<String> {
+    let cache =
+        TAG_CACHE.get_or_init(|| parking_lot::RwLock::new(std::collections::HashMap::new()));
+
+    let cache_key = match parent_id {
+        Some(p_id) => format!("{}:{}", p_id, name),
+        None => format!("root:{}", name),
+    };
+
+    {
+        let read_guard = cache.read();
+        if let Some(id) = read_guard.get(&cache_key) {
+            return Some(id.clone());
+        }
+    }
+
+    let upload_key = client.upload_api_key.as_ref()?;
+
+    // Step 1: List all tags
+    let get_url = client.build_url("/tags", &[]);
+    let res = client
+        .http_client
+        .get(&get_url)
+        .header("x-api-key", upload_key)
+        .send()
+        .await
+        .ok()?;
+
+    if res.status().is_success() {
+        if let Ok(tags) = res.json::<Vec<crate::immich_client::model::Tag>>().await {
+            for tag in &tags {
+                if tag.name == name && tag.parent_id.as_deref() == parent_id {
+                    let mut write_guard = cache.write();
+                    write_guard.insert(cache_key, tag.id.clone());
+                    return Some(tag.id.clone());
+                }
+            }
+        }
+    }
+
+    // Step 2: Create tag if not found
+    let post_url = client.build_url("/tags", &[]);
+    let create_body = serde_json::json!({
+        "name": name,
+        "parentId": parent_id,
+    });
+
+    let create_res = client
+        .http_client
+        .post(&post_url)
+        .header("x-api-key", upload_key)
+        .json(&create_body)
+        .send()
+        .await
+        .ok()?;
+
+    let status = create_res.status();
+    if status.is_success() || status == StatusCode::CREATED {
+        if let Ok(created_tag) = create_res.json::<crate::immich_client::model::Tag>().await {
+            let mut write_guard = cache.write();
+            write_guard.insert(cache_key, created_tag.id.clone());
+            return Some(created_tag.id);
+        }
+    } else {
+        // Tag might have been created concurrently by another thread.
+        // Query /tags again to find the concurrently created tag.
+        let get_url = client.build_url("/tags", &[]);
+        let retry_res = client
+            .http_client
+            .get(&get_url)
+            .header("x-api-key", upload_key)
+            .send()
+            .await
+            .ok()?;
+
+        if retry_res.status().is_success() {
+            if let Ok(tags) = retry_res
+                .json::<Vec<crate::immich_client::model::Tag>>()
+                .await
+            {
+                for tag in &tags {
+                    if tag.name == name && tag.parent_id.as_deref() == parent_id {
+                        let mut write_guard = cache.write();
+                        write_guard.insert(cache_key, tag.id.clone());
+                        return Some(tag.id.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
 pub async fn upload_asset_handler(
     headers: HeaderMap,
     Path(key): Path<String>,
@@ -417,26 +521,128 @@ pub async fn upload_asset_handler(
     }
 
     let client = ImmichClient::new();
+
+    // If service account key is not set, disable upload functionality entirely.
+    if client.upload_api_key.is_none() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+
+    // Parse uploader name header
+    let uploader_name = match headers.get("x-uploader-name").and_then(|h| h.to_str().ok()) {
+        Some(val) if !val.is_empty() => match urlencoding::decode(val) {
+            Ok(decoded) => decoded.into_owned(),
+            Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+        },
+        _ => return StatusCode::BAD_REQUEST.into_response(),
+    };
+
     let cookie_password = get_cookie_password(&headers, &key);
 
-    let mut params = vec![("key", key.as_str())];
-    if let Some(ref pwd) = cookie_password {
-        params.push(("password", pwd.as_str()));
+    // Validate share key first
+    let share_link = match client
+        .fetch_share_me(&key, cookie_password.as_deref())
+        .await
+    {
+        Ok((status, text)) if status.is_success() => {
+            match serde_json::from_str::<crate::immich_client::model::SharedLink>(&text) {
+                Ok(link) => link,
+                Err(e) => {
+                    eprintln!("upload: failed to parse share link response: {}", e);
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            }
+        }
+        Ok((status, _)) => return status.into_response(),
+        Err(e) => {
+            eprintln!("upload: failed to fetch share link: {}", e);
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    if share_link.r#type.as_deref() != Some("ALBUM") || !share_link.allow_upload.unwrap_or(false) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+
+    let album_id = match share_link.album.as_ref() {
+        Some(album) => &album.id,
+        None => return StatusCode::BAD_REQUEST.into_response(),
+    };
+
+    // Ensure the service account user is a contributor (editor) to the album
+    let service_account_user_id = match client.get_upload_user_id().await {
+        Some(id) => id,
+        None => {
+            eprintln!("upload: failed to resolve upload user ID");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    let is_added = {
+        let cache =
+            ADDED_ALBUMS.get_or_init(|| parking_lot::RwLock::new(std::collections::HashSet::new()));
+        let read_guard = cache.read();
+        read_guard.contains(album_id)
+    };
+
+    if !is_added {
+        let add_users_body = serde_json::json!({
+            "albumUsers": [
+                {
+                    "userId": service_account_user_id,
+                    "role": "editor"
+                }
+            ]
+        });
+        let add_res = client
+            .admin_put(&format!("/albums/{}/users", album_id), &add_users_body)
+            .await;
+        let mut add_success = false;
+        if let Some(res) = add_res {
+            let status = res.status();
+            if status.is_success() || status == StatusCode::CONFLICT {
+                add_success = true;
+            } else if status == StatusCode::BAD_REQUEST {
+                let body = res.text().await.unwrap_or_default();
+                if body.contains("already") {
+                    add_success = true;
+                } else {
+                    eprintln!(
+                        "upload: failed to add service account to album {}: status {} — {}",
+                        album_id, status, body
+                    );
+                }
+            } else {
+                eprintln!(
+                    "upload: failed to add service account to album {}: status {}",
+                    album_id, status
+                );
+            }
+        } else {
+            eprintln!("upload: failed to send add user request (admin key missing)");
+        }
+
+        if add_success {
+            let cache = ADDED_ALBUMS.get().unwrap();
+            let mut write_guard = cache.write();
+            write_guard.insert(album_id.clone());
+        }
     }
 
     // Extract crucial headers from the incoming request.
-    // Content-Type is mandatory because it contains the `boundary=---...` string.
     let content_type = headers.get(axum::http::header::CONTENT_TYPE).cloned();
     let content_length = headers.get(axum::http::header::CONTENT_LENGTH).cloned();
 
     // Stream the raw axum body directly into the reqwest body.
-    // This streams the payload chunk-by-chunk without loading the whole file into RAM.
     let stream = req.into_body().into_data_stream();
     let reqwest_body = reqwest::Body::wrap_stream(stream);
 
-    // Forward the streamed request to Immich
-    let url = client.build_url("/assets", &params);
-    let mut out_req = client.http_client.post(&url).body(reqwest_body);
+    // Forward the streamed request to Immich using the service account API key
+    let url = client.build_url("/assets", &[]);
+    let mut out_req = client
+        .http_client
+        .post(&url)
+        .header("x-api-key", client.upload_api_key.as_ref().unwrap())
+        .body(reqwest_body);
 
     if let Some(ct) = content_type {
         out_req = out_req.header(reqwest::header::CONTENT_TYPE, ct);
@@ -480,80 +686,157 @@ pub async fn upload_asset_handler(
     };
     let asset_id = upload_resp.id;
 
-    // Check if the asset is currently in the trash, and restore it if so.
-    if let Some(asset_res) = client.admin_get(&format!("/assets/{}", asset_id)).await {
-        if asset_res.status().is_success() {
-            if let Ok(asset_info) = asset_res.json::<crate::immich_client::model::Asset>().await {
+    // Check if the asset is currently in the trash, and restore it if so (using the service account API key).
+    let get_asset_url = client.build_url(&format!("/assets/{}", asset_id), &[]);
+    let asset_res = client
+        .http_client
+        .get(&get_asset_url)
+        .header("x-api-key", client.upload_api_key.as_ref().unwrap())
+        .send()
+        .await;
+
+    if let Ok(r) = asset_res {
+        if r.status().is_success() {
+            if let Ok(asset_info) = r.json::<crate::immich_client::model::Asset>().await {
                 if asset_info.is_trashed.unwrap_or(false) {
                     println!(
                         "upload: asset '{}' is in trash, attempting to restore...",
                         asset_id
                     );
+                    let restore_url = client.build_url("/trash/restore/assets", &[]);
                     let restore_body = serde_json::json!({ "ids": [asset_id] });
-                    if let Some(restore_res) = client
-                        .admin_post("/trash/restore/assets", &restore_body)
-                        .await
-                    {
-                        if restore_res.status().is_success() {
+                    let restore_res = client
+                        .http_client
+                        .post(&restore_url)
+                        .header("x-api-key", client.upload_api_key.as_ref().unwrap())
+                        .json(&restore_body)
+                        .send()
+                        .await;
+
+                    match restore_res {
+                        Ok(res) if res.status().is_success() => {
                             println!(
                                 "upload: successfully restored asset '{}' from trash",
                                 asset_id
                             );
-                        } else if restore_res.status() == StatusCode::FORBIDDEN {
-                            eprintln!(
-                                "upload: failed to restore asset '{}' from trash: Forbidden (403). The configured IMMICH_API_KEY lacks the 'asset.delete' permission.",
-                                asset_id
-                            );
-                        } else {
+                        }
+                        Ok(res) => {
                             eprintln!(
                                 "upload: failed to restore asset '{}' from trash: status {}",
                                 asset_id,
-                                restore_res.status()
+                                res.status()
                             );
                         }
-                    } else {
-                        eprintln!(
-                            "upload: failed to send restore request for asset '{}' (admin key missing)",
-                            asset_id
-                        );
+                        Err(e) => {
+                            eprintln!(
+                                "upload: failed to send restore request for asset '{}': {}",
+                                asset_id, e
+                            );
+                        }
                     }
                 }
             }
         }
     }
 
-    // For album shares, add the uploaded asset to the album
-    let share_link: Option<crate::immich_client::model::SharedLink> = client
-        .fetch_share_me(&key, cookie_password.as_deref())
-        .await
-        .ok()
-        .and_then(|(status, text)| {
-            if status.is_success() {
-                serde_json::from_str(&text).ok()
-            } else {
-                None
+    // Let Immich commit the uploaded asset to the database before tagging/associating it.
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+    // Tag the asset with the uploader name (using the service account API key)
+    if let Some(parent_tag_id) = get_or_create_tag(&client, "SharedBy", None).await {
+        if let Some(child_tag_id) =
+            get_or_create_tag(&client, &uploader_name, Some(&parent_tag_id)).await
+        {
+            let tag_url = client.build_url(&format!("/tags/{}/assets", child_tag_id), &[]);
+            let mut tag_success = false;
+
+            for attempt in 1..=3 {
+                let tag_res = client
+                    .http_client
+                    .put(&tag_url)
+                    .header("x-api-key", client.upload_api_key.as_ref().unwrap())
+                    .json(&serde_json::json!({ "ids": [asset_id] }))
+                    .send()
+                    .await;
+
+                #[derive(serde::Deserialize)]
+                struct TagResponse {
+                    #[allow(dead_code)]
+                    id: String,
+                    success: bool,
+                }
+
+                match tag_res {
+                    Ok(res) if res.status().is_success() => {
+                        if let Ok(results) = res.json::<Vec<TagResponse>>().await {
+                            if let Some(first) = results.first() {
+                                if first.success {
+                                    tag_success = true;
+                                    break;
+                                } else {
+                                    eprintln!(
+                                        "upload: tagging returned success:false for asset {} (attempt {})",
+                                        asset_id, attempt
+                                    );
+                                }
+                            } else {
+                                eprintln!(
+                                    "upload: tagging returned empty list for asset {} (attempt {})",
+                                    asset_id, attempt
+                                );
+                            }
+                        } else {
+                            eprintln!(
+                                "upload: failed to parse tag response for asset {} (attempt {})",
+                                asset_id, attempt
+                            );
+                        }
+                    }
+                    Ok(res) => {
+                        eprintln!(
+                            "upload: tagging failed for asset {} with status {} (attempt {})",
+                            asset_id,
+                            res.status(),
+                            attempt
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "upload: tagging request failed for asset {}: {} (attempt {})",
+                            asset_id, e, attempt
+                        );
+                    }
+                }
+
+                // Backoff before retry
+                tokio::time::sleep(std::time::Duration::from_millis(attempt * 200)).await;
             }
-        });
 
-    if let Some(album_id) = share_link
-        .as_ref()
-        .and_then(|link| link.album.as_ref())
-        .map(|album| album.id.as_str())
-    {
-        let album_url = client.build_url(&format!("/albums/{}/assets", album_id), &params);
-        let album_res = client
-            .http_client
-            .put(&album_url)
-            .json(&serde_json::json!({ "ids": [asset_id] }))
-            .send()
-            .await;
-
-        if let Err(e) = &album_res {
-            eprintln!(
-                "failed to add asset {} to album {}: {}",
-                asset_id, album_id, e
-            );
+            if !tag_success {
+                eprintln!(
+                    "upload: permanently failed to tag asset {} after 3 attempts",
+                    asset_id
+                );
+            }
         }
+    }
+
+    // Add the uploaded asset to the album (using the service account API key)
+    let album_url = client.build_url(&format!("/albums/{}/assets", album_id), &[]);
+    let album_res = client
+        .http_client
+        .put(&album_url)
+        .header("x-api-key", client.upload_api_key.as_ref().unwrap())
+        .json(&serde_json::json!({ "ids": [asset_id] }))
+        .send()
+        .await;
+
+    if let Err(e) = &album_res {
+        eprintln!(
+            "failed to add asset {} to album {}: {}",
+            asset_id, album_id, e
+        );
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
     StatusCode::OK.into_response()

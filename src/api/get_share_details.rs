@@ -245,21 +245,37 @@ mod server_helpers {
         resolve_owner_fallback(client, assets).await;
     }
 
-    /// Looks up `SharedBy/{name}` tags via the admin API and stamps matching
+    /// Looks up `SharedBy/{name}` tags via the admin API or the upload service account API and stamps matching
     /// assets with the tag name as `uploader_name`.
     async fn resolve_shared_by_tags(
         client: &ImmichClient,
         album_id: &str,
         assets: &mut [crate::dto::SafeAsset],
     ) {
-        let Some(tags_res): Option<reqwest::Response> = client.admin_get("/tags").await else {
+        if let Some(ref upload_key) = client.upload_api_key {
+            resolve_shared_by_tags_for_key(client, upload_key, album_id, assets).await;
+        }
+        if let Some(ref admin_key) = client.admin_api_key {
+            if Some(admin_key) != client.upload_api_key.as_ref() {
+                resolve_shared_by_tags_for_key(client, admin_key, album_id, assets).await;
+            }
+        }
+    }
+
+    async fn resolve_shared_by_tags_for_key(
+        client: &ImmichClient,
+        api_key: &str,
+        album_id: &str,
+        assets: &mut [crate::dto::SafeAsset],
+    ) {
+        let Some(tags_res): Option<reqwest::Response> = client.get_with_key("/tags", api_key).await else {
             return;
         };
         if !tags_res.status().is_success() {
             static WARN_ONCE: std::sync::Once = std::sync::Once::new();
             WARN_ONCE.call_once(|| {
                 eprintln!(
-                    "warning: Admin API /tags failed: {} — uploader attribution via SharedBy/ tags will be unavailable",
+                    "warning: API /tags failed: {} — uploader attribution via SharedBy/ tags will be unavailable",
                     tags_res.status()
                 );
             });
@@ -296,7 +312,7 @@ mod server_helpers {
                 };
 
                 let Some(search_res): Option<reqwest::Response> =
-                    client.admin_post("/search/metadata", &search_req).await
+                    client.post_with_key("/search/metadata", api_key, &search_req).await
                 else {
                     break;
                 };

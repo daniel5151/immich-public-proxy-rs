@@ -5,6 +5,7 @@ pub struct ImmichClient {
     pub api_url: String,
     pub http_client: Client,
     pub admin_api_key: Option<String>,
+    pub upload_api_key: Option<String>,
 }
 
 impl ImmichClient {
@@ -28,11 +29,43 @@ impl ImmichClient {
             .get_or_init(|| std::env::var("IMMICH_API_KEY").ok())
             .clone();
 
+        static UPLOAD_API_KEY: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        let upload_api_key = UPLOAD_API_KEY
+            .get_or_init(|| std::env::var("IMMICH_API_KEY_UPLOAD_USER").ok())
+            .clone();
+
         Self {
             api_url,
             http_client,
             admin_api_key,
+            upload_api_key,
         }
+    }
+
+    /// Fetches the user ID associated with the upload API key, caching the result thread-safely.
+    pub async fn get_upload_user_id(&self) -> Option<String> {
+        static UPLOAD_USER_ID: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        if let Some(cached) = UPLOAD_USER_ID.get() {
+            return cached.clone();
+        }
+
+        let upload_key = self.upload_api_key.as_ref()?;
+        let url = self.build_url("/users/me", &[]);
+        let res = self.http_client
+            .get(&url)
+            .header("x-api-key", upload_key)
+            .send()
+            .await
+            .ok()?;
+
+        let user_id = if res.status().is_success() {
+            res.json::<crate::immich_client::model::User>().await.ok().map(|u| u.id)
+        } else {
+            None
+        };
+
+        UPLOAD_USER_ID.get_or_init(|| user_id.clone());
+        user_id
     }
 
     pub fn build_url(&self, path: &str, params: &[(&str, &str)]) -> String {
@@ -45,37 +78,80 @@ impl ImmichClient {
         u.to_string()
     }
 
-    /// Sends an authenticated GET request using the admin API key.
-    /// Returns `None` if there is no admin API key configured.
-    pub async fn admin_get(&self, path: &str) -> Option<reqwest::Response> {
-        let admin_key = self.admin_api_key.as_ref()?;
+    /// Sends an authenticated GET request using the specified API key.
+    pub async fn get_with_key(&self, path: &str, key: &str) -> Option<reqwest::Response> {
         let url = self.build_url(path, &[]);
         self.http_client
             .get(&url)
-            .header("x-api-key", admin_key)
+            .header("x-api-key", key)
             .send()
             .await
             .ok()
     }
 
-    /// Sends an authenticated POST request using the admin API key.
-    /// Returns `None` if there is no admin API key configured.
-    pub async fn admin_post(
+    /// Sends an authenticated POST request using the specified API key.
+    pub async fn post_with_key(
         &self,
         path: &str,
+        key: &str,
         body: &impl serde::Serialize,
     ) -> Option<reqwest::Response> {
-        let admin_key = self.admin_api_key.as_ref()?;
         let url = self.build_url(path, &[]);
         self.http_client
             .post(&url)
-            .header("x-api-key", admin_key)
+            .header("x-api-key", key)
             .json(body)
             .send()
             .await
             .ok()
     }
 
+    /// Sends an authenticated PUT request using the specified API key.
+    pub async fn put_with_key(
+        &self,
+        path: &str,
+        key: &str,
+        body: &impl serde::Serialize,
+    ) -> Option<reqwest::Response> {
+        let url = self.build_url(path, &[]);
+        self.http_client
+            .put(&url)
+            .header("x-api-key", key)
+            .json(body)
+            .send()
+            .await
+            .ok()
+    }
+
+    /// Sends an authenticated GET request using the admin API key.
+    /// Returns `None` if there is no admin API key configured.
+    pub async fn admin_get(&self, path: &str) -> Option<reqwest::Response> {
+        let admin_key = self.admin_api_key.as_ref()?;
+        self.get_with_key(path, admin_key).await
+    }
+
+    /// Sends an authenticated POST request using the admin API key.
+    /// Returns `None` if there is no admin API key configured.
+    #[allow(dead_code)]
+    pub async fn admin_post(
+        &self,
+        path: &str,
+        body: &impl serde::Serialize,
+    ) -> Option<reqwest::Response> {
+        let admin_key = self.admin_api_key.as_ref()?;
+        self.post_with_key(path, admin_key, body).await
+    }
+
+    /// Sends an authenticated PUT request using the admin API key.
+    /// Returns `None` if there is no admin API key configured.
+    pub async fn admin_put(
+        &self,
+        path: &str,
+        body: &impl serde::Serialize,
+    ) -> Option<reqwest::Response> {
+        let admin_key = self.admin_api_key.as_ref()?;
+        self.put_with_key(path, admin_key, body).await
+    }
     /// Queries the admin `/shared-links` endpoint to find a link by its key or slug.
     pub async fn get_admin_shared_link(
         &self,

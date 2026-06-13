@@ -77,12 +77,13 @@ impl SafeAlbum {
 #[cfg(feature = "ssr")]
 impl SafeSharedLink {
     pub fn from_base(link: crate::immich_client::model::SharedLink) -> Self {
+        let upload_key_set = std::env::var("IMMICH_API_KEY_UPLOAD_USER").is_ok();
         SafeSharedLink {
             key: link.key,
             description: link.description,
             r#type: link.r#type,
             allow_download: link.allow_download,
-            allow_upload: link.allow_upload,
+            allow_upload: if upload_key_set { link.allow_upload } else { Some(false) },
             assets: link.assets.into_iter().map(SafeAsset::from_base).collect(),
             album: link.album.map(SafeAlbum::from_base),
         }
