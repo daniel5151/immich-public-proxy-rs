@@ -1,72 +1,160 @@
 #![recursion_limit = "512"]
 
 mod api;
-mod app;
 mod dto;
 mod immich_client;
-#[cfg(feature = "ssr")]
 mod proxy;
 
-#[cfg(feature = "ssr")]
-#[tokio::main]
-async fn main() {
-    use crate::app::*;
-    use crate::proxy::ProxyRoutes as _;
-    use axum::Router;
-    use leptos::logging::log;
-    use leptos::prelude::*;
-    use leptos_axum::{LeptosRoutes, generate_route_list};
+use crate::proxy::ProxyRoutes as _;
+use axum::{
+    Router,
+    extract::Path,
+    http::{HeaderMap, StatusCode},
+    response::{Html, IntoResponse, Response},
+    routing::get,
+};
 
-    fn shell(options: LeptosOptions) -> impl IntoView {
-        use leptos_meta::MetaTags;
-        view! {
-            <!DOCTYPE html>
-            <html lang="en">
-                <head>
-                    <meta charset="utf-8"/>
-                    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1.0"/>
-                    <AutoReload options=options.clone() />
-                    <HydrationScripts options/>
-                    <MetaTags/>
-                </head>
-                <body>
-                    <App/>
-                </body>
-            </html>
+async fn serve_share_html(Path(key): Path<String>, headers: HeaderMap) -> Response {
+    let details_res = api::get_share_details::get_share_details(key.clone(), None, &headers).await;
+
+    let site_root = std::env::var("LEPTOS_SITE_ROOT").unwrap_or_else(|_| "target/site".to_string());
+    let index_path = std::path::Path::new(&site_root).join("index.html");
+
+    let mut html_content = match tokio::fs::read_to_string(&index_path).await {
+        Ok(content) => content,
+        Err(e) => {
+            eprintln!("Failed to read index.html from {:?}: {}", index_path, e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to read index.html",
+            )
+                .into_response();
+        }
+    };
+
+    if let Ok(details) = details_res {
+        if !details.password_required {
+            let title = details
+                .link
+                .description
+                .clone()
+                .or_else(|| {
+                    details
+                        .link
+                        .album
+                        .as_ref()
+                        .and_then(|a| a.album_name.clone())
+                })
+                .unwrap_or_else(|| "Shared Files".to_string());
+
+            let description = details
+                .link
+                .album
+                .as_ref()
+                .and_then(|a| a.description.clone())
+                .unwrap_or_else(|| {
+                    format!(
+                        "Shared album containing {} item(s)",
+                        details.link.assets.len()
+                    )
+                });
+
+            let public_base_url = details.public_base_url.trim_end_matches('/').to_string();
+            let current_url = format!("{}/share/{}", public_base_url, details.request_key);
+
+            let cover_asset_id = details
+                .link
+                .album
+                .as_ref()
+                .and_then(|a| a.album_thumbnail_asset_id.clone())
+                .or_else(|| details.link.assets.first().map(|a| a.id.clone()));
+
+            let cover_image_url = cover_asset_id
+                .map(|id| {
+                    format!(
+                        "{}/share/photo/{}/{}/preview",
+                        public_base_url, details.link.key, id
+                    )
+                })
+                .unwrap_or_default();
+
+            let meta_tags = format!(
+                r#"<title>{}</title>
+<meta name="description" content="{}" />
+<meta property="og:title" content="{}" />
+<meta property="og:description" content="{}" />
+<meta property="og:image" content="{}" />
+<meta property="og:url" content="{}" />
+<meta property="og:type" content="website" />
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:title" content="{}" />
+<meta name="twitter:description" content="{}" />
+<meta name="twitter:image" content="{}" />"#,
+                title,
+                description,
+                title,
+                description,
+                cover_image_url,
+                current_url,
+                title,
+                description,
+                cover_image_url
+            );
+
+            if let Some(pos) = html_content.find("</head>") {
+                html_content.insert_str(pos, &meta_tags);
+            }
         }
     }
 
-    let conf = get_configuration(None).unwrap();
-    let addr = conf.leptos_options.site_addr;
-    let leptos_options = conf.leptos_options;
-    // Generate the list of routes in your Leptos App
-    let routes = generate_route_list(App);
+    Html(html_content).into_response()
+}
+
+async fn serve_index() -> Response {
+    let site_root = std::env::var("LEPTOS_SITE_ROOT").unwrap_or_else(|_| "target/site".to_string());
+    let index_path = std::path::Path::new(&site_root).join("index.html");
+
+    match tokio::fs::read_to_string(&index_path).await {
+        Ok(content) => Html(content).into_response(),
+        Err(e) => {
+            eprintln!("Failed to read index.html from {:?}: {}", index_path, e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to read index.html",
+            )
+                .into_response()
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    let addr_str =
+        std::env::var("LEPTOS_SITE_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".to_string());
+    let addr: std::net::SocketAddr = addr_str.parse().expect("Invalid bind address");
+
+    let site_root = std::env::var("LEPTOS_SITE_ROOT").unwrap_or_else(|_| "target/site".to_string());
 
     let app = Router::new()
+        // API routes
+        .route(
+            "/api/share/{key}",
+            get(api::get_share_details::get_share_details_handler),
+        )
+        // Proxy routes
         .proxy_routes()
+        // Meta SEO routes for shares
+        .route("/share/{key}", get(serve_share_html))
+        .route("/s/{key}", get(serve_share_html))
+        // Static files serving
+        .fallback_service(
+            tower_http::services::ServeDir::new(&site_root).fallback(get(serve_index)),
+        )
         .layer(axum::extract::DefaultBodyLimit::disable())
-        .leptos_routes(&leptos_options, routes, {
-            let leptos_options = leptos_options.clone();
-            move || shell(leptos_options.clone())
-        })
-        .fallback(leptos_axum::file_and_error_handler(shell))
-        .with_state(leptos_options)
         .layer(axum::middleware::map_response(
-            |mut response: axum::response::Response| async move {
-                // Content-Security-Policy:
-                // - script-src: 'unsafe-inline' is required by Leptos HydrationScripts.
-                //   Our own code has no inline scripts (moved to web.js), so this can
-                //   be replaced with nonce-based CSP once Leptos nonce support is configured.
-                //   'wasm-unsafe-eval' is required for Leptos WASM hydration.
-                // - style-src 'unsafe-inline': Leptos hydration injects inline style attrs
-                // - img-src data:: LightGallery uses data: URIs for some icons
-                // - frame-ancestors 'none': prevents clickjacking via iframing
-                //
-                // In debug builds, Leptos AutoReload creates a blob: Web Worker and
-                // connects to ws://127.0.0.1:<reload-port>, so the dev CSP relaxes
-                // worker-src and connect-src accordingly.
+            |mut response: Response| async move {
                 let connect_src = if cfg!(debug_assertions) {
-                    "'self' ws://127.0.0.1:3001"
+                    "'self' ws://127.0.0.1:5173" // Vite dev ws
                 } else {
                     "'self'"
                 };
@@ -92,14 +180,9 @@ async fn main() {
             },
         ));
 
-    // run our app with hyper
-    // `axum::Server` is a re-export of `hyper::Server`
-    log!("listening on http://{}", &addr);
+    println!("Listening on http://{}", &addr);
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     axum::serve(listener, app.into_make_service())
         .await
         .unwrap();
 }
-
-#[cfg(not(feature = "ssr"))]
-pub fn main() {} // hydration entry via wasm-bindgen in lib.rs

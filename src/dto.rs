@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../frontend/src/types/generated/")]
 #[allow(dead_code)]
 pub struct SafeAsset {
     pub id: String,
@@ -14,12 +16,14 @@ pub struct SafeAsset {
     #[serde(default)]
     pub uploader_is_fallback: bool,
     #[serde(skip_serializing)]
+    #[ts(skip)]
     pub owner_id: Option<String>,
     pub download_url: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../frontend/src/types/generated/")]
 #[allow(dead_code)]
 pub struct SafeAlbum {
     pub id: String,
@@ -27,11 +31,13 @@ pub struct SafeAlbum {
     pub description: Option<String>,
     pub album_thumbnail_asset_id: Option<String>,
     #[serde(skip_serializing, default)]
+    #[ts(skip)]
     pub assets: Vec<SafeAsset>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../frontend/src/types/generated/")]
 pub struct SafeSharedLink {
     pub key: String,
     pub description: Option<String>,
@@ -43,7 +49,6 @@ pub struct SafeSharedLink {
     pub album: Option<SafeAlbum>,
 }
 
-#[cfg(feature = "ssr")]
 impl SafeAsset {
     pub fn from_base(asset: crate::immich_client::model::Asset) -> Self {
         SafeAsset {
@@ -61,7 +66,6 @@ impl SafeAsset {
     }
 }
 
-#[cfg(feature = "ssr")]
 impl SafeAlbum {
     pub fn from_base(album: crate::immich_client::model::Album) -> Self {
         SafeAlbum {
@@ -74,7 +78,6 @@ impl SafeAlbum {
     }
 }
 
-#[cfg(feature = "ssr")]
 impl SafeSharedLink {
     pub fn from_base(link: crate::immich_client::model::SharedLink) -> Self {
         let upload_key_set = std::env::var("IMMICH_API_KEY_UPLOAD_USER").is_ok();
@@ -83,7 +86,11 @@ impl SafeSharedLink {
             description: link.description,
             r#type: link.r#type,
             allow_download: link.allow_download,
-            allow_upload: if upload_key_set { link.allow_upload } else { Some(false) },
+            allow_upload: if upload_key_set {
+                link.allow_upload
+            } else {
+                Some(false)
+            },
             assets: link.assets.into_iter().map(SafeAsset::from_base).collect(),
             album: link.album.map(SafeAlbum::from_base),
         }

@@ -36,7 +36,7 @@ This project implements the core functionality of the original Node.js proxy wit
 
 | Feature                   | Details                                                                                          |
 | :------------------------ | :----------------------------------------------------------------------------------------------- |
-| **Server-Side Rendering** | Uses Leptos for SSR, allowing for SEO-friendly link previews without client-side-only rendering. |
+| **Server-Side Rendering** | Rust Axum backend injects SEO/OpenGraph previews dynamically, then mounts a decoupled React SPA. |
 | **Bulk Selection**        | Native UI for selecting and downloading a subset of assets as a ZIP.                             |
 | **Lazy Loading**          | Explicit `IntersectionObserver` implementation for large grids.                                  |
 | **Single Binary**         | Compiles to a single binary for easier deployment outside of Docker.                             |
@@ -54,11 +54,11 @@ That said, I'm not opposed to adding more features + config machinery if there's
 ## Installation
 
 ### Manual Build
-1. Install the Rust toolchain and `wasm32-unknown-unknown` target.
-2. Install `cargo-leptos`.
-3. Build the project:
+1. Install the Rust toolchain and Node.js (v20+).
+2. Build the project:
    ```bash
-   cargo leptos build --release
+   (cd frontend && npm install && npm run build)
+   cargo build --release
    ```
 4. Deploy the following files to your server:
    - Server binary: `target/release/immich-public-proxy-rs`
@@ -125,6 +125,23 @@ Restart=always
 
 [Install]
 WantedBy=multi-user.target
+```
+
+---
+
+## Dev Flow
+
+You'll need to run two processes simultaneously.
+
+```bash
+(cd frontend && npx vite build --watch)
+```
+
+```bash
+IMMICH_URL=http://<immich-ip>:2283 \
+IMMICH_API_KEY="..." \
+IMMICH_API_KEY_UPLOAD_USER="..." \
+cargo run
 ```
 
 ---

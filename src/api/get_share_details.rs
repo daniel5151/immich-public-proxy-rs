@@ -1,16 +1,19 @@
 use crate::dto::SafeSharedLink;
-#[cfg(feature = "ssr")]
-use crate::immich_client::model::SharedLink;
-
-#[cfg(feature = "ssr")]
 use crate::immich_client::client::ImmichClient;
-#[cfg(feature = "ssr")]
 use crate::immich_client::model::Asset;
-use leptos::prelude::*;
-use serde::Deserialize;
-use serde::Serialize;
+use crate::immich_client::model::SharedLink;
+use axum::{
+    Json,
+    extract::{Path, Query},
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
+};
+use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../frontend/src/types/generated/")]
 pub struct ShareDetails {
     pub link: SafeSharedLink,
     pub password_required: bool,
@@ -18,19 +21,21 @@ pub struct ShareDetails {
     pub request_key: String,
 }
 
-#[server(GetShareDetails, "/api")]
+#[derive(Deserialize)]
+pub struct ShareParams {
+    pub password: Option<String>,
+}
+
+/// Helper function to fetch share details. Used by the API handler and the HTML meta injector.
 pub async fn get_share_details(
     key: String,
     password: Option<String>,
-) -> Result<ShareDetails, ServerFnError> {
-    let headers = leptos_axum::extract::<axum::http::HeaderMap>()
-        .await
-        .map_err(|_| ServerFnError::new("Failed to extract headers"))?;
-
+    headers: &HeaderMap,
+) -> Result<ShareDetails, String> {
     let host = headers
         .get("host")
         .and_then(|h| h.to_str().ok())
-        .ok_or_else(|| ServerFnError::new("Host header must be present"))?;
+        .ok_or_else(|| "Host header must be present".to_string())?;
 
     let proto = headers
         .get("x-forwarded-proto")
@@ -42,10 +47,13 @@ pub async fn get_share_details(
 
     // Check cookie for password if not provided
     let password =
-        password.or_else(|| crate::immich_client::client::get_cookie_password(&headers, &key));
+        password.or_else(|| crate::immich_client::client::get_cookie_password(headers, &key));
 
     let client = ImmichClient::new();
-    let (status, text) = client.fetch_share_me(&key, password.as_deref()).await?;
+    let (status, text) = client
+        .fetch_share_me(&key, password.as_deref())
+        .await
+        .map_err(|e| e.to_string())?;
 
     if status == 401 {
         return server_helpers::handle_unauthorized(&client, &key, public_base_url).await;
@@ -56,14 +64,10 @@ pub async fn get_share_details(
             "fetch_share_me failed for key '{}': {} — {}",
             key, status, text
         );
-        return Err(ServerFnError::new(format!(
-            "Failed with status: {}",
-            status
-        )));
+        return Err(format!("Failed with status: {}", status));
     }
 
-    let link: SharedLink =
-        serde_json::from_str(&text).map_err(|e| ServerFnError::new(e.to_string()))?;
+    let link: SharedLink = serde_json::from_str(&text).map_err(|e| e.to_string())?;
 
     let allow_download = link.allow_download.unwrap_or(false);
     let show_metadata = link.show_metadata.unwrap_or(true);
@@ -78,21 +82,23 @@ pub async fn get_share_details(
             }
 
             let album_url = client.build_url(&format!("/albums/{}", album.id), &album_params);
-            let album_res = client.http_client.get(&album_url).send().await?;
+            let album_res = client
+                .http_client
+                .get(&album_url)
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
 
             if !album_res.status().is_success() {
                 let status = album_res.status();
                 let body = album_res.text().await.unwrap_or_default();
                 eprintln!("Failed to fetch album {}: {} — {}", album.id, status, body);
                 if status == 403 {
-                    return Err(ServerFnError::new(
-                        "Permission denied fetching album. Ensure the shared link key has the 'album.read' permission.",
-                    ));
+                    return Err(
+                        "Permission denied fetching album. Ensure the shared link key has the 'album.read' permission.".to_string(),
+                    );
                 }
-                return Err(ServerFnError::new(format!(
-                    "Failed to fetch album: {}",
-                    status
-                )));
+                return Err(format!("Failed to fetch album: {}", status));
             }
 
             if let Ok(album_data) = album_res.json::<crate::immich_client::model::Album>().await {
@@ -136,7 +142,10 @@ pub async fn get_share_details(
     // Stamp download_url server-side when downloads are allowed
     if allow_download {
         for asset in &mut safe_link.assets {
-            asset.download_url = Some(format!("/share/photo/{}/{}/original", safe_link.key, asset.id));
+            asset.download_url = Some(format!(
+                "/share/photo/{}/{}/original",
+                safe_link.key, asset.id
+            ));
         }
     }
 
@@ -148,7 +157,27 @@ pub async fn get_share_details(
     })
 }
 
-#[cfg(feature = "ssr")]
+/// Axum JSON API handler
+pub async fn get_share_details_handler(
+    Path(key): Path<String>,
+    Query(params): Query<ShareParams>,
+    headers: HeaderMap,
+) -> Result<Json<ShareDetails>, Response> {
+    match get_share_details(key, params.password, &headers).await {
+        Ok(details) => Ok(Json(details)),
+        Err(err) => {
+            let status = if err.contains("Invalid share key") {
+                StatusCode::NOT_FOUND
+            } else if err.contains("not accessible") {
+                StatusCode::FORBIDDEN
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            Err((status, Json(serde_json::json!({ "error": err }))).into_response())
+        }
+    }
+}
+
 mod server_helpers {
     use super::*;
 
@@ -158,7 +187,7 @@ mod server_helpers {
         client: &ImmichClient,
         key: &str,
         public_base_url: String,
-    ) -> Result<ShareDetails, ServerFnError> {
+    ) -> Result<ShareDetails, String> {
         match client.get_admin_shared_link(key).await {
             Ok(Some(link)) if link.password.is_some() => {
                 eprintln!("Share '{}' requires a password", key);
@@ -169,9 +198,7 @@ mod server_helpers {
                     "Share '{}' returned 401 but has no password set — share is not accessible",
                     key
                 );
-                Err(ServerFnError::ServerError(
-                    "Share is not accessible".to_string(),
-                ))
+                Err("Share is not accessible".to_string())
             }
             Ok(None) if client.admin_api_key.is_some() => {
                 // Admin API is available but the link wasn't found
@@ -179,7 +206,7 @@ mod server_helpers {
                     "Share '{}' not found via admin API — invalid share key",
                     key
                 );
-                Err(ServerFnError::ServerError("Invalid share key".to_string()))
+                Err("Invalid share key".to_string())
             }
             _ => {
                 // No admin key or API error — can't determine the cause,
@@ -268,7 +295,8 @@ mod server_helpers {
         album_id: &str,
         assets: &mut [crate::dto::SafeAsset],
     ) {
-        let Some(tags_res): Option<reqwest::Response> = client.get_with_key("/tags", api_key).await else {
+        let Some(tags_res): Option<reqwest::Response> = client.get_with_key("/tags", api_key).await
+        else {
             return;
         };
         if !tags_res.status().is_success() {
@@ -311,8 +339,9 @@ mod server_helpers {
                     page: Some(page),
                 };
 
-                let Some(search_res): Option<reqwest::Response> =
-                    client.post_with_key("/search/metadata", api_key, &search_req).await
+                let Some(search_res): Option<reqwest::Response> = client
+                    .post_with_key("/search/metadata", api_key, &search_req)
+                    .await
                 else {
                     break;
                 };
