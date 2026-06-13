@@ -99,9 +99,12 @@ async fn serve_share_html(Path(key): Path<String>, headers: HeaderMap) -> Respon
                 cover_image_url
             );
 
-            if let (Some(start), Some(end)) = (html_content.find("<title>"), html_content.find("</title>")) {
+            if let (Some(start), Some(end)) =
+                (html_content.find("<title>"), html_content.find("</title>"))
+            {
                 if start < end {
-                    html_content.replace_range(start..end + 8, &format!("<title>{}</title>", title));
+                    html_content
+                        .replace_range(start..end + 8, &format!("<title>{}</title>", title));
                 }
             }
 

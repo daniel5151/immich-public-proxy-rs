@@ -507,6 +507,224 @@ async fn get_or_create_tag(
     None
 }
 
+async fn tag_and_associate_asset_background(
+    client: ImmichClient,
+    asset_id: String,
+    album_id: String,
+    uploader_name: String,
+) {
+    let mut trash_checked = false;
+    let mut tagged = false;
+    let mut added_to_album = false;
+
+    // Retry loop: we will try up to 5 times to perform the remaining steps
+    for attempt in 1..=5 {
+        // Step 1: Check trash status and restore if needed
+        if !trash_checked {
+            let get_asset_url = client.build_url(&format!("/assets/{}", asset_id), &[]);
+            let asset_res = client
+                .http_client
+                .get(&get_asset_url)
+                .header("x-api-key", client.upload_api_key.as_ref().unwrap())
+                .send()
+                .await;
+
+            match asset_res {
+                Ok(r) if r.status().is_success() => {
+                    if let Ok(asset_info) = r.json::<crate::immich_client::model::Asset>().await {
+                        if asset_info.is_trashed.unwrap_or(false) {
+                            println!(
+                                "upload background: asset '{}' is in trash, attempting to restore (attempt {})...",
+                                asset_id, attempt
+                            );
+                            let restore_url = client.build_url("/trash/restore/assets", &[]);
+                            let restore_body = serde_json::json!({ "ids": [asset_id] });
+                            let restore_res = client
+                                .http_client
+                                .post(&restore_url)
+                                .header("x-api-key", client.upload_api_key.as_ref().unwrap())
+                                .json(&restore_body)
+                                .send()
+                                .await;
+
+                            match restore_res {
+                                Ok(res) if res.status().is_success() => {
+                                    println!(
+                                        "upload background: successfully restored asset '{}' from trash",
+                                        asset_id
+                                    );
+                                    trash_checked = true;
+                                }
+                                Ok(res) => {
+                                    eprintln!(
+                                        "upload background: failed to restore asset '{}' from trash: status {} (attempt {})",
+                                        asset_id,
+                                        res.status(),
+                                        attempt
+                                    );
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "upload background: failed to send restore request for asset '{}': {} (attempt {})",
+                                        asset_id, e, attempt
+                                    );
+                                }
+                            }
+                        } else {
+                            // Asset exists and is not in trash
+                            trash_checked = true;
+                        }
+                    } else {
+                        eprintln!(
+                            "upload background: failed to parse asset response for '{}' (attempt {})",
+                            asset_id, attempt
+                        );
+                    }
+                }
+                Ok(r) => {
+                    eprintln!(
+                        "upload background: checking asset '{}' returned status {} (attempt {})",
+                        asset_id,
+                        r.status(),
+                        attempt
+                    );
+                }
+                Err(e) => {
+                    eprintln!(
+                        "upload background: failed to check asset '{}': {} (attempt {})",
+                        asset_id, e, attempt
+                    );
+                }
+            }
+        }
+
+        // Step 2: Tag the asset with uploader name
+        if trash_checked && !tagged {
+            if let Some(parent_tag_id) = get_or_create_tag(&client, "SharedBy", None).await {
+                if let Some(child_tag_id) =
+                    get_or_create_tag(&client, &uploader_name, Some(&parent_tag_id)).await
+                {
+                    let tag_url = client.build_url(&format!("/tags/{}/assets", child_tag_id), &[]);
+                    let tag_res = client
+                        .http_client
+                        .put(&tag_url)
+                        .header("x-api-key", client.upload_api_key.as_ref().unwrap())
+                        .json(&serde_json::json!({ "ids": [asset_id] }))
+                        .send()
+                        .await;
+
+                    #[derive(serde::Deserialize)]
+                    struct TagResponse {
+                        #[allow(dead_code)]
+                        id: String,
+                        success: bool,
+                    }
+
+                    match tag_res {
+                        Ok(res) if res.status().is_success() => {
+                            if let Ok(results) = res.json::<Vec<TagResponse>>().await {
+                                if let Some(first) = results.first() {
+                                    if first.success {
+                                        tagged = true;
+                                    } else {
+                                        eprintln!(
+                                            "upload background: tagging returned success:false for asset {} (attempt {})",
+                                            asset_id, attempt
+                                        );
+                                    }
+                                } else {
+                                    eprintln!(
+                                        "upload background: tagging returned empty list for asset {} (attempt {})",
+                                        asset_id, attempt
+                                    );
+                                }
+                            } else {
+                                eprintln!(
+                                    "upload background: failed to parse tag response for asset {} (attempt {})",
+                                    asset_id, attempt
+                                );
+                            }
+                        }
+                        Ok(res) => {
+                            eprintln!(
+                                "upload background: tagging failed for asset {} with status {} (attempt {})",
+                                asset_id,
+                                res.status(),
+                                attempt
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "upload background: tagging request failed for asset {}: {} (attempt {})",
+                                asset_id, e, attempt
+                            );
+                        }
+                    }
+                } else {
+                    eprintln!(
+                        "upload background: failed to get or create child tag '{}' (attempt {})",
+                        uploader_name, attempt
+                    );
+                }
+            } else {
+                eprintln!(
+                    "upload background: failed to get or create parent tag 'SharedBy' (attempt {})",
+                    attempt
+                );
+            }
+        }
+
+        // Step 3: Add to album
+        if trash_checked && !added_to_album {
+            let album_url = client.build_url(&format!("/albums/{}/assets", album_id), &[]);
+            let album_res = client
+                .http_client
+                .put(&album_url)
+                .header("x-api-key", client.upload_api_key.as_ref().unwrap())
+                .json(&serde_json::json!({ "ids": [asset_id] }))
+                .send()
+                .await;
+
+            match album_res {
+                Ok(res) if res.status().is_success() => {
+                    added_to_album = true;
+                }
+                Ok(res) => {
+                    eprintln!(
+                        "upload background: failed to add asset {} to album {}: status {} (attempt {})",
+                        asset_id,
+                        album_id,
+                        res.status(),
+                        attempt
+                    );
+                }
+                Err(e) => {
+                    eprintln!(
+                        "upload background: failed to send add-to-album request for asset {} to album {}: {} (attempt {})",
+                        asset_id, album_id, e, attempt
+                    );
+                }
+            }
+        }
+
+        // If all operations succeeded, we can stop!
+        if trash_checked && tagged && added_to_album {
+            break;
+        }
+
+        // Wait before the next attempt, with exponential backoff.
+        let delay_ms = (250 * attempt as u64).min(2000);
+        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+    }
+
+    if !trash_checked || !tagged || !added_to_album {
+        eprintln!(
+            "upload background: finished processing asset {} with status: trash_checked={}, tagged={}, added_to_album={}",
+            asset_id, trash_checked, tagged, added_to_album
+        );
+    }
+}
+
 pub async fn upload_asset_handler(
     headers: HeaderMap,
     Path(key): Path<String>,
@@ -686,158 +904,14 @@ pub async fn upload_asset_handler(
     };
     let asset_id = upload_resp.id;
 
-    // Check if the asset is currently in the trash, and restore it if so (using the service account API key).
-    let get_asset_url = client.build_url(&format!("/assets/{}", asset_id), &[]);
-    let asset_res = client
-        .http_client
-        .get(&get_asset_url)
-        .header("x-api-key", client.upload_api_key.as_ref().unwrap())
-        .send()
-        .await;
-
-    if let Ok(r) = asset_res {
-        if r.status().is_success() {
-            if let Ok(asset_info) = r.json::<crate::immich_client::model::Asset>().await {
-                if asset_info.is_trashed.unwrap_or(false) {
-                    println!(
-                        "upload: asset '{}' is in trash, attempting to restore...",
-                        asset_id
-                    );
-                    let restore_url = client.build_url("/trash/restore/assets", &[]);
-                    let restore_body = serde_json::json!({ "ids": [asset_id] });
-                    let restore_res = client
-                        .http_client
-                        .post(&restore_url)
-                        .header("x-api-key", client.upload_api_key.as_ref().unwrap())
-                        .json(&restore_body)
-                        .send()
-                        .await;
-
-                    match restore_res {
-                        Ok(res) if res.status().is_success() => {
-                            println!(
-                                "upload: successfully restored asset '{}' from trash",
-                                asset_id
-                            );
-                        }
-                        Ok(res) => {
-                            eprintln!(
-                                "upload: failed to restore asset '{}' from trash: status {}",
-                                asset_id,
-                                res.status()
-                            );
-                        }
-                        Err(e) => {
-                            eprintln!(
-                                "upload: failed to send restore request for asset '{}': {}",
-                                asset_id, e
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Let Immich commit the uploaded asset to the database before tagging/associating it.
-    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-
-    // Tag the asset with the uploader name (using the service account API key)
-    if let Some(parent_tag_id) = get_or_create_tag(&client, "SharedBy", None).await {
-        if let Some(child_tag_id) =
-            get_or_create_tag(&client, &uploader_name, Some(&parent_tag_id)).await
-        {
-            let tag_url = client.build_url(&format!("/tags/{}/assets", child_tag_id), &[]);
-            let mut tag_success = false;
-
-            for attempt in 1..=3 {
-                let tag_res = client
-                    .http_client
-                    .put(&tag_url)
-                    .header("x-api-key", client.upload_api_key.as_ref().unwrap())
-                    .json(&serde_json::json!({ "ids": [asset_id] }))
-                    .send()
-                    .await;
-
-                #[derive(serde::Deserialize)]
-                struct TagResponse {
-                    #[allow(dead_code)]
-                    id: String,
-                    success: bool,
-                }
-
-                match tag_res {
-                    Ok(res) if res.status().is_success() => {
-                        if let Ok(results) = res.json::<Vec<TagResponse>>().await {
-                            if let Some(first) = results.first() {
-                                if first.success {
-                                    tag_success = true;
-                                    break;
-                                } else {
-                                    eprintln!(
-                                        "upload: tagging returned success:false for asset {} (attempt {})",
-                                        asset_id, attempt
-                                    );
-                                }
-                            } else {
-                                eprintln!(
-                                    "upload: tagging returned empty list for asset {} (attempt {})",
-                                    asset_id, attempt
-                                );
-                            }
-                        } else {
-                            eprintln!(
-                                "upload: failed to parse tag response for asset {} (attempt {})",
-                                asset_id, attempt
-                            );
-                        }
-                    }
-                    Ok(res) => {
-                        eprintln!(
-                            "upload: tagging failed for asset {} with status {} (attempt {})",
-                            asset_id,
-                            res.status(),
-                            attempt
-                        );
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "upload: tagging request failed for asset {}: {} (attempt {})",
-                            asset_id, e, attempt
-                        );
-                    }
-                }
-
-                // Backoff before retry
-                tokio::time::sleep(std::time::Duration::from_millis(attempt * 200)).await;
-            }
-
-            if !tag_success {
-                eprintln!(
-                    "upload: permanently failed to tag asset {} after 3 attempts",
-                    asset_id
-                );
-            }
-        }
-    }
-
-    // Add the uploaded asset to the album (using the service account API key)
-    let album_url = client.build_url(&format!("/albums/{}/assets", album_id), &[]);
-    let album_res = client
-        .http_client
-        .put(&album_url)
-        .header("x-api-key", client.upload_api_key.as_ref().unwrap())
-        .json(&serde_json::json!({ "ids": [asset_id] }))
-        .send()
-        .await;
-
-    if let Err(e) = &album_res {
-        eprintln!(
-            "failed to add asset {} to album {}: {}",
-            asset_id, album_id, e
-        );
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
+    // Spawn a background task to check trash, tag, and add to the album,
+    // so the main upload request path can return immediately and be parallelized.
+    tokio::spawn(tag_and_associate_asset_background(
+        client,
+        asset_id,
+        album_id.to_string(),
+        uploader_name,
+    ));
 
     StatusCode::OK.into_response()
 }

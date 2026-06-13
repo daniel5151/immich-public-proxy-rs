@@ -1,6 +1,7 @@
 use reqwest::Client;
 use reqwest::Url;
 
+#[derive(Clone)]
 pub struct ImmichClient {
     pub api_url: String,
     pub http_client: Client,
@@ -51,7 +52,8 @@ impl ImmichClient {
 
         let upload_key = self.upload_api_key.as_ref()?;
         let url = self.build_url("/users/me", &[]);
-        let res = self.http_client
+        let res = self
+            .http_client
             .get(&url)
             .header("x-api-key", upload_key)
             .send()
@@ -59,7 +61,10 @@ impl ImmichClient {
             .ok()?;
 
         let user_id = if res.status().is_success() {
-            res.json::<crate::immich_client::model::User>().await.ok().map(|u| u.id)
+            res.json::<crate::immich_client::model::User>()
+                .await
+                .ok()
+                .map(|u| u.id)
         } else {
             None
         };
