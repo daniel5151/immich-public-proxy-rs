@@ -29,6 +29,7 @@ pub struct SafeAlbum {
     pub id: String,
     pub album_name: Option<String>,
     pub description: Option<String>,
+    pub order: Option<String>,
     pub album_thumbnail_asset_id: Option<String>,
     #[serde(skip_serializing, default)]
     #[ts(skip)]
@@ -72,6 +73,7 @@ impl SafeAlbum {
             id: album.id,
             album_name: album.album_name,
             description: album.description,
+            order: album.order,
             album_thumbnail_asset_id: album.album_thumbnail_asset_id,
             assets: album.assets.into_iter().map(SafeAsset::from_base).collect(),
         }

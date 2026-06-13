@@ -46,6 +46,7 @@ pub struct Asset {
     pub height: Option<i32>,
     pub owner_id: Option<String>,
     pub owner: Option<User>,
+    pub tags: Option<Vec<Tag>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

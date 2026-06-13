@@ -140,7 +140,7 @@ interface DateGroup {
 function GalleryPage({ details }: GalleryPageProps) {
   const { link } = details;
   const realKey = link.key;
-  const assets = link.assets;
+  const [assets, setAssets] = useState<SafeAsset[]>(() => link.assets);
   const allowDownload = link.allowDownload ?? false;
   const allowUpload = link.allowUpload ?? false;
 
@@ -177,7 +177,7 @@ function GalleryPage({ details }: GalleryPageProps) {
   const [isUploading, setIsUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState({ completed: 0, total: 0 });
   const [uploadStatus, setUploadStatus] = useState<{ type: 'success' | 'failed'; message?: string } | null>(null);
-  
+
   const [showNameModal, setShowNameModal] = useState(false);
   const [uploaderName, setUploaderName] = useState(() => localStorage.getItem('uploader_name') || '');
   const [isEditingNameOnly, setIsEditingNameOnly] = useState(false);
@@ -434,6 +434,51 @@ function GalleryPage({ details }: GalleryPageProps) {
     }
   };
 
+  const insertAndSortAsset = (newAsset: SafeAsset) => {
+    setAssets((prev) => {
+      if (prev.some((a) => a.id === newAsset.id)) return prev;
+      const next = [...prev, newAsset];
+      const order = details.link.album?.order;
+      if (order === 'asc') {
+        next.sort((a, b) => {
+          const ad = a.fileCreatedAt ? new Date(a.fileCreatedAt).getTime() : 0;
+          const bd = b.fileCreatedAt ? new Date(b.fileCreatedAt).getTime() : 0;
+          return ad - bd;
+        });
+      } else if (order === 'desc') {
+        next.sort((a, b) => {
+          const ad = a.fileCreatedAt ? new Date(a.fileCreatedAt).getTime() : 0;
+          const bd = b.fileCreatedAt ? new Date(b.fileCreatedAt).getTime() : 0;
+          return bd - ad;
+        });
+      }
+      return next;
+    });
+    setDisplayCount((c) => c + 1);
+  };
+
+  const pollAssetStatus = async (assetId: string) => {
+    // Poll every 500ms up to 40 times (20 seconds max)
+    const maxAttempts = 40;
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      try {
+        const res = await fetch(`/share/${realKey}/status/${assetId}`);
+        if (res.status === 200) {
+          const newAsset: SafeAsset = await res.json();
+          insertAndSortAsset(newAsset);
+          return;
+        } else if (res.status !== 202) {
+          console.error(`Status polling failed for asset ${assetId}: ${res.status}`);
+          return;
+        }
+      } catch (err) {
+        console.error(`Status polling request failed for asset ${assetId}:`, err);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+    console.warn(`Status polling timed out for asset ${assetId}`);
+  };
+
   const onFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const filesList = e.target.files;
     if (!filesList || filesList.length === 0) return;
@@ -475,6 +520,8 @@ function GalleryPage({ details }: GalleryPageProps) {
           failedName = file.name;
           break;
         }
+        const uploadResult: { id: string } = await res.json();
+        pollAssetStatus(uploadResult.id);
       } catch {
         success = false;
         failedName = file.name;
@@ -663,12 +710,7 @@ function GalleryPage({ details }: GalleryPageProps) {
           )}
           {!isUploading && uploadStatus?.type === 'success' && (
             <div className="toast-content success">
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
-                <span>✅ Upload complete</span>
-                <span style={{ fontSize: '0.8rem', opacity: 0.75 }}>
-                  Reload the page to see your new photos.
-                </span>
-              </div>
+              <span>✅ Upload complete</span>
             </div>
           )}
           {!isUploading && uploadStatus?.type === 'failed' && (
