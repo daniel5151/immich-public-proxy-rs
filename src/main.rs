@@ -160,28 +160,33 @@ async fn main() {
         .layer(axum::extract::DefaultBodyLimit::disable())
         .layer(axum::middleware::map_response(
             |mut response: Response| async move {
-                let connect_src = if cfg!(debug_assertions) {
-                    "'self' ws://127.0.0.1:5173" // Vite dev ws
-                } else {
-                    "'self'"
-                };
+                static CSP_HEADER: std::sync::OnceLock<axum::http::HeaderValue> =
+                    std::sync::OnceLock::new();
+                let csp_value = CSP_HEADER.get_or_init(|| {
+                    let connect_src = if cfg!(debug_assertions) {
+                        "'self' ws://127.0.0.1:5173" // Vite dev ws
+                    } else {
+                        "'self'"
+                    };
 
-                let csp = format!(
-                    "default-src 'none'; \
-                     script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; \
-                     worker-src 'self' blob:; \
-                     style-src 'self' 'unsafe-inline'; \
-                     img-src 'self' data:; \
-                     media-src 'self'; \
-                     font-src 'self' data:; \
-                     connect-src {connect_src}; \
-                     frame-ancestors 'none'; \
-                     base-uri 'self'; \
-                     form-action 'self'"
-                );
+                    let csp = format!(
+                        "default-src 'none'; \
+                         script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; \
+                         worker-src 'self' blob:; \
+                         style-src 'self' 'unsafe-inline'; \
+                         img-src 'self' data:; \
+                         media-src 'self'; \
+                         font-src 'self' data:; \
+                         connect-src {connect_src}; \
+                         frame-ancestors 'none'; \
+                         base-uri 'self'; \
+                         form-action 'self'"
+                    );
+                    axum::http::HeaderValue::from_str(&csp).unwrap()
+                });
                 response.headers_mut().insert(
                     axum::http::header::CONTENT_SECURITY_POLICY,
-                    axum::http::HeaderValue::from_str(&csp).unwrap(),
+                    csp_value.clone(),
                 );
                 response
             },
