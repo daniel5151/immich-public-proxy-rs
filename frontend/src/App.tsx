@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useMemo } from 'react';
 import type { ShareDetails } from './types/generated/ShareDetails';
 import type { SafeAsset } from './types/generated/SafeAsset';
 import lightGallery from 'lightgallery';
@@ -7,54 +7,60 @@ import lgThumbnail from 'lightgallery/plugins/thumbnail';
 import lgVideo from 'lightgallery/plugins/video';
 import lgFullscreen from 'lightgallery/plugins/fullscreen';
 import lgHash from 'lightgallery/plugins/hash';
+import type { GalleryItem } from 'lightgallery/lg-utils';
 
 import 'lightgallery/css/lightgallery-bundle.css';
 
 type LightGallery = ReturnType<typeof lightGallery>;
 
 export default function App() {
-  const [shareKey, setShareKey] = useState<string>('');
-  const [details, setDetails] = useState<ShareDetails | null>(null);
-  const [loading, setLoading] = useState<boolean>(true);
-  const [error, setError] = useState<string | null>(null);
-
-  // Router logic
-  useEffect(() => {
+  const [shareKey] = useState<string>(() => {
     const pathname = window.location.pathname;
     const parts = pathname.split('/').filter(Boolean);
     if ((parts[0] === 'share' || parts[0] === 's') && parts[1]) {
-      setShareKey(parts[1]);
-    } else {
-      setLoading(false);
+      return parts[1];
     }
-  }, []);
-
-  const fetchDetails = async (key: string, password?: string) => {
-    try {
-      setLoading(true);
-      let url = `/api/share/${key}`;
-      if (password) {
-        url += `?password=${encodeURIComponent(password)}`;
-      }
-      const res = await fetch(url);
-      if (!res.ok) {
-        const errData = await res.json().catch(() => ({}));
-        throw new Error(errData.error || `Failed to fetch share details (${res.status})`);
-      }
-      const data: ShareDetails = await res.json();
-      setDetails(data);
-      setError(null);
-    } catch (e: any) {
-      setError(e.message || 'Failed to load share details');
-    } finally {
-      setLoading(false);
-    }
-  };
+    return '';
+  });
+  const [details, setDetails] = useState<ShareDetails | null>(null);
+  const [loading, setLoading] = useState<boolean>(() => {
+    const pathname = window.location.pathname;
+    const parts = pathname.split('/').filter(Boolean);
+    return !!((parts[0] === 'share' || parts[0] === 's') && parts[1]);
+  });
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (shareKey) {
-      fetchDetails(shareKey);
-    }
+    if (!shareKey) return;
+
+    let active = true;
+    const fetchDetails = async () => {
+      try {
+        const res = await fetch(`/api/share/${shareKey}`);
+        if (!active) return;
+        if (!res.ok) {
+          const errData = await res.json().catch(() => ({}));
+          throw new Error(errData.error || `Failed to fetch share details (${res.status})`);
+        }
+        const data: ShareDetails = await res.json();
+        setDetails(data);
+        setError(null);
+      } catch (e) {
+        if (active) {
+          const message = e instanceof Error ? e.message : 'Failed to load share details';
+          setError(message);
+        }
+      } finally {
+        if (active) {
+          setLoading(false);
+        }
+      }
+    };
+
+    fetchDetails();
+    return () => {
+      active = false;
+    };
   }, [shareKey]);
 
   if (loading) {
@@ -78,7 +84,7 @@ export default function App() {
   }
 
   if (details) {
-    return <GalleryPage details={details} shareKey={shareKey} />;
+    return <GalleryPage details={details} />;
   }
 
   return <div className="error-msg">Error: Invalid share key</div>;
@@ -143,8 +149,8 @@ function GalleryPage({ details }: GalleryPageProps) {
 
   const [selectedAssets, setSelectedAssets] = useState<Set<string>>(new Set());
 
-  // Check if there is a hash pointing to a slide index on load, and make sure it's valid
-  const getInitialDisplayCount = () => {
+  const [displayCount, setDisplayCount] = useState<number>(() => {
+    // Check if there is a hash pointing to a slide index on load, and make sure it's valid
     const defaultInitial = Math.min(40, assets.length);
     try {
       const hash = window.location.hash;
@@ -163,13 +169,11 @@ function GalleryPage({ details }: GalleryPageProps) {
           }
         }
       }
-    } catch (e) {
+    } catch {
       // Ignore parsing errors
     }
     return defaultInitial;
-  };
-
-  const [displayCount, setDisplayCount] = useState<number>(getInitialDisplayCount);
+  });
   const [isUploading, setIsUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState({ completed: 0, total: 0 });
   const [uploadStatus, setUploadStatus] = useState<{ type: 'success' | 'failed'; message?: string } | null>(null);
@@ -179,6 +183,8 @@ function GalleryPage({ details }: GalleryPageProps) {
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const lgRef = useRef<LightGallery | null>(null);
+  const galleryContainerRef = useRef<HTMLDivElement>(null);
+  const observerRef = useRef<HTMLDivElement>(null);
 
   // CSP compliance: error boundary for missing thumbnails
   useEffect(() => {
@@ -205,7 +211,7 @@ function GalleryPage({ details }: GalleryPageProps) {
 
   // Lazy load intersection observer
   useEffect(() => {
-    const observerTarget = document.getElementById('loading-observer');
+    const observerTarget = observerRef.current;
     if (!observerTarget) return;
 
     const observer = new IntersectionObserver((entries) => {
@@ -224,41 +230,46 @@ function GalleryPage({ details }: GalleryPageProps) {
 
     observer.observe(observerTarget);
     return () => observer.disconnect();
-  }, [assets.length, isUploading, displayCount]);
+  }, [assets.length, isUploading]);
 
   // Group assets by date
-  const groups: DateGroup[] = [];
-  assets.forEach((asset, i) => {
-    let dateLabel = 'Unknown Date';
-    if (asset.fileCreatedAt) {
-      try {
-        const date = new Date(asset.fileCreatedAt);
-        if (!isNaN(date.getTime())) {
-          dateLabel = date.toLocaleDateString('en-US', {
-            weekday: 'short',
-            month: 'short',
-            day: 'numeric',
-            year: 'numeric'
-          });
+  const groups = useMemo(() => {
+    const groups: DateGroup[] = [];
+    assets.forEach((asset, i) => {
+      let dateLabel = 'Unknown Date';
+      if (asset.fileCreatedAt) {
+        try {
+          const date = new Date(asset.fileCreatedAt);
+          if (!isNaN(date.getTime())) {
+            dateLabel = date.toLocaleDateString('en-US', {
+              weekday: 'short',
+              month: 'short',
+              day: 'numeric',
+              year: 'numeric'
+            });
+          }
+        } catch {
+          // Fallback
         }
-      } catch {
-        // Fallback
       }
-    }
 
-    if (groups.length > 0 && groups[groups.length - 1].label === dateLabel) {
-      groups[groups.length - 1].items.push({ globalIndex: i, asset });
-    } else {
-      groups.push({
-        label: dateLabel,
-        items: [{ globalIndex: i, asset }]
-      });
-    }
-  });
+      if (groups.length > 0 && groups[groups.length - 1].label === dateLabel) {
+        groups[groups.length - 1].items.push({ globalIndex: i, asset });
+      } else {
+        groups.push({
+          label: dateLabel,
+          items: [{ globalIndex: i, asset }]
+        });
+      }
+    });
+    return groups;
+  }, [assets]);
 
   // lightGallery initialization / update
-  const initLg = () => {
-    const el = document.getElementById('lightgallery');
+  useEffect(() => {
+    if (assets.length === 0) return;
+
+    const el = galleryContainerRef.current;
     if (!el) return;
 
     if (lgRef.current) {
@@ -271,7 +282,7 @@ function GalleryPage({ details }: GalleryPageProps) {
       const thumbnailUrl = `/share/photo/${realKey}/${asset.id}/thumbnail`;
 
       if (asset.type === 'VIDEO') {
-        const item: any = {
+        const item = {
           video: {
             source: [
               {
@@ -285,21 +296,17 @@ function GalleryPage({ details }: GalleryPageProps) {
             }
           },
           poster: previewUrl,
-          thumb: thumbnailUrl
+          thumb: thumbnailUrl,
+          downloadUrl: asset.downloadUrl
         };
-        if (asset.downloadUrl) {
-          item.downloadUrl = asset.downloadUrl;
-        }
-        return item;
+        return item as unknown as GalleryItem;
       } else {
-        const item: any = {
+        const item = {
           src: previewUrl,
-          thumb: thumbnailUrl
+          thumb: thumbnailUrl,
+          downloadUrl: asset.downloadUrl
         };
-        if (asset.downloadUrl) {
-          item.downloadUrl = asset.downloadUrl;
-        }
-        return item;
+        return item as GalleryItem;
       }
     });
 
@@ -325,7 +332,7 @@ function GalleryPage({ details }: GalleryPageProps) {
 
     lgRef.current = lightGallery(el, lgConfig);
 
-    const handleClick = (e: MouseEvent) => {
+    const handleClick = (e: Event) => {
       const target = (e.target as HTMLElement).closest('.gallery-item');
       if (target && el.contains(target)) {
         const indexAttr = target.getAttribute('data-index');
@@ -340,26 +347,16 @@ function GalleryPage({ details }: GalleryPageProps) {
       }
     };
 
-    el.removeEventListener('click', handleClick as any);
-    el.addEventListener('click', handleClick as any);
+    el.addEventListener('click', handleClick);
 
     return () => {
-      el.removeEventListener('click', handleClick as any);
+      el.removeEventListener('click', handleClick);
       if (lgRef.current) {
         lgRef.current.destroy();
         lgRef.current = null;
       }
     };
-  };
-
-  useEffect(() => {
-    if (assets.length > 0) {
-      const cleanup = initLg();
-      return () => {
-        cleanup?.();
-      };
-    }
-  }, [displayCount]);
+  }, [displayCount, assets, realKey]);
 
   // Toggles and selection behaviors
   const onToggleAsset = (id: string) => {
@@ -462,7 +459,7 @@ function GalleryPage({ details }: GalleryPageProps) {
           failedName = file.name;
           break;
         }
-      } catch (e) {
+      } catch {
         success = false;
         failedName = file.name;
         break;
@@ -536,7 +533,7 @@ function GalleryPage({ details }: GalleryPageProps) {
       )}
 
       {/* LightGallery Grid container */}
-      <div id="lightgallery">
+      <div id="lightgallery" ref={galleryContainerRef}>
         {groups.map((group) => {
           const groupStartIndex = group.items[0].globalIndex;
           if (displayCount <= groupStartIndex) return null;
@@ -608,7 +605,7 @@ function GalleryPage({ details }: GalleryPageProps) {
         })}
       </div>
 
-      <div id="loading-observer" style={{ height: '1px', width: '100%' }}></div>
+      <div id="loading-observer" ref={observerRef} style={{ height: '1px', width: '100%' }}></div>
 
       {/* Loading spinners / status logs */}
       {(displayCount < assets.length || isUploading) && (
