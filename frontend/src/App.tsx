@@ -182,12 +182,12 @@ function GalleryPage({ details }: GalleryPageProps) {
         });
       }
     }, {
-      rootMargin: '1000px 0px 1000px 0px'
+      rootMargin: '200px 0px 200px 0px'
     });
 
     observer.observe(observerTarget);
     return () => observer.disconnect();
-  }, [assets.length, isUploading]);
+  }, [assets.length, isUploading, displayCount]);
 
   // Group assets by date
   const groups: DateGroup[] = [];
@@ -229,7 +229,7 @@ function GalleryPage({ details }: GalleryPageProps) {
       lgRef.current = null;
     }
 
-    const itemsArray = assets.map((asset) => {
+    const itemsArray = assets.slice(0, displayCount).map((asset) => {
       const previewUrl = `/share/photo/${realKey}/${asset.id}/preview`;
       const thumbnailUrl = `/share/photo/${realKey}/${asset.id}/thumbnail`;
 
