@@ -132,7 +132,34 @@ function GalleryPage({ details }: GalleryPageProps) {
   const albumDescription = link.album?.description;
 
   const [selectedAssets, setSelectedAssets] = useState<Set<string>>(new Set());
-  const [displayCount, setDisplayCount] = useState<number>(Math.min(40, assets.length));
+
+  // Check if there is a hash pointing to a slide index on load, and make sure it's valid
+  const getInitialDisplayCount = () => {
+    const defaultInitial = Math.min(40, assets.length);
+    try {
+      const hash = window.location.hash;
+      if (hash) {
+        const params = new URLSearchParams(hash.substring(1));
+        const slideStr = params.get('slide');
+        if (slideStr) {
+          const slideIndex = parseInt(slideStr, 10);
+          if (!isNaN(slideIndex) && slideIndex >= 0) {
+            if (slideIndex < assets.length) {
+              return Math.min(Math.max(defaultInitial, slideIndex + 1), assets.length);
+            } else {
+              // The requested slide is out of bounds. Clear the hash to prevent lightGallery from crashing.
+              window.location.hash = '';
+            }
+          }
+        }
+      }
+    } catch (e) {
+      // Ignore parsing errors
+    }
+    return defaultInitial;
+  };
+
+  const [displayCount, setDisplayCount] = useState<number>(getInitialDisplayCount);
   const [isUploading, setIsUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState({ completed: 0, total: 0 });
   const [uploadStatus, setUploadStatus] = useState<{ type: 'success' | 'failed'; message?: string } | null>(null);
