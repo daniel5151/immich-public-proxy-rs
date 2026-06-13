@@ -166,7 +166,7 @@ async fn main() {
                      style-src 'self' 'unsafe-inline'; \
                      img-src 'self' data:; \
                      media-src 'self'; \
-                     font-src 'self'; \
+                     font-src 'self' data:; \
                      connect-src {connect_src}; \
                      frame-ancestors 'none'; \
                      base-uri 'self'; \

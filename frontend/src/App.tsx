@@ -1,6 +1,16 @@
 import { useState, useEffect, useRef } from 'react';
 import type { ShareDetails } from './types/generated/ShareDetails';
 import type { SafeAsset } from './types/generated/SafeAsset';
+import lightGallery from 'lightgallery';
+import lgZoom from 'lightgallery/plugins/zoom';
+import lgThumbnail from 'lightgallery/plugins/thumbnail';
+import lgVideo from 'lightgallery/plugins/video';
+import lgFullscreen from 'lightgallery/plugins/fullscreen';
+import lgHash from 'lightgallery/plugins/hash';
+
+import 'lightgallery/css/lightgallery-bundle.css';
+
+type LightGallery = ReturnType<typeof lightGallery>;
 
 export default function App() {
   const [shareKey, setShareKey] = useState<string>('');
@@ -168,7 +178,7 @@ function GalleryPage({ details }: GalleryPageProps) {
   const [uploaderName, setUploaderName] = useState(() => localStorage.getItem('uploader_name') || '');
 
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const lgRef = useRef<any>(null);
+  const lgRef = useRef<LightGallery | null>(null);
 
   // CSP compliance: error boundary for missing thumbnails
   useEffect(() => {
@@ -249,7 +259,7 @@ function GalleryPage({ details }: GalleryPageProps) {
   // lightGallery initialization / update
   const initLg = () => {
     const el = document.getElementById('lightgallery');
-    if (!el || !(window as any).lightGallery) return;
+    if (!el) return;
 
     if (lgRef.current) {
       lgRef.current.destroy();
@@ -295,12 +305,12 @@ function GalleryPage({ details }: GalleryPageProps) {
 
     const lgConfig = {
       plugins: [
-        (window as any).lgZoom,
-        (window as any).lgThumbnail,
-        (window as any).lgVideo,
-        (window as any).lgFullscreen,
-        (window as any).lgHash
-      ].filter(Boolean),
+        lgZoom,
+        lgThumbnail,
+        lgVideo,
+        lgFullscreen,
+        lgHash
+      ],
       speed: 500,
       licenseKey: '8FFA6495-676C4D30-8BFC54B6-4D0A6CEC',
       selector: '.gallery-item',
@@ -313,7 +323,7 @@ function GalleryPage({ details }: GalleryPageProps) {
       dynamicEl: itemsArray
     };
 
-    lgRef.current = (window as any).lightGallery(el, lgConfig);
+    lgRef.current = lightGallery(el, lgConfig);
 
     const handleClick = (e: MouseEvent) => {
       const target = (e.target as HTMLElement).closest('.gallery-item');
