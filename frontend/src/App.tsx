@@ -180,6 +180,7 @@ function GalleryPage({ details }: GalleryPageProps) {
   
   const [showNameModal, setShowNameModal] = useState(false);
   const [uploaderName, setUploaderName] = useState(() => localStorage.getItem('uploader_name') || '');
+  const [isEditingNameOnly, setIsEditingNameOnly] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const lgRef = useRef<LightGallery | null>(null);
@@ -397,12 +398,25 @@ function GalleryPage({ details }: GalleryPageProps) {
 
   // Upload helpers
   const triggerFileInput = () => {
-    const name = uploaderName.trim();
+    const name = (localStorage.getItem('uploader_name') || '').trim();
     if (!name) {
+      setUploaderName('');
+      setIsEditingNameOnly(false);
       setShowNameModal(true);
     } else {
       fileInputRef.current?.click();
     }
+  };
+
+  const triggerEditName = () => {
+    setUploaderName(localStorage.getItem('uploader_name') || '');
+    setIsEditingNameOnly(true);
+    setShowNameModal(true);
+  };
+
+  const handleCancelNameModal = () => {
+    setShowNameModal(false);
+    setUploaderName(localStorage.getItem('uploader_name') || '');
   };
 
   const onConfirmName = (e: React.FormEvent) => {
@@ -411,10 +425,12 @@ function GalleryPage({ details }: GalleryPageProps) {
     if (name) {
       localStorage.setItem('uploader_name', name);
       setShowNameModal(false);
-      // Small timeout to allow state to settle before file dialog
-      setTimeout(() => {
-        fileInputRef.current?.click();
-      }, 50);
+      if (!isEditingNameOnly) {
+        // Small timeout to allow state to settle before file dialog
+        setTimeout(() => {
+          fileInputRef.current?.click();
+        }, 50);
+      }
     }
   };
 
@@ -523,6 +539,27 @@ function GalleryPage({ details }: GalleryPageProps) {
                 <span>Download all</span>
               </a>
             </div>
+          )}
+          {allowUpload && (
+            <button
+              onClick={triggerEditName}
+              title="Upload settings"
+              className="header-btn-circle"
+            >
+              <svg
+                xmlns="http://www.w3.org/2000/svg"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                className="header-icon"
+              >
+                <circle cx="12" cy="12" r="3"></circle>
+                <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+              </svg>
+            </button>
           )}
         </div>
       </div>
@@ -644,7 +681,7 @@ function GalleryPage({ details }: GalleryPageProps) {
 
       {/* Uploader name modal dialog */}
       {showNameModal && (
-        <div className="modal-overlay" onClick={() => setShowNameModal(false)}>
+        <div className="modal-overlay" onClick={handleCancelNameModal}>
           <div className="modal-container" onClick={(e) => e.stopPropagation()}>
             <h3 className="modal-title">Uploader Name</h3>
             <p className="modal-desc">Please enter your name to attribute your uploaded photos.</p>
@@ -659,7 +696,7 @@ function GalleryPage({ details }: GalleryPageProps) {
                 onChange={(e) => setUploaderName(e.target.value)}
               />
               <div className="modal-actions">
-                <button type="button" className="header-btn" onClick={() => setShowNameModal(false)}>
+                <button type="button" className="header-btn" onClick={handleCancelNameModal}>
                   Cancel
                 </button>
                 <button
