@@ -220,8 +220,17 @@ function GalleryPage({ details }: GalleryPageProps) {
   const galleryContainerRef = useRef<HTMLDivElement>(null);
   const observerRef = useRef<HTMLDivElement>(null);
 
-  // Reset displayCount when filter changes
+  // Reset displayCount when filter changes. Skip the initial mount run so a
+  // deep-linked slide (e.g. #lg=1&slide=61) keeps the larger displayCount the
+  // initializer computed — otherwise we'd clobber it back to 40 before
+  // lightGallery builds its dynamicEl, and lgHash would open an out-of-range
+  // slide and crash.
+  const didMountFilterResetRef = useRef(false);
   useEffect(() => {
+    if (!didMountFilterResetRef.current) {
+      didMountFilterResetRef.current = true;
+      return;
+    }
     setDisplayCount(Math.min(40, filteredAssets.length));
   }, [enabledUploaders]); // eslint-disable-line react-hooks/exhaustive-deps
 
