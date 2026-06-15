@@ -445,7 +445,7 @@ async fn get_or_create_tag(
 
     let upload_key = client.upload_api_key.as_ref()?;
 
-    // Step 1: List all tags
+    // Step 1: List all tags and bulk-cache them
     let get_url = client.build_url("/tags", &[]);
     let res = client
         .http_client
@@ -457,12 +457,16 @@ async fn get_or_create_tag(
 
     if res.status().is_success() {
         if let Ok(tags) = res.json::<Vec<crate::immich_client::model::Tag>>().await {
+            let mut write_guard = cache.write();
             for tag in &tags {
-                if tag.name == name && tag.parent_id.as_deref() == parent_id {
-                    let mut write_guard = cache.write();
-                    write_guard.insert(cache_key, tag.id.clone());
-                    return Some(tag.id.clone());
-                }
+                let key = match &tag.parent_id {
+                    Some(p_id) => format!("{}:{}", p_id, tag.name),
+                    None => format!("root:{}", tag.name),
+                };
+                write_guard.entry(key).or_insert_with(|| tag.id.clone());
+            }
+            if let Some(id) = write_guard.get(&cache_key) {
+                return Some(id.clone());
             }
         }
     }
@@ -507,12 +511,16 @@ async fn get_or_create_tag(
                 .json::<Vec<crate::immich_client::model::Tag>>()
                 .await
             {
+                let mut write_guard = cache.write();
                 for tag in &tags {
-                    if tag.name == name && tag.parent_id.as_deref() == parent_id {
-                        let mut write_guard = cache.write();
-                        write_guard.insert(cache_key, tag.id.clone());
-                        return Some(tag.id.clone());
-                    }
+                    let key = match &tag.parent_id {
+                        Some(p_id) => format!("{}:{}", p_id, tag.name),
+                        None => format!("root:{}", tag.name),
+                    };
+                    write_guard.insert(key, tag.id.clone());
+                }
+                if let Some(id) = write_guard.get(&cache_key) {
+                    return Some(id.clone());
                 }
             }
         }
@@ -1076,7 +1084,7 @@ pub async fn upload_status_handler(
     );
     let thumb_res = client
         .http_client
-        .get(&get_thumb_url)
+        .head(&get_thumb_url)
         .header("x-api-key", client.upload_api_key.as_ref().unwrap())
         .send()
         .await;
