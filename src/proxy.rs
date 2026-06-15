@@ -116,9 +116,16 @@ pub async fn unlock_share_handler(
         let b64_pwd = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&payload.password);
         let b64_key = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&payload.key);
 
+        let is_https = headers
+            .get("x-forwarded-proto")
+            .and_then(|p| p.to_str().ok())
+            .map(|p| p.eq_ignore_ascii_case("https"))
+            .unwrap_or(false);
+        let secure_flag = if is_https { " Secure;" } else { "" };
+
         let cookie1 = format!(
-            "immich_pwd_{}={}; Path=/; HttpOnly; Secure; SameSite=Lax",
-            b64_key, b64_pwd
+            "immich_pwd_{}={};{} Path=/; HttpOnly; SameSite=Lax",
+            b64_key, b64_pwd, secure_flag
         );
         let mut resp = Redirect::to(&format!("/share/{}", payload.key)).into_response();
         resp.headers_mut()
@@ -127,8 +134,8 @@ pub async fn unlock_share_handler(
         if payload.key != real_key {
             let b64_real_key = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&real_key);
             let cookie2 = format!(
-                "immich_pwd_{}={}; Path=/; HttpOnly; Secure; SameSite=Lax",
-                b64_real_key, b64_pwd
+                "immich_pwd_{}={};{} Path=/; HttpOnly; SameSite=Lax",
+                b64_real_key, b64_pwd, secure_flag
             );
             resp.headers_mut()
                 .append(axum::http::header::SET_COOKIE, cookie2.parse().unwrap());
