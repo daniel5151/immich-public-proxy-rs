@@ -14,6 +14,14 @@ use axum::{
     routing::get,
 };
 
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#x27;")
+}
+
 async fn serve_share_html(Path(key): Path<String>, headers: HeaderMap) -> Response {
     let details_res = api::get_share_details::get_share_details(key.clone(), None, &headers).await;
 
@@ -77,6 +85,9 @@ async fn serve_share_html(Path(key): Path<String>, headers: HeaderMap) -> Respon
                     )
                 })
                 .unwrap_or_default();
+
+            let title = html_escape(&title);
+            let description = html_escape(&description);
 
             let meta_tags = format!(
                 r#"<meta name="description" content="{}" />
