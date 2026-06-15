@@ -149,6 +149,39 @@ function GalleryPage({ details }: GalleryPageProps) {
 
   const [selectedAssets, setSelectedAssets] = useState<Set<string>>(new Set());
 
+  // --- Filter by Uploader state ---
+  const [enabledUploaders, setEnabledUploaders] = useState<Set<string> | null>(null);
+  const [showSettingsModal, setShowSettingsModal] = useState(false);
+
+  // Compute uploader counts and distinct names from the full asset list
+  const uploaderCounts = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const asset of assets) {
+      const name = asset.uploaderName ?? 'Unknown';
+      counts.set(name, (counts.get(name) ?? 0) + 1);
+    }
+    return counts;
+  }, [assets]);
+
+  const distinctUploaders = useMemo(() => {
+    return Array.from(uploaderCounts.keys()).sort((a, b) => a.localeCompare(b));
+  }, [uploaderCounts]);
+
+  const hasMultipleUploaders = distinctUploaders.length >= 2;
+
+  const isFilterActive = enabledUploaders !== null && enabledUploaders.size < distinctUploaders.length;
+
+  // Filtered assets based on uploader selection
+  const filteredAssets = useMemo(() => {
+    if (!enabledUploaders) return assets;
+    return assets.filter((a) => {
+      const name = a.uploaderName ?? 'Unknown';
+      return enabledUploaders.has(name);
+    });
+  }, [assets, enabledUploaders]);
+
+  // --- End filter state ---
+
   const [displayCount, setDisplayCount] = useState<number>(() => {
     // Check if there is a hash pointing to a slide index on load, and make sure it's valid
     const defaultInitial = Math.min(40, assets.length);
@@ -178,14 +211,19 @@ function GalleryPage({ details }: GalleryPageProps) {
   const [uploadProgress, setUploadProgress] = useState({ completed: 0, total: 0 });
   const [uploadStatus, setUploadStatus] = useState<{ type: 'success' | 'failed'; message?: string } | null>(null);
 
+  // Upload name prompt modal (kept separate from settings for the upload flow)
   const [showNameModal, setShowNameModal] = useState(false);
   const [uploaderName, setUploaderName] = useState(() => localStorage.getItem('uploader_name') || '');
-  const [isEditingNameOnly, setIsEditingNameOnly] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const lgRef = useRef<LightGallery | null>(null);
   const galleryContainerRef = useRef<HTMLDivElement>(null);
   const observerRef = useRef<HTMLDivElement>(null);
+
+  // Reset displayCount when filter changes
+  useEffect(() => {
+    setDisplayCount(Math.min(40, filteredAssets.length));
+  }, [enabledUploaders]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // CSP compliance: error boundary for missing thumbnails
   useEffect(() => {
@@ -210,7 +248,7 @@ function GalleryPage({ details }: GalleryPageProps) {
     return () => document.body.classList.remove('selection-mode');
   }, [selectedAssets.size]);
 
-  // Lazy load intersection observer
+  // Lazy load intersection observer — operates on filteredAssets
   useEffect(() => {
     const observerTarget = observerRef.current;
     if (!observerTarget) return;
@@ -219,8 +257,8 @@ function GalleryPage({ details }: GalleryPageProps) {
       const entry = entries[0];
       if (entry.isIntersecting && !isUploading) {
         setDisplayCount((current) => {
-          if (current < assets.length) {
-            return Math.min(current + 12, assets.length);
+          if (current < filteredAssets.length) {
+            return Math.min(current + 12, filteredAssets.length);
           }
           return current;
         });
@@ -231,12 +269,12 @@ function GalleryPage({ details }: GalleryPageProps) {
 
     observer.observe(observerTarget);
     return () => observer.disconnect();
-  }, [assets.length, isUploading]);
+  }, [filteredAssets.length, isUploading]);
 
-  // Group assets by date
+  // Group filteredAssets by date
   const groups = useMemo(() => {
     const groups: DateGroup[] = [];
-    assets.forEach((asset, i) => {
+    filteredAssets.forEach((asset, i) => {
       let dateLabel = 'Unknown Date';
       if (asset.fileCreatedAt) {
         try {
@@ -264,11 +302,11 @@ function GalleryPage({ details }: GalleryPageProps) {
       }
     });
     return groups;
-  }, [assets]);
+  }, [filteredAssets]);
 
-  // lightGallery initialization / update
+  // lightGallery initialization / update — uses filteredAssets
   useEffect(() => {
-    if (assets.length === 0) return;
+    if (filteredAssets.length === 0) return;
 
     const el = galleryContainerRef.current;
     if (!el) return;
@@ -278,7 +316,7 @@ function GalleryPage({ details }: GalleryPageProps) {
       lgRef.current = null;
     }
 
-    const itemsArray = assets.slice(0, displayCount).map((asset) => {
+    const itemsArray = filteredAssets.slice(0, displayCount).map((asset) => {
       const previewUrl = `/share/photo/${realKey}/${asset.id}/preview`;
       const thumbnailUrl = `/share/photo/${realKey}/${asset.id}/thumbnail`;
 
@@ -357,7 +395,7 @@ function GalleryPage({ details }: GalleryPageProps) {
         lgRef.current = null;
       }
     };
-  }, [displayCount, assets, realKey]);
+  }, [displayCount, filteredAssets, realKey]);
 
   // Toggles and selection behaviors
   const onToggleAsset = (id: string) => {
@@ -401,17 +439,10 @@ function GalleryPage({ details }: GalleryPageProps) {
     const name = (localStorage.getItem('uploader_name') || '').trim();
     if (!name) {
       setUploaderName('');
-      setIsEditingNameOnly(false);
       setShowNameModal(true);
     } else {
       fileInputRef.current?.click();
     }
-  };
-
-  const triggerEditName = () => {
-    setUploaderName(localStorage.getItem('uploader_name') || '');
-    setIsEditingNameOnly(true);
-    setShowNameModal(true);
   };
 
   const handleCancelNameModal = () => {
@@ -425,13 +456,31 @@ function GalleryPage({ details }: GalleryPageProps) {
     if (name) {
       localStorage.setItem('uploader_name', name);
       setShowNameModal(false);
-      if (!isEditingNameOnly) {
-        // Small timeout to allow state to settle before file dialog
-        setTimeout(() => {
-          fileInputRef.current?.click();
-        }, 50);
-      }
+      // Small timeout to allow state to settle before file dialog
+      setTimeout(() => {
+        fileInputRef.current?.click();
+      }, 50);
     }
+  };
+
+  // Settings modal open handler
+  const openSettings = () => {
+    // Initialize enabled uploaders on first open if multiple uploaders exist
+    if (enabledUploaders === null && hasMultipleUploaders) {
+      setEnabledUploaders(new Set(distinctUploaders));
+    }
+    // Sync uploader name from localStorage
+    setUploaderName(localStorage.getItem('uploader_name') || '');
+    setShowSettingsModal(true);
+  };
+
+  const closeSettings = () => {
+    // Save uploader name on close
+    const name = uploaderName.trim();
+    if (name) {
+      localStorage.setItem('uploader_name', name);
+    }
+    setShowSettingsModal(false);
   };
 
   const insertAndSortAsset = (newAsset: SafeAsset) => {
@@ -587,11 +636,12 @@ function GalleryPage({ details }: GalleryPageProps) {
               </a>
             </div>
           )}
-          {allowUpload && (
+          {(allowUpload || hasMultipleUploaders) && (
             <button
-              onClick={triggerEditName}
-              title="Upload settings"
+              onClick={openSettings}
+              title="Settings"
               className="header-btn-circle"
+              style={{ position: 'relative' }}
             >
               <svg
                 xmlns="http://www.w3.org/2000/svg"
@@ -606,6 +656,7 @@ function GalleryPage({ details }: GalleryPageProps) {
                 <circle cx="12" cy="12" r="3"></circle>
                 <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
               </svg>
+              {isFilterActive && <span className="filter-dot" />}
             </button>
           )}
         </div>
@@ -693,7 +744,7 @@ function GalleryPage({ details }: GalleryPageProps) {
       <div id="loading-observer" ref={observerRef} style={{ height: '1px', width: '100%' }}></div>
 
       {/* Loading spinners / status logs */}
-      {(displayCount < assets.length || isUploading) && (
+      {(displayCount < filteredAssets.length || isUploading) && (
         <div id="loading-spinner">
           <span className="loader"></span>
         </div>
@@ -724,7 +775,7 @@ function GalleryPage({ details }: GalleryPageProps) {
         </div>
       )}
 
-      {/* Uploader name modal dialog */}
+      {/* Upload name prompt modal (for upload button flow) */}
       {showNameModal && (
         <div className="modal-overlay" onClick={handleCancelNameModal}>
           <div className="modal-container" onClick={(e) => e.stopPropagation()}>
@@ -753,6 +804,85 @@ function GalleryPage({ details }: GalleryPageProps) {
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* Unified Settings modal */}
+      {showSettingsModal && (
+        <div className="modal-overlay" onClick={closeSettings}>
+          <div className="modal-container settings-modal" onClick={(e) => e.stopPropagation()}>
+            <h3 className="modal-title">Settings</h3>
+
+            {hasMultipleUploaders && (
+              <div className="settings-section">
+                <div className="settings-section-label">Filter by Uploader</div>
+                <div className="filter-list">
+                  {distinctUploaders.map((name) => (
+                    <label key={name} className="filter-row">
+                      <input
+                        type="checkbox"
+                        checked={enabledUploaders?.has(name) ?? true}
+                        onChange={() => {
+                          setEnabledUploaders((prev) => {
+                            const next = new Set(prev ?? distinctUploaders);
+                            if (next.has(name)) {
+                              next.delete(name);
+                            } else {
+                              next.add(name);
+                            }
+                            return next;
+                          });
+                        }}
+                      />
+                      <span className="filter-name">{name}</span>
+                      <span className="filter-count">{uploaderCounts.get(name) ?? 0}</span>
+                    </label>
+                  ))}
+                </div>
+                <div className="filter-actions">
+                  <button
+                    className="filter-link"
+                    onClick={() => setEnabledUploaders(new Set(distinctUploaders))}
+                  >
+                    Select All
+                  </button>
+                  <span className="filter-separator">·</span>
+                  <button
+                    className="filter-link"
+                    onClick={() => setEnabledUploaders(new Set())}
+                  >
+                    Clear All
+                  </button>
+                </div>
+                <div className="filter-summary">
+                  Showing {filteredAssets.length}/{assets.length}
+                </div>
+              </div>
+            )}
+
+            {allowUpload && (
+              <div className="settings-section">
+                <div className="settings-section-label">Uploader Name</div>
+                <input
+                  type="text"
+                  className="modal-input settings-name-input"
+                  placeholder="Your Name"
+                  value={uploaderName}
+                  onChange={(e) => setUploaderName(e.target.value)}
+                  onBlur={() => {
+                    const name = uploaderName.trim();
+                    if (name) localStorage.setItem('uploader_name', name);
+                  }}
+                />
+              </div>
+            )}
+
+            <div className="modal-actions">
+              <button className="modal-btn-confirm" onClick={closeSettings}>
+                Done
+              </button>
+            </div>
           </div>
         </div>
       )}
