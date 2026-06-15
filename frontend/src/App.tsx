@@ -288,7 +288,7 @@ function GalleryPage({ details }: GalleryPageProps) {
             source: [
               {
                 src: `/share/video/${realKey}/${asset.id}`,
-                type: 'video/mp4'
+                type: asset.originalMimeType || 'video/mp4'
               }
             ],
             attributes: {

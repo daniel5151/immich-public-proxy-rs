@@ -9,6 +9,7 @@ pub struct SafeAsset {
     pub id: String,
     pub original_file_name: Option<String>,
     pub r#type: String, // "IMAGE" or "VIDEO"
+    pub original_mime_type: Option<String>,
     pub file_created_at: Option<String>,
     pub width: Option<i32>,
     pub height: Option<i32>,
@@ -56,6 +57,7 @@ impl SafeAsset {
             id: asset.id,
             original_file_name: asset.original_file_name,
             r#type: asset.r#type,
+            original_mime_type: asset.original_mime_type,
             file_created_at: asset.file_created_at,
             width: asset.width,
             height: asset.height,
