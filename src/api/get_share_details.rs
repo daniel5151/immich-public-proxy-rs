@@ -42,8 +42,11 @@ pub async fn get_share_details(
         .and_then(|p| p.to_str().ok())
         .unwrap_or("http");
 
-    let public_base_url =
-        std::env::var("PUBLIC_BASE_URL").unwrap_or_else(|_| format!("{}://{}", proto, host));
+    static PUBLIC_BASE_URL_ENV: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let public_base_url = PUBLIC_BASE_URL_ENV
+        .get_or_init(|| std::env::var("PUBLIC_BASE_URL").ok())
+        .clone()
+        .unwrap_or_else(|| format!("{}://{}", proto, host));
 
     // Check cookie for password if not provided
     let password =
