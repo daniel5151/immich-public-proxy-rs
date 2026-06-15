@@ -25,8 +25,11 @@ fn html_escape(s: &str) -> String {
 async fn serve_share_html(Path(key): Path<String>, headers: HeaderMap) -> Response {
     let details_res = api::get_share_details::get_share_details(key.clone(), None, &headers).await;
 
-    let site_root = std::env::var("LEPTOS_SITE_ROOT").unwrap_or_else(|_| "target/site".to_string());
-    let index_path = std::path::Path::new(&site_root).join("index.html");
+    static SITE_ROOT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let site_root = SITE_ROOT.get_or_init(|| {
+        std::env::var("LEPTOS_SITE_ROOT").unwrap_or_else(|_| "target/site".to_string())
+    });
+    let index_path = std::path::Path::new(site_root).join("index.html");
 
     let mut html_content = match tokio::fs::read_to_string(&index_path).await {
         Ok(content) => content,
@@ -88,6 +91,8 @@ async fn serve_share_html(Path(key): Path<String>, headers: HeaderMap) -> Respon
 
             let title = html_escape(&title);
             let description = html_escape(&description);
+            let cover_image_url = html_escape(&cover_image_url);
+            let current_url = html_escape(&current_url);
 
             let meta_tags = format!(
                 r#"<meta name="description" content="{}" />
@@ -129,8 +134,11 @@ async fn serve_share_html(Path(key): Path<String>, headers: HeaderMap) -> Respon
 }
 
 async fn serve_index() -> Response {
-    let site_root = std::env::var("LEPTOS_SITE_ROOT").unwrap_or_else(|_| "target/site".to_string());
-    let index_path = std::path::Path::new(&site_root).join("index.html");
+    static SITE_ROOT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let site_root = SITE_ROOT.get_or_init(|| {
+        std::env::var("LEPTOS_SITE_ROOT").unwrap_or_else(|_| "target/site".to_string())
+    });
+    let index_path = std::path::Path::new(site_root).join("index.html");
 
     match tokio::fs::read_to_string(&index_path).await {
         Ok(content) => Html(content).into_response(),
