@@ -403,12 +403,19 @@ pub async fn download_all(
         axum::http::header::CONTENT_TYPE,
         "application/zip".parse().unwrap(),
     );
+    let ascii_filename: String = filename
+        .chars()
+        .map(|c| if c.is_ascii_graphic() || c == ' ' { c } else { '_' })
+        .collect();
     let encoded_filename = urlencoding::encode(&filename);
     headers.insert(
         axum::http::header::CONTENT_DISPOSITION,
-        format!("attachment; filename*=UTF-8''{}", encoded_filename)
-            .parse()
-            .unwrap(),
+        format!(
+            "attachment; filename=\"{}\"; filename*=UTF-8''{}",
+            ascii_filename, encoded_filename
+        )
+        .parse()
+        .unwrap(),
     );
 
     (headers, Body::from_stream(res.bytes_stream())).into_response()
