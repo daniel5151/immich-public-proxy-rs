@@ -23,7 +23,14 @@ impl ImmichClient {
             .clone();
 
         static CLIENT: std::sync::OnceLock<Client> = std::sync::OnceLock::new();
-        let http_client = CLIENT.get_or_init(Client::new).clone();
+        let http_client = CLIENT
+            .get_or_init(|| {
+                Client::builder()
+                    .connect_timeout(std::time::Duration::from_secs(10))
+                    .build()
+                    .expect("Failed to build HTTP client")
+            })
+            .clone();
 
         static ADMIN_API_KEY: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
         let admin_api_key = ADMIN_API_KEY
