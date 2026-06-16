@@ -219,6 +219,11 @@ function GalleryPage({ details }: GalleryPageProps) {
   const lgRef = useRef<LightGallery | null>(null);
   const galleryContainerRef = useRef<HTMLDivElement>(null);
   const observerRef = useRef<HTMLDivElement>(null);
+  // Remember which thumbnails have finished loading. The `loaded` class is
+  // applied imperatively in onLoad for the immediate paint, but className is
+  // React-controlled — so we must re-add it from here on every render, or a
+  // selection re-render would drop it and restart the shimmer over the image.
+  const loadedAssetsRef = useRef<Set<string>>(new Set());
 
   // Reset displayCount when filter changes. Skip the initial mount run so a
   // deep-linked slide (e.g. #lg=1&slide=61) keeps the larger displayCount the
@@ -710,7 +715,7 @@ function GalleryPage({ details }: GalleryPageProps) {
                   return (
                     <div
                       key={asset.id}
-                      className={`tile-wrapper ${isAssetSelected ? 'selected' : ''}`}
+                      className={`tile-wrapper ${isAssetSelected ? 'selected' : ''} ${loadedAssetsRef.current.has(asset.id) ? 'loaded' : ''}`}
                       style={{ flexBasis, flexGrow: aspect }}
                     >
                       <div
@@ -733,6 +738,11 @@ function GalleryPage({ details }: GalleryPageProps) {
                           loading="lazy"
                           src={`/share/photo/${realKey}/${asset.id}/thumbnail`}
                           alt=""
+                          onLoad={(e) => {
+                            loadedAssetsRef.current.add(asset.id);
+                            const wrapper = (e.target as HTMLElement).closest('.tile-wrapper');
+                            if (wrapper) wrapper.classList.add('loaded');
+                          }}
                         />
                         {asset.uploaderName && (
                           <div className={`uploader-badge ${asset.uploaderIsFallback ? 'using-owner-data' : ''}`}>

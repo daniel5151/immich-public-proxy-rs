@@ -302,6 +302,13 @@ body.selection-mode .date-selector,
     position: relative;
     height: 250px;
     overflow: hidden;
+    background: linear-gradient(90deg, #111 25%, #1a1a1a 50%, #111 75%);
+    background-size: 200% 100%;
+    animation: shimmer 1.5s ease-in-out infinite;
+}
+
+.gallery-date-items .tile-wrapper.loaded {
+    animation: none;
     background: #111;
 }
 
@@ -321,7 +328,12 @@ body.selection-mode .date-selector,
     height: 100%;
     width: 100%;
     object-fit: cover;
-    transition: transform 0.3s ease;
+    opacity: 0;
+    transition: opacity 0.3s ease, transform 0.3s ease;
+}
+
+.gallery-date-items .tile-wrapper.loaded img {
+    opacity: 1;
 }
 
 @media (hover: hover) {
@@ -487,6 +499,10 @@ body.selection-mode .tile-selector {
     to {
         transform: rotate(360deg);
     }
+}
+@keyframes shimmer {
+    0% { background-position: -200% 0; }
+    100% { background-position: 200% 0; }
 }
 
 /* Prevent last row flex items from stretching to full width */
