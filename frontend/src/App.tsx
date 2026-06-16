@@ -349,20 +349,20 @@ function GalleryPage({ details }: GalleryPageProps) {
       }
     });
 
+    const isMobile = window.matchMedia('(max-width: 640px)').matches;
+    const plugins = isMobile
+      ? [lgZoom, lgVideo, lgFullscreen, lgHash]
+      : [lgZoom, lgThumbnail, lgVideo, lgFullscreen, lgHash];
+
     const lgConfig = {
-      plugins: [
-        lgZoom,
-        lgThumbnail,
-        lgVideo,
-        lgFullscreen,
-        lgHash
-      ],
-      speed: 500,
+      plugins,
+      speed: 200,
       licenseKey: '8FFA6495-676C4D30-8BFC54B6-4D0A6CEC',
       selector: '.gallery-item',
       download: true,
-      counter: false,
+      counter: true,
       hideScrollbar: true,
+      swipeToClose: true,
       preload: 2,
       mobileSettings: { controls: false, showCloseIcon: true, download: true },
       dynamic: true,
