@@ -211,6 +211,7 @@ function GalleryPage({ details }: GalleryPageProps) {
   const [uploadProgress, setUploadProgress] = useState({ completed: 0, total: 0 });
   const [uploadStatus, setUploadStatus] = useState<{ type: 'success' | 'failed'; message?: string } | null>(null);
   const [isDragOver, setIsDragOver] = useState(false);
+  const [isDownloading, setIsDownloading] = useState(false);
   const dragCounterRef = useRef(0);
 
   // Upload name prompt modal (kept separate from settings for the upload flow)
@@ -512,6 +513,25 @@ function GalleryPage({ details }: GalleryPageProps) {
     return `/share/${realKey}/download?asset_ids=${encodeURIComponent(idsStr)}`;
   };
 
+  // Reset the download-all button once the download has actually kicked off or
+  // the user dismissed the browser's save dialog. We can't observe an <a>-driven
+  // download directly, so we reset on the next window focus (fires when a save
+  // dialog is confirmed/cancelled) with a short timeout fallback for browsers
+  // that download in the background without stealing focus.
+  const handleDownloadAll = () => {
+    setIsDownloading(true);
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      window.removeEventListener('focus', finish);
+      clearTimeout(fallback);
+      setIsDownloading(false);
+    };
+    const fallback = setTimeout(finish, 2000);
+    window.addEventListener('focus', finish);
+  };
+
   // Upload helpers
   const triggerFileInput = () => {
     const name = (localStorage.getItem('uploader_name') || '').trim();
@@ -788,9 +808,18 @@ function GalleryPage({ details }: GalleryPageProps) {
           )}
           {allowDownload && (
             <div id="download-all">
-              <a href={`/share/${realKey}/download`} title="Download all" className="header-btn">
-                <img src="/images/align-bottom-svgrepo-com.svg" alt="" className="header-icon" />
-                <span>Download all</span>
+              <a
+                href={`/share/${realKey}/download`}
+                title="Download all"
+                className={`header-btn ${isDownloading ? 'disabled' : ''}`}
+                onClick={handleDownloadAll}
+              >
+                {isDownloading ? (
+                  <span className="loader-small" />
+                ) : (
+                  <img src="/images/align-bottom-svgrepo-com.svg" alt="" className="header-icon" />
+                )}
+                <span>{isDownloading ? 'Preparing…' : 'Download all'}</span>
               </a>
             </div>
           )}
