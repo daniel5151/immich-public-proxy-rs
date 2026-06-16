@@ -224,6 +224,7 @@ function GalleryPage({ details }: GalleryPageProps) {
   // React-controlled — so we must re-add it from here on every render, or a
   // selection re-render would drop it and restart the shimmer over the image.
   const loadedAssetsRef = useRef<Set<string>>(new Set());
+  const lastSelectedIndexRef = useRef<number | null>(null);
 
   // Reset displayCount when filter changes. Skip the initial mount run so a
   // deep-linked slide (e.g. #lg=1&slide=61) keeps the larger displayCount the
@@ -412,16 +413,33 @@ function GalleryPage({ details }: GalleryPageProps) {
   }, [displayCount, filteredAssets, realKey]);
 
   // Toggles and selection behaviors
-  const onToggleAsset = (id: string) => {
+  const onToggleAsset = (id: string, index?: number, shiftKey?: boolean) => {
+    // Capture the anchor BEFORE we overwrite the ref at the end of this call.
+    // setSelectedAssets runs its updater asynchronously, so reading
+    // lastSelectedIndexRef inside it would see the just-written value and
+    // collapse the range to the single clicked tile.
+    const anchorIndex = lastSelectedIndexRef.current;
     setSelectedAssets((prev) => {
       const next = new Set(prev);
-      if (next.has(id)) {
+      // Shift-click range select
+      if (shiftKey && index != null && anchorIndex != null) {
+        const start = Math.min(anchorIndex, index);
+        const end = Math.max(anchorIndex, index);
+        for (let i = start; i <= end; i++) {
+          if (i < filteredAssets.length) {
+            next.add(filteredAssets[i].id);
+          }
+        }
+      } else if (next.has(id)) {
         next.delete(id);
       } else {
         next.add(id);
       }
       return next;
     });
+    if (index != null) {
+      lastSelectedIndexRef.current = index;
+    }
   };
 
   const getGroupSelectionStatus = (groupItems: { asset: SafeAsset }[]) => {
@@ -723,7 +741,7 @@ function GalleryPage({ details }: GalleryPageProps) {
                         onClick={(e) => {
                           e.stopPropagation();
                           e.preventDefault();
-                          onToggleAsset(asset.id);
+                          onToggleAsset(asset.id, globalIndex, e.shiftKey);
                         }}
                       >
                         <span className="check-icon"></span>
@@ -732,7 +750,14 @@ function GalleryPage({ details }: GalleryPageProps) {
                         className="gallery-item"
                         data-index={globalIndex}
                         href={`/share/photo/${realKey}/${asset.id}/preview`}
-                        onClick={(e) => e.preventDefault()} // Let lightGallery click handler take over
+                        onClick={(e) => {
+                          e.preventDefault();
+                          if (selectedAssets.size > 0) {
+                            e.stopPropagation();
+                            onToggleAsset(asset.id, globalIndex, e.shiftKey);
+                          }
+                          // Otherwise let lightGallery click handler take over
+                        }}
                       >
                         <img
                           loading="lazy"
