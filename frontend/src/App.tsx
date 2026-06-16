@@ -266,6 +266,14 @@ function GalleryPage({ details }: GalleryPageProps) {
     return () => document.body.classList.remove('selection-mode');
   }, [selectedAssets.size]);
 
+  // Auto-dismiss upload toast
+  useEffect(() => {
+    if (!uploadStatus || isUploading) return;
+    const delay = uploadStatus.type === 'failed' ? 8000 : 4000;
+    const timer = setTimeout(() => setUploadStatus(null), delay);
+    return () => clearTimeout(timer);
+  }, [uploadStatus, isUploading]);
+
   // Lazy load intersection observer — operates on filteredAssets
   useEffect(() => {
     const observerTarget = observerRef.current;
