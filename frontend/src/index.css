@@ -208,6 +208,20 @@ textarea {
     margin: 0;
 }
 
+.album-stats {
+    padding: 0 1rem;
+    font-size: 0.85rem;
+    color: rgba(255, 255, 255, 0.45);
+    font-weight: 400;
+    font-variant-numeric: tabular-nums;
+}
+
+@media (max-width: 640px) {
+    .album-stats {
+        text-align: center;
+    }
+}
+
 #lightgallery {
     padding: 0.5rem 1rem 1rem;
     display: block;

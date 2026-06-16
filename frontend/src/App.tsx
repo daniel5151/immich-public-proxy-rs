@@ -330,6 +330,16 @@ function GalleryPage({ details }: GalleryPageProps) {
     return groups;
   }, [filteredAssets]);
 
+  // Album stats
+  const albumStats = useMemo(() => {
+    const photos = filteredAssets.filter(a => a.type !== 'VIDEO').length;
+    const videos = filteredAssets.filter(a => a.type === 'VIDEO').length;
+    const parts: string[] = [];
+    if (photos > 0) parts.push(`${photos} photo${photos !== 1 ? 's' : ''}`);
+    if (videos > 0) parts.push(`${videos} video${videos !== 1 ? 's' : ''}`);
+    return parts.join(' · ');
+  }, [filteredAssets]);
+
   // lightGallery initialization / update — uses filteredAssets
   useEffect(() => {
     if (filteredAssets.length === 0) return;
@@ -789,6 +799,10 @@ function GalleryPage({ details }: GalleryPageProps) {
         <div id="album-description">
           <h2>{albumDescription}</h2>
         </div>
+      )}
+
+      {albumStats && (
+        <div className="album-stats">{albumStats}</div>
       )}
 
       {/* LightGallery Grid container */}
