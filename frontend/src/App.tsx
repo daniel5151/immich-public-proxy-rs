@@ -210,12 +210,15 @@ function GalleryPage({ details }: GalleryPageProps) {
   const [isUploading, setIsUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState({ completed: 0, total: 0 });
   const [uploadStatus, setUploadStatus] = useState<{ type: 'success' | 'failed'; message?: string } | null>(null);
+  const [isDragOver, setIsDragOver] = useState(false);
+  const dragCounterRef = useRef(0);
 
   // Upload name prompt modal (kept separate from settings for the upload flow)
   const [showNameModal, setShowNameModal] = useState(false);
   const [uploaderName, setUploaderName] = useState(() => localStorage.getItem('uploader_name') || '');
 
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const pendingDropFilesRef = useRef<File[] | null>(null);
   const lgRef = useRef<LightGallery | null>(null);
   const galleryContainerRef = useRef<HTMLDivElement>(null);
   const observerRef = useRef<HTMLDivElement>(null);
@@ -480,6 +483,7 @@ function GalleryPage({ details }: GalleryPageProps) {
   const handleCancelNameModal = () => {
     setShowNameModal(false);
     setUploaderName(localStorage.getItem('uploader_name') || '');
+    pendingDropFilesRef.current = null;
   };
 
   const onConfirmName = (e: React.FormEvent) => {
@@ -488,10 +492,18 @@ function GalleryPage({ details }: GalleryPageProps) {
     if (name) {
       localStorage.setItem('uploader_name', name);
       setShowNameModal(false);
-      // Small timeout to allow state to settle before file dialog
-      setTimeout(() => {
-        fileInputRef.current?.click();
-      }, 50);
+      // If the name modal was triggered by a drag-and-drop, upload those
+      // stashed files directly instead of popping the file picker.
+      const pending = pendingDropFilesRef.current;
+      if (pending && pending.length > 0) {
+        pendingDropFilesRef.current = null;
+        void uploadFiles(pending);
+      } else {
+        // Small timeout to allow state to settle before file dialog
+        setTimeout(() => {
+          fileInputRef.current?.click();
+        }, 50);
+      }
     }
   };
 
@@ -560,13 +572,8 @@ function GalleryPage({ details }: GalleryPageProps) {
     console.warn(`Status polling timed out for asset ${assetId}`);
   };
 
-  const onFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const filesList = e.target.files;
-    if (!filesList || filesList.length === 0) return;
-
-    const files = Array.from(filesList);
-    // Reset file input value so same selection triggers event next time
-    e.target.value = '';
+  const uploadFiles = async (files: File[]) => {
+    if (files.length === 0) return;
 
     const count = files.length;
     setIsUploading(true);
@@ -620,9 +627,85 @@ function GalleryPage({ details }: GalleryPageProps) {
     setIsUploading(false);
   };
 
+  const onFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const filesList = e.target.files;
+    if (!filesList || filesList.length === 0) return;
+    const files = Array.from(filesList);
+    // Reset file input value so same selection triggers event next time
+    e.target.value = '';
+    await uploadFiles(files);
+  };
+
+  // Drag-and-drop handlers
+  const onDragEnter = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (!allowUpload) return;
+    dragCounterRef.current++;
+    if (e.dataTransfer.types.includes('Files')) {
+      setIsDragOver(true);
+    }
+  };
+
+  const onDragLeave = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    dragCounterRef.current--;
+    if (dragCounterRef.current === 0) {
+      setIsDragOver(false);
+    }
+  };
+
+  const onDragOver = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+  };
+
+  const onDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragOver(false);
+    dragCounterRef.current = 0;
+    if (!allowUpload || isUploading) return;
+    const files = Array.from(e.dataTransfer.files);
+    if (files.length === 0) return;
+    const name = (localStorage.getItem('uploader_name') || '').trim();
+    if (!name) {
+      // No uploader name yet: stash the dropped files and prompt for a name.
+      // They'll be uploaded on confirm, so we don't lose this drop or pop the
+      // file picker.
+      pendingDropFilesRef.current = files;
+      setUploaderName('');
+      setShowNameModal(true);
+      return;
+    }
+    void uploadFiles(files);
+  };
+
   return (
-    <div id="gallery-root">
+    <div
+      id="gallery-root"
+      onDragEnter={onDragEnter}
+      onDragLeave={onDragLeave}
+      onDragOver={onDragOver}
+      onDrop={onDrop}
+    >
       <title>{title}</title>
+
+      {/* Drag-and-drop overlay */}
+      {isDragOver && (
+        <div className="drop-overlay">
+          <div className="drop-overlay-content">
+            <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+              <polyline points="17 8 12 3 7 8" />
+              <line x1="12" y1="3" x2="12" y2="15" />
+            </svg>
+            <span>Drop to upload</span>
+          </div>
+        </div>
+      )}
+
       {/* Selection floating bar */}
       <div id="selection-bar" className={selectedAssets.size > 0 ? 'active' : ''}>
         <button className="icon-btn" onClick={() => setSelectedAssets(new Set())}>
