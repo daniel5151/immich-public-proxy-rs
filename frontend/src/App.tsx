@@ -183,29 +183,42 @@ function GalleryPage({ details }: GalleryPageProps) {
   // --- End filter state ---
 
   const [displayCount, setDisplayCount] = useState<number>(() => {
-    // Check if there is a hash pointing to a slide index on load, and make sure it's valid
+    // Render enough items up-front to satisfy both a deep-linked lightbox slide
+    // (#lg=1&slide=N) and a restored scroll position (?at=N), taking whichever
+    // reaches further into the album. Both are validated; out-of-range values
+    // are ignored (and a bad slide hash is cleared so lightGallery can't crash).
     const defaultInitial = Math.min(40, assets.length);
+    let needed = defaultInitial;
     try {
-      const hash = window.location.hash;
-      if (hash) {
-        const params = new URLSearchParams(hash.substring(1));
-        const slideStr = params.get('slide');
-        if (slideStr) {
-          const slideIndex = parseInt(slideStr, 10);
-          if (!isNaN(slideIndex) && slideIndex >= 0) {
-            if (slideIndex < assets.length) {
-              return Math.min(Math.max(defaultInitial, slideIndex + 1), assets.length);
-            } else {
-              // The requested slide is out of bounds. Clear the hash to prevent lightGallery from crashing.
-              window.location.hash = '';
-            }
+      const params = new URLSearchParams(window.location.hash.substring(1));
+      const slideStr = params.get('slide');
+      if (slideStr) {
+        const slideIndex = parseInt(slideStr, 10);
+        if (!isNaN(slideIndex) && slideIndex >= 0) {
+          if (slideIndex < assets.length) {
+            needed = Math.max(needed, Math.min(slideIndex + 1, assets.length));
+          } else {
+            // The requested slide is out of bounds. Clear the hash to prevent lightGallery from crashing.
+            window.location.hash = '';
           }
         }
       }
     } catch {
       // Ignore parsing errors
     }
-    return defaultInitial;
+    try {
+      const atStr = new URLSearchParams(window.location.search).get('at');
+      if (atStr) {
+        const at = parseInt(atStr, 10);
+        if (!isNaN(at) && at > 0 && at < assets.length) {
+          // +12 so a little of the next row is rendered below the anchor.
+          needed = Math.max(needed, Math.min(at + 12, assets.length));
+        }
+      }
+    } catch {
+      // Ignore parsing errors
+    }
+    return Math.min(needed, assets.length);
   });
   const [isUploading, setIsUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState({ completed: 0, total: 0 });
@@ -548,6 +561,84 @@ function GalleryPage({ details }: GalleryPageProps) {
       window.scrollTo({ top, behavior: 'auto' });
     }
   }, [displayCount]);
+
+  // --- Persist scroll position in the URL (?at=<assetIndex>) -----------------
+  // We anchor on the global index of the topmost asset currently under the
+  // header rather than a pixel offset or scroll fraction, so the position stays
+  // correct across viewport resizes and column-count changes (phone <-> desktop)
+  // and composes cleanly with the lightbox deep link, which lives in the hash
+  // (?at=80#lg=1&slide=61). Lightbox open/slide/close all preserve the query
+  // string, so the two halves restore independently.
+
+  // Restore once on mount: the displayCount initializer already grew the render
+  // window to include ?at=, so we just need to scroll to that tile after it
+  // paints. Guarded so later displayCount growth (lazy load, scrubber) can't
+  // re-trigger a jump.
+  const didRestoreScrollRef = useRef(false);
+  useEffect(() => {
+    if (didRestoreScrollRef.current) return;
+    let targetIdx = NaN;
+    try {
+      const atStr = new URLSearchParams(window.location.search).get('at');
+      if (atStr) targetIdx = parseInt(atStr, 10);
+    } catch { /* ignore */ }
+    if (isNaN(targetIdx) || targetIdx <= 0 || targetIdx >= filteredAssets.length) {
+      didRestoreScrollRef.current = true; // nothing valid to restore
+      return;
+    }
+    const el = galleryContainerRef.current?.querySelector<HTMLElement>(
+      `.gallery-item[data-index="${targetIdx}"]`
+    );
+    if (el) {
+      didRestoreScrollRef.current = true;
+      const headerOffset = headerHeight + 10;
+      const top = el.getBoundingClientRect().top + window.scrollY - headerOffset;
+      window.scrollTo({ top, behavior: 'auto' });
+    }
+    // If not rendered yet, leave the guard unset so the next displayCount/render
+    // pass retries (the initializer should have grown the window already).
+  }, [displayCount, filteredAssets.length, headerHeight]);
+
+  // Write the current position to the URL, debounced so we don't spam history.
+  // Skipped until the initial restore has settled, so we never overwrite the
+  // incoming ?at= before it's applied.
+  useEffect(() => {
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const writePosition = () => {
+      if (!didRestoreScrollRef.current) return;
+      const container = galleryContainerRef.current;
+      if (!container) return;
+      const headerLine = headerHeight + 10;
+      // Topmost asset still (partly) below the header line.
+      let topIdx = 0;
+      const items = container.querySelectorAll<HTMLElement>('.gallery-item[data-index]');
+      for (const item of items) {
+        if (item.getBoundingClientRect().bottom > headerLine) {
+          topIdx = parseInt(item.getAttribute('data-index') || '0', 10) || 0;
+          break;
+        }
+      }
+      try {
+        const url = new URL(window.location.href);
+        if (topIdx > 0) {
+          url.searchParams.set('at', String(topIdx));
+        } else {
+          url.searchParams.delete('at'); // at the top -> clean URL
+        }
+        // Preserve any lightbox hash; only replace state (no new history entry).
+        history.replaceState(history.state, '', url.pathname + url.search + url.hash);
+      } catch { /* ignore */ }
+    };
+    const onScroll = () => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(writePosition, 200);
+    };
+    window.addEventListener('scroll', onScroll, { passive: true });
+    return () => {
+      window.removeEventListener('scroll', onScroll);
+      if (timer) clearTimeout(timer);
+    };
+  }, [headerHeight]);
 
   // Map a pointer Y (relative to the bar's usable area) to the date group whose
   // proportional band contains it, and scrub the page there.
