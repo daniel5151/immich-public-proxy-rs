@@ -92,7 +92,7 @@ export default function App() {
 
 function HomePage() {
   return (
-    <div className="container" style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', height: '100vh', background: '#262626', margin: 0 }}>
+    <div className="container" style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', height: '100dvh', background: '#262626', margin: 0 }}>
       <a href="https://github.com/alangrainger/immich-public-proxy">
         <img src="/images/ipp.svg" alt="Immich Public Proxy" style={{ maxWidth: '280px', height: '280px', opacity: 0.3 }} />
       </a>
@@ -106,7 +106,7 @@ interface PasswordPageProps {
 
 function PasswordPage({ shareKey }: PasswordPageProps) {
   return (
-    <main className="container" style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', height: '100vh', flexDirection: 'column' }}>
+    <main className="container" style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', height: '100dvh', flexDirection: 'column' }}>
       <div style={{ background: '#333', padding: '2rem', borderRadius: '8px', boxShadow: '0 4px 6px rgba(0,0,0,0.1)', textAlign: 'center' }}>
         <form id="unlock" method="post" action="/share/unlock" style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
           <input
