@@ -274,6 +274,31 @@ function GalleryPage({ details }: GalleryPageProps) {
     return () => clearTimeout(timer);
   }, [uploadStatus, isUploading]);
 
+  // Keyboard navigation
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      // Don't intercept when typing in inputs
+      const tag = (e.target as HTMLElement).tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+
+      // Escape: clear selection
+      if (e.key === 'Escape' && selectedAssets.size > 0) {
+        e.preventDefault();
+        setSelectedAssets(new Set());
+      }
+
+      // Ctrl/Cmd+A: select all visible
+      if ((e.ctrlKey || e.metaKey) && e.key === 'a') {
+        e.preventDefault();
+        const visibleIds = filteredAssets.slice(0, displayCount).map(a => a.id);
+        setSelectedAssets(new Set(visibleIds));
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [selectedAssets.size, filteredAssets, displayCount]);
+
   // Lazy load intersection observer — operates on filteredAssets
   useEffect(() => {
     const observerTarget = observerRef.current;
