@@ -247,6 +247,8 @@ function GalleryPage({ details }: GalleryPageProps) {
   // selection re-render would drop it and restart the shimmer over the image.
   const loadedAssetsRef = useRef<Set<string>>(new Set());
   const lastSelectedIndexRef = useRef<number | null>(null);
+  const headerRef = useRef<HTMLDivElement | null>(null);
+  const [headerHeight, setHeaderHeight] = useState(96);
 
   // Reset displayCount when filter changes. Skip the initial mount run so a
   // deep-linked slide (e.g. #lg=1&slide=61) keeps the larger displayCount the
@@ -361,17 +363,26 @@ function GalleryPage({ details }: GalleryPageProps) {
     return parts.join(' · ');
   }, [filteredAssets]);
 
-  // Measure available scrubber geometry (anchored under the header, running to
-  // the bottom edge) and track resize.
+  // Measure the real header height (it wraps to two rows on mobile, and its box
+  // includes the safe-area inset padding) and publish it as a CSS variable so
+  // every layout offset — gallery padding, sticky date headers, scrubber — is
+  // driven off one source of truth instead of hard-coded magic numbers.
   useEffect(() => {
     const measure = () => {
-      const headerOffset = window.innerWidth <= 640 ? 110 : 96;
-      setScrubberTop(headerOffset);
-      setScrubberHeight(Math.max(0, window.innerHeight - headerOffset - 8));
+      const h = headerRef.current?.offsetHeight ?? 96;
+      setHeaderHeight(h);
+      document.documentElement.style.setProperty('--header-h', `${h}px`);
+      setScrubberTop(h);
+      setScrubberHeight(Math.max(0, window.innerHeight - h - 8));
     };
     measure();
     window.addEventListener('resize', measure);
-    return () => window.removeEventListener('resize', measure);
+    const ro = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(measure) : null;
+    if (ro && headerRef.current) ro.observe(headerRef.current);
+    return () => {
+      window.removeEventListener('resize', measure);
+      ro?.disconnect();
+    };
   }, []);
 
   const SCRUBBER_PAD = 6; // top & bottom breathing room inside the bar
@@ -423,7 +434,7 @@ function GalleryPage({ details }: GalleryPageProps) {
   // Track active date group via scroll position
   useEffect(() => {
     if (groups.length === 0) return;
-    const headerOffset = window.innerWidth <= 640 ? 120 : 100;
+    const headerOffset = headerHeight + 10;
 
     const onScroll = () => {
       const headerLine = headerOffset + 20;
@@ -492,7 +503,7 @@ function GalleryPage({ details }: GalleryPageProps) {
     window.addEventListener('scroll', onScroll, { passive: true });
     onScroll(); // set initial
     return () => window.removeEventListener('scroll', onScroll);
-  }, [groups, scrubberSegments, scrubberHeight]);
+  }, [groups, headerHeight, scrubberSegments, scrubberHeight]);
 
   // Pixel position of the active date along the bar (for the indicator line).
   const activeIndicatorY = useMemo(() => {
@@ -511,7 +522,7 @@ function GalleryPage({ details }: GalleryPageProps) {
     if (idx < 0) return;
     const group = groups[idx];
     const startIndex = group.items[0].globalIndex;
-    const headerOffset = window.innerWidth <= 640 ? 120 : 100;
+    const headerOffset = headerHeight + 10;
     const el = dateGroupRefs.current.get(label);
     if (el) {
       const top = el.getBoundingClientRect().top + window.scrollY - headerOffset;
@@ -532,7 +543,7 @@ function GalleryPage({ details }: GalleryPageProps) {
     const el = dateGroupRefs.current.get(label);
     if (el) {
       pendingScrollRef.current = null;
-      const headerOffset = window.innerWidth <= 640 ? 120 : 100;
+      const headerOffset = headerHeight + 10;
       const top = el.getBoundingClientRect().top + window.scrollY - headerOffset;
       window.scrollTo({ top, behavior: 'auto' });
     }
@@ -1027,7 +1038,7 @@ function GalleryPage({ details }: GalleryPageProps) {
       </div>
 
       {/* Main Header */}
-      <div id="header">
+      <div id="header" ref={headerRef}>
         <h1>{title}</h1>
         <div className="header-actions">
           {allowUpload && (

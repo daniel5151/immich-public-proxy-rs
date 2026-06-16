@@ -56,7 +56,9 @@ textarea {
 }
 
 #gallery-root {
-    padding-top: calc(var(--header-height) + env(safe-area-inset-top, 0px));
+    /* --header-h is measured from the real header at runtime (it includes its
+       own safe-area padding); fall back to the desktop header height. */
+    padding-top: var(--header-h, calc(var(--header-height) + env(safe-area-inset-top, 0px)));
     padding-left: env(safe-area-inset-left, 0px);
     padding-right: env(safe-area-inset-right, 0px);
 }
@@ -103,10 +105,6 @@ textarea {
 }
 
 @media (max-width: 640px) {
-    #gallery-root {
-        padding-top: calc(100px + env(safe-area-inset-top, 0px));
-    }
-
     #header h1 {
         flex: 1 1 100%;
         height: auto;
@@ -239,15 +237,13 @@ textarea {
     padding: 1rem 0 0.5rem 4px;
     gap: 12px;
     position: sticky;
-    top: calc(var(--header-height) + env(safe-area-inset-top, 0px));
+    /* Pin so the header's own top padding tucks up behind the fixed bar
+       (which sits above it in stacking order), landing the date text flush
+       against the bar instead of leaving a black padding strip below it.
+       1rem matches the padding-top below. */
+    top: calc(var(--header-h, calc(var(--header-height) + env(safe-area-inset-top, 0px))) - 1rem);
     z-index: 50;
     background: var(--bg-color);
-}
-
-@media (max-width: 640px) {
-    .gallery-date-header {
-        top: calc(100px + env(safe-area-inset-top, 0px));
-    }
 }
 
 .date-selector {
