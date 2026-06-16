@@ -24,7 +24,8 @@ Share photos and albums from [Immich](https://github.com/immich-app/immich) with
     - Lazy loading of grid tiles using `IntersectionObserver` for performance in large albums.
     - Responsive layout for desktop and mobile browsers.
     - Render Uploader Attribution Badges (pulled from `SharedBy/{name}` tags).
-- **SEO/Metadata**: Server-side rendering (SSR) provides OpenGraph meta tags for link previews.
+    - **Filter by Uploader**: When an album has multiple uploaders, a settings gear appears with a checkbox filter to show/hide photos by uploader. Includes photo counts per uploader, Select All / Clear All, and a visual indicator on the gear when filtering is active.
+- **SEO/Metadata**: Server-side rendering (SSR) provides OpenGraph meta tags for link previews. Meta tag values are HTML-escaped and URL-encoded to prevent stored XSS.
 
 ---
 
@@ -39,6 +40,7 @@ This project implements the core functionality of the original Node.js proxy wit
 | **Server-Side Rendering** | Rust Axum backend injects SEO/OpenGraph previews dynamically, then mounts a decoupled React SPA. |
 | **Bulk Selection**        | Native UI for selecting and downloading a subset of assets as a ZIP.                             |
 | **Lazy Loading**          | Explicit `IntersectionObserver` implementation for large grids.                                  |
+| **Filter by Uploader**    | Settings panel to filter gallery view by uploader name in multi-contributor albums.              |
 | **Single Binary**         | Compiles to a single binary for easier deployment outside of Docker.                             |
 
 ### Upstream Features Not Currently Implemented
@@ -98,10 +100,10 @@ Depending on the features you enable, your API keys require specific permissions
 
 Used to fetch share details, check passwords, and display uploader attribution badges.
 
-| Feature                         | Required Permissions     | Notes                                                                                                             |
-| :------------------------------ | :----------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| **Password Protected Shares**   | `sharedLink.read`        | Used to query if a password is required for a share.                                                              |
-| **Link Not Found Resolution**   | `sharedLink.read`        | Distinguishes invalid keys from password-protected keys, avoiding infinite password prompt loops.                 |
+| Feature                         | Required Permissions     | Notes                                                                                                              |
+| :------------------------------ | :----------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| **Password Protected Shares**   | `sharedLink.read`        | Used to query if a password is required for a share.                                                               |
+| **Link Not Found Resolution**   | `sharedLink.read`        | Distinguishes invalid keys from password-protected keys, avoiding infinite password prompt loops.                  |
 | **Uploader Attribution Badges** | `tag.read`, `asset.read` | Relies on photos having tags with format `SharedBy/{name}`.                                                        |
 | **Efficient User Resolution**   | `user.read`              | Recommended; allows fetching all users at once to resolve owner fallback names, avoiding slow sequential requests. |
 
@@ -109,11 +111,11 @@ Used to fetch share details, check passwords, and display uploader attribution b
 
 Required to support uploading to shared albums.
 
-| Feature                        | Required Permissions            | Notes                                                                                            |
-| :----------------------------- | :------------------------------ | :----------------------------------------------------------------------------------------------- |
-| **Asset Upload**               | `asset.create`                  | Required to upload photos and videos to Immich.                                                  |
-| **Uploader Tagging**           | `tag.create`, `tag.read`        | Required to create and apply `SharedBy/{name}` tags.                                             |
-| **Album Association**          | `album.write` or `album.update` | Required to add the uploaded asset to the shared album.                                          |
+| Feature                        | Required Permissions            | Notes                                                                                                 |
+| :----------------------------- | :------------------------------ | :---------------------------------------------------------------------------------------------------- |
+| **Asset Upload**               | `asset.create`                  | Required to upload photos and videos to Immich.                                                       |
+| **Uploader Tagging**           | `tag.create`, `tag.read`        | Required to create and apply `SharedBy/{name}` tags.                                                  |
+| **Album Association**          | `album.write` or `album.update` | Required to add the uploaded asset to the shared album.                                               |
 | **Restore Trashed Duplicates** | `asset.delete`                  | Required if you want the proxy to automatically restore duplicate uploads that were manually trashed. |
 
 ### Systemd Service Example

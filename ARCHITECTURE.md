@@ -117,7 +117,12 @@ sequenceDiagram
     Axum-->>User: Return 200 OK / Success
 ```
 
-### C. ZIP Downloads
+### C. Filter by Uploader (Frontend)
+When an album has assets from multiple uploaders (i.e., ≥2 distinct `uploaderName` values), the frontend displays a settings gear button with a unified Settings modal. The modal contains a checkbox filter list showing each uploader's name and photo count (alphabetically sorted). Filtering is applied via `useMemo` before date-grouping and lightGallery index construction, so the lightbox, lazy loading, and grid all operate on the filtered set. Asset selection is independent of the filter — selected assets remain selected even when hidden by the filter. The filter state is ephemeral (not persisted to `localStorage`).
+
+The Settings modal also houses the existing "Uploader Name" input when uploads are enabled, unifying both settings into one panel.
+
+### D. ZIP Downloads
 Downloads can be requested for the entire share or a custom selection of checkboxes. The backend handles this by streaming each asset from Immich on-the-fly and wrapping it into a compressed ZIP stream in real-time, avoiding large temporary disk usage.
 
 ---
@@ -149,6 +154,7 @@ pub struct SafeAsset {
     pub id: String,
     pub original_file_name: Option<String>,
     pub r#type: String, // "IMAGE" or "VIDEO"
+    pub original_mime_type: Option<String>,
     pub file_created_at: Option<String>,
     pub width: Option<i32>,
     pub height: Option<i32>,
@@ -171,6 +177,7 @@ export type SafeAsset = {
   id: string;
   originalFileName: string | null;
   type: string;
+  originalMimeType: string | null;
   fileCreatedAt: string | null;
   width: number | null;
   height: number | null;
@@ -192,7 +199,27 @@ function AssetTile({ asset }: { asset: SafeAsset }) {
 
 ---
 
-## 5. Development & Builds
+## 5. Security & Performance Hardening
+
+### HTML Escaping
+All dynamic values injected into SSR meta tags (`og:title`, `og:description`, `og:image`, `og:url`, and their Twitter equivalents) are HTML-entity-escaped via a dedicated `html_escape()` function in `main.rs`. This prevents stored XSS from malicious album names or descriptions.
+
+### Cookie Security
+The `Secure` flag on password session cookies (`immich_pwd_*`) is conditional: it is set only when the incoming `X-Forwarded-Proto` header is `https`. This allows password-protected shares to work on plain HTTP deployments (common in LAN/Docker setups without TLS termination).
+
+### MIME Passthrough
+`SafeAsset` carries `original_mime_type` from Immich's upstream API. The frontend uses this for `<video>` elements instead of hardcoding a MIME type, ensuring correct playback for formats like `video/quicktime` (`.mov`).
+
+### Content-Disposition
+Download responses include both an ASCII fallback `filename="..."` and a UTF-8 `filename*=UTF-8''...` parameter, ensuring filenames with non-ASCII characters display correctly across all browsers.
+
+### OnceLock Caching
+Environment variables (`PUBLIC_BASE_URL`, `LEPTOS_SITE_ROOT`, `IMMICH_API_KEY_UPLOAD_USER`) and the shared `reqwest::Client` (with a 10-second connect timeout) are initialized once via `std::sync::OnceLock` and reused across requests.
+
+### Bulk Tag Cache
+The `get_or_create_tag` function in `proxy.rs` populates the tag cache with all tags from a single `/tags` API call, rather than scanning the full list per lookup. This reduces upload latency for albums with many tags/uploaders.
+
+## 6. Development & Builds
 
 ### Running Locally
 To run the proxy in development mode:
