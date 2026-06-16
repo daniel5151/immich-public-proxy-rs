@@ -549,6 +549,97 @@ body.selection-mode .tile-selector {
     100% { background-position: 200% 0; }
 }
 
+/* Date Scrubber — proportional, full-height (immich-style) */
+.date-scrubber {
+    position: fixed;
+    right: 0;
+    /* top + height set inline (anchored under header, runs to bottom edge) */
+    width: 56px;
+    z-index: 90;
+    box-sizing: border-box;
+    cursor: row-resize;
+    touch-action: none;
+    opacity: 0;
+    transition: opacity 0.25s ease;
+}
+
+/* Reveal on hover, while scrubbing, or on touch devices */
+#lightgallery:hover ~ .date-scrubber,
+.date-scrubber:hover,
+.date-scrubber.scrubbing {
+    opacity: 1;
+}
+
+@media (hover: none) {
+    .date-scrubber { opacity: 1; width: 28px; }
+}
+
+.scrubber-segment {
+    position: relative;
+    width: 100%;
+    min-height: 0;
+}
+
+/* Dots sit at the bottom edge of their segment, right-aligned */
+.scrubber-dot {
+    position: absolute;
+    right: 10px;
+    bottom: 0;
+    width: 4px;
+    height: 4px;
+    border-radius: 50%;
+    background: var(--hatch-widget-muted, rgba(255, 255, 255, 0.35));
+    transform: translateY(50%);
+}
+
+.scrubber-year {
+    position: absolute;
+    right: 20px;
+    bottom: -7px;
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+    color: var(--hatch-widget-muted, rgba(255, 255, 255, 0.6));
+    white-space: nowrap;
+    pointer-events: none;
+}
+
+/* Current scroll position indicator */
+.scrubber-indicator {
+    position: absolute;
+    right: 0;
+    width: 40px;
+    height: 2px;
+    background: var(--accent-color, #3b82f6);
+    pointer-events: none;
+    transition: top 0.05s linear;
+}
+
+/* Floating date bubble while dragging */
+.scrubber-bubble {
+    position: absolute;
+    right: 56px;
+    transform: translateY(-50%);
+    max-width: 240px;
+    font-size: 0.8rem;
+    font-weight: 600;
+    color: #fff;
+    background: rgba(0, 0, 0, 0.82);
+    -webkit-backdrop-filter: blur(8px);
+    backdrop-filter: blur(8px);
+    padding: 5px 12px;
+    border-radius: 6px 0 0 6px;
+    border-right: 2px solid var(--accent-color, #3b82f6);
+    white-space: nowrap;
+    pointer-events: none;
+    box-shadow: 0 2px 12px rgba(0, 0, 0, 0.35);
+}
+
+@media (max-width: 640px) {
+    .scrubber-year { font-size: 10px; right: 14px; }
+    .scrubber-dot { right: 8px; }
+    .scrubber-bubble { right: 28px; }
+}
+
 /* Prevent last row flex items from stretching to full width */
 .gallery-date-items::after {
     content: '';

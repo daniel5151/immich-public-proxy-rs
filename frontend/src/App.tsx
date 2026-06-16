@@ -222,6 +222,24 @@ function GalleryPage({ details }: GalleryPageProps) {
   const pendingDropFilesRef = useRef<File[] | null>(null);
   const lgRef = useRef<LightGallery | null>(null);
   const galleryContainerRef = useRef<HTMLDivElement>(null);
+  const dateGroupRefs = useRef<Map<string, HTMLDivElement>>(new Map());
+  const scrubberRef = useRef<HTMLDivElement | null>(null);
+  const pendingScrollRef = useRef<string | null>(null);
+  const scrubRafRef = useRef<number | null>(null);
+  const [scrubberHeight, setScrubberHeight] = useState(0);
+  const [scrubberTop, setScrubberTop] = useState(96);
+  const [isScrubbing, setIsScrubbing] = useState(false);
+  const [scrubLabel, setScrubLabel] = useState('');
+  const [scrubY, setScrubY] = useState(0);
+  const [activeDateLabel, setActiveDateLabel] = useState<string>('');
+  // 0..1 position of the indicator over the *whole* usable bar, derived from
+  // real scroll position so it glides continuously instead of snapping between
+  // band tops. Stored as a fraction so it stays correct across bar resizes.
+  const [indicatorFrac, setIndicatorFrac] = useState(0);
+  // While in the bottom "tail" (where the page bottoms out before any further
+  // group can become active), anchor the sweep so it eases to the bar bottom
+  // without jumping at handoff.
+  const tailAnchorRef = useRef<{ startFrac: number; startScroll: number } | null>(null);
   const observerRef = useRef<HTMLDivElement>(null);
   // Remember which thumbnails have finished loading. The `loaded` class is
   // applied imperatively in onLoad for the immediate paint, but className is
@@ -300,29 +318,6 @@ function GalleryPage({ details }: GalleryPageProps) {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [selectedAssets.size, filteredAssets, displayCount]);
 
-  // Lazy load intersection observer — operates on filteredAssets
-  useEffect(() => {
-    const observerTarget = observerRef.current;
-    if (!observerTarget) return;
-
-    const observer = new IntersectionObserver((entries) => {
-      const entry = entries[0];
-      if (entry.isIntersecting && !isUploading) {
-        setDisplayCount((current) => {
-          if (current < filteredAssets.length) {
-            return Math.min(current + 12, filteredAssets.length);
-          }
-          return current;
-        });
-      }
-    }, {
-      rootMargin: '200px 0px 200px 0px'
-    });
-
-    observer.observe(observerTarget);
-    return () => observer.disconnect();
-  }, [filteredAssets.length, isUploading]);
-
   // Group filteredAssets by date
   const groups = useMemo(() => {
     const groups: DateGroup[] = [];
@@ -365,6 +360,255 @@ function GalleryPage({ details }: GalleryPageProps) {
     if (videos > 0) parts.push(`${videos} video${videos !== 1 ? 's' : ''}`);
     return parts.join(' · ');
   }, [filteredAssets]);
+
+  // Measure available scrubber geometry (anchored under the header, running to
+  // the bottom edge) and track resize.
+  useEffect(() => {
+    const measure = () => {
+      const headerOffset = window.innerWidth <= 640 ? 110 : 96;
+      setScrubberTop(headerOffset);
+      setScrubberHeight(Math.max(0, window.innerHeight - headerOffset - 8));
+    };
+    measure();
+    window.addEventListener('resize', measure);
+    return () => window.removeEventListener('resize', measure);
+  }, []);
+
+  const SCRUBBER_PAD = 6; // top & bottom breathing room inside the bar
+
+  // Proportional segments (immich-style): each date group gets a pixel height
+  // proportional to its asset share, so the whole album maps onto the bar and
+  // the first/last dates are always pinned to the very top/bottom. Dots and
+  // labels are decimated by pixel distance so they never crowd or overflow.
+  const scrubberSegments = useMemo(() => {
+    const totalAssets = filteredAssets.length;
+    const usable = scrubberHeight - SCRUBBER_PAD * 2;
+    if (groups.length === 0 || totalAssets === 0 || usable <= 0) {
+      return [] as {
+        label: string; shortLabel: string; year: string; height: number; top: number;
+        hasDot: boolean; hasLabel: boolean;
+      }[];
+    }
+    const MIN_DOT_DISTANCE = 8;
+    const MIN_LABEL_DISTANCE = 28;
+    const out: {
+      label: string; shortLabel: string; year: string; height: number; top: number;
+      hasDot: boolean; hasLabel: boolean;
+    }[] = [];
+    let top = 0;
+    let sinceDot = MIN_DOT_DISTANCE;
+    let sinceLabel = MIN_LABEL_DISTANCE;
+    let prevYear: string | null = null;
+    groups.forEach((group, i) => {
+      const h = (group.items.length / totalAssets) * usable;
+      const parts = group.label.split(', ');
+      const shortLabel = parts.length >= 2 ? parts[1] : group.label;
+      const year = parts.length >= 3 ? parts[2] : (parts.at(-1) ?? '');
+      let hasDot = false;
+      let hasLabel = false;
+      if (i === 0) {
+        hasDot = true; hasLabel = true; sinceDot = 0; sinceLabel = 0; prevYear = year;
+      } else {
+        if (sinceDot >= MIN_DOT_DISTANCE) { hasDot = true; sinceDot = 0; }
+        if (year !== prevYear && sinceLabel >= MIN_LABEL_DISTANCE) {
+          hasLabel = true; sinceLabel = 0; prevYear = year;
+        }
+      }
+      out.push({ label: group.label, shortLabel, year, height: h, top, hasDot, hasLabel });
+      top += h; sinceDot += h; sinceLabel += h;
+    });
+    return out;
+  }, [groups, filteredAssets.length, scrubberHeight]);
+
+  // Track active date group via scroll position
+  useEffect(() => {
+    if (groups.length === 0) return;
+    const headerOffset = window.innerWidth <= 640 ? 120 : 100;
+
+    const onScroll = () => {
+      const headerLine = headerOffset + 20;
+      const usable = scrubberHeight - SCRUBBER_PAD * 2;
+      if (usable <= 0 || scrubberSegments.length === 0) return;
+
+      // Active group = the last one whose top has scrolled up past the header
+      // line. The trailing groups in the final viewport never reach it (the
+      // page bottoms out first), which is exactly why we need the tail handling
+      // below to still carry the indicator to the bottom.
+      let activeIdx = 0;
+      for (let i = 0; i < groups.length; i++) {
+        const el = dateGroupRefs.current.get(groups[i].label);
+        if (el && el.getBoundingClientRect().top <= headerLine) activeIdx = i;
+      }
+      setActiveDateLabel(groups[activeIdx]?.label ?? '');
+
+      const seg = scrubberSegments[activeIdx];
+      const activeEl = dateGroupRefs.current.get(groups[activeIdx].label);
+      const thisTop = activeEl ? activeEl.getBoundingClientRect().top : headerLine;
+      const passed = Math.max(0, headerLine - thisTop);
+
+      const maxScroll = document.documentElement.scrollHeight - window.innerHeight;
+      const scrollRemaining = Math.max(0, maxScroll - window.scrollY);
+
+      // Distance the page must still scroll for the *next* group to reach the
+      // header line. Infinite for the last group (there is no next).
+      let needed = Infinity;
+      if (activeIdx < groups.length - 1) {
+        const nextEl = dateGroupRefs.current.get(groups[activeIdx + 1].label);
+        if (nextEl) needed = Math.max(0, nextEl.getBoundingClientRect().top - headerLine);
+      }
+
+      // Position within the active band. For a group that still has a reachable
+      // successor we interpolate by how far we've scrolled through it; for the
+      // last group we anchor at the band top (0) and let the tail sweep below
+      // carry it down.
+      const inBand = activeIdx < groups.length - 1 && isFinite(needed)
+        ? passed / (passed + needed)
+        : 0;
+      const bandFrac = (seg.top + Math.min(1, Math.max(0, inBand)) * seg.height) / usable;
+
+      // Tail: the page will bottom out before the next group can activate, so
+      // the active-group walk can't reach the end on its own.
+      const isTail = activeIdx >= groups.length - 1 || scrollRemaining <= needed;
+
+      if (!isTail) {
+        tailAnchorRef.current = null;
+        setIndicatorFrac(Math.min(1, Math.max(0, bandFrac)));
+        return;
+      }
+
+      // Anchor the tail at the band position where we entered it (so there's no
+      // jump), then sweep continuously to the very bottom of the bar as the
+      // remaining page scroll is consumed.
+      if (!tailAnchorRef.current) {
+        tailAnchorRef.current = { startFrac: bandFrac, startScroll: window.scrollY };
+      }
+      const anchor = tailAnchorRef.current;
+      const span = Math.max(1, maxScroll - anchor.startScroll);
+      const sweep = Math.min(1, Math.max(0, (window.scrollY - anchor.startScroll) / span));
+      const frac = anchor.startFrac + (1 - anchor.startFrac) * sweep;
+      setIndicatorFrac(Math.min(1, Math.max(0, frac)));
+    };
+
+    window.addEventListener('scroll', onScroll, { passive: true });
+    onScroll(); // set initial
+    return () => window.removeEventListener('scroll', onScroll);
+  }, [groups, scrubberSegments, scrubberHeight]);
+
+  // Pixel position of the active date along the bar (for the indicator line).
+  const activeIndicatorY = useMemo(() => {
+    const usable = scrubberHeight - SCRUBBER_PAD * 2;
+    if (usable <= 0) return 0;
+    // indicatorFrac is a continuous 0..1 position over the whole usable bar,
+    // computed from real scroll position (with an anchored sweep through the
+    // bottom tail), so the line glides and always reaches the very bottom.
+    return SCRUBBER_PAD + indicatorFrac * usable;
+  }, [scrubberHeight, indicatorFrac]);
+
+  // Scroll the page to a given date group, expanding the lazy-load window first
+  // if that group hasn't been rendered yet (so far-away jumps actually work).
+  const scrollToGroup = (label: string) => {
+    const idx = groups.findIndex((g) => g.label === label);
+    if (idx < 0) return;
+    const group = groups[idx];
+    const startIndex = group.items[0].globalIndex;
+    const headerOffset = window.innerWidth <= 640 ? 120 : 100;
+    const el = dateGroupRefs.current.get(label);
+    if (el) {
+      const top = el.getBoundingClientRect().top + window.scrollY - headerOffset;
+      window.scrollTo({ top, behavior: isScrubbing ? 'auto' : 'smooth' });
+      return;
+    }
+    // Not rendered yet — grow displayCount to include it, then scroll next frame.
+    if (displayCount <= startIndex) {
+      setDisplayCount(Math.min(startIndex + 24, filteredAssets.length));
+      pendingScrollRef.current = label;
+    }
+  };
+
+  // Once a pending (far-jump) group has been rendered, scroll to it.
+  useEffect(() => {
+    const label = pendingScrollRef.current;
+    if (!label) return;
+    const el = dateGroupRefs.current.get(label);
+    if (el) {
+      pendingScrollRef.current = null;
+      const headerOffset = window.innerWidth <= 640 ? 120 : 100;
+      const top = el.getBoundingClientRect().top + window.scrollY - headerOffset;
+      window.scrollTo({ top, behavior: 'auto' });
+    }
+  }, [displayCount]);
+
+  // Map a pointer Y (relative to the bar's usable area) to the date group whose
+  // proportional band contains it, and scrub the page there.
+  const scrubToClientY = (clientY: number) => {
+    const bar = scrubberRef.current;
+    if (!bar || scrubberSegments.length === 0) return;
+    const rect = bar.getBoundingClientRect();
+    const usable = scrubberHeight - SCRUBBER_PAD * 2;
+    const y = Math.max(0, Math.min(usable, clientY - rect.top - SCRUBBER_PAD));
+    let target = scrubberSegments[0];
+    for (const seg of scrubberSegments) {
+      if (y >= seg.top && y < seg.top + seg.height) { target = seg; break; }
+      if (y >= seg.top) target = seg;
+    }
+    setScrubY(SCRUBBER_PAD + y);
+    setScrubLabel(target.label);
+    scrollToGroup(target.label);
+  };
+
+  // While dragging the scrubber, track pointer globally (mouse + touch).
+  useEffect(() => {
+    if (!isScrubbing) return;
+    const onMove = (clientY: number) => {
+      if (scrubRafRef.current !== null) return;
+      scrubRafRef.current = requestAnimationFrame(() => {
+        scrubRafRef.current = null;
+        scrubToClientY(clientY);
+      });
+    };
+    const onMouseMove = (e: MouseEvent) => { e.preventDefault(); onMove(e.clientY); };
+    const onTouchMove = (e: TouchEvent) => {
+      if (e.touches.length > 0) onMove(e.touches[0].clientY);
+    };
+    const stop = () => setIsScrubbing(false);
+    window.addEventListener('mousemove', onMouseMove);
+    window.addEventListener('mouseup', stop);
+    window.addEventListener('touchmove', onTouchMove, { passive: true });
+    window.addEventListener('touchend', stop);
+    return () => {
+      window.removeEventListener('mousemove', onMouseMove);
+      window.removeEventListener('mouseup', stop);
+      window.removeEventListener('touchmove', onTouchMove);
+      window.removeEventListener('touchend', stop);
+      if (scrubRafRef.current !== null) {
+        cancelAnimationFrame(scrubRafRef.current);
+        scrubRafRef.current = null;
+      }
+    };
+  }, [isScrubbing, scrubberSegments, scrubberHeight]);
+
+  // Lazy load intersection observer — operates on filteredAssets
+  useEffect(() => {
+    const observerTarget = observerRef.current;
+    if (!observerTarget) return;
+
+    const observer = new IntersectionObserver((entries) => {
+      const entry = entries[0];
+      if (entry.isIntersecting && !isUploading) {
+        setDisplayCount((current) => {
+          if (current < filteredAssets.length) {
+            return Math.min(current + 12, filteredAssets.length);
+          }
+          return current;
+        });
+      }
+    }, {
+      rootMargin: '200px 0px 200px 0px'
+    });
+
+    observer.observe(observerTarget);
+    return () => observer.disconnect();
+  }, [filteredAssets.length, isUploading]);
 
   // lightGallery initialization / update — uses filteredAssets
   useEffect(() => {
@@ -869,7 +1113,13 @@ function GalleryPage({ details }: GalleryPageProps) {
           const visibleGroupItems = group.items.filter((item) => item.globalIndex < displayCount);
 
           return (
-            <div key={group.label} className="gallery-date-group">
+            <div
+              key={group.label}
+              className="gallery-date-group"
+              ref={(el) => {
+                if (el) dateGroupRefs.current.set(group.label, el);
+              }}
+            >
               <div className="gallery-date-header">
                 <span className="date-label">{group.label}</span>
                 <div
@@ -943,6 +1193,45 @@ function GalleryPage({ details }: GalleryPageProps) {
           );
         })}
       </div>
+
+      {/* Date scrubber — proportional, full-height (immich-style) */}
+      {groups.length > 1 && scrubberHeight > 0 && (
+        <div
+          ref={scrubberRef}
+          className={`date-scrubber ${isScrubbing ? 'scrubbing' : ''}`}
+          style={{ top: `${scrubberTop}px`, height: `${scrubberHeight}px`, paddingTop: SCRUBBER_PAD, paddingBottom: SCRUBBER_PAD }}
+          onMouseDown={(e) => { e.preventDefault(); setIsScrubbing(true); scrubToClientY(e.clientY); }}
+          onTouchStart={(e) => {
+            if (e.touches.length > 0) { setIsScrubbing(true); scrubToClientY(e.touches[0].clientY); }
+          }}
+        >
+          {/* Floating date label that follows the cursor while scrubbing */}
+          {isScrubbing && scrubLabel && (
+            <div className="scrubber-bubble" style={{ top: `${scrubY}px` }}>
+              {scrubLabel}
+            </div>
+          )}
+
+          {/* Active scroll-position indicator line */}
+          {!isScrubbing && activeDateLabel && (
+            <div className="scrubber-indicator" style={{ top: `${activeIndicatorY}px` }} />
+          )}
+
+          {/* Proportional segments with decimated dots + year labels */}
+          {scrubberSegments.map((seg) => (
+            <div
+              key={seg.label}
+              className="scrubber-segment"
+              style={{ height: `${seg.height}px` }}
+            >
+              {seg.hasLabel && (
+                <span className="scrubber-year">{seg.year}</span>
+              )}
+              {seg.hasDot && <span className="scrubber-dot" />}
+            </div>
+          ))}
+        </div>
+      )}
 
       <div id="loading-observer" ref={observerRef} style={{ height: '1px', width: '100%' }}></div>
 
