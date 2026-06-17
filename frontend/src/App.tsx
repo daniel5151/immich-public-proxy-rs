@@ -724,7 +724,11 @@ function GalleryPage({ details }: GalleryPageProps) {
       lgRef.current = null;
     }
 
-    const itemsArray = filteredAssets.slice(0, displayCount).map((asset) => {
+    // Build dynamicEl from the FULL filtered set, not the lazy-loaded slice, so
+    // lightGallery's counter reads "N of {total}" instead of "N of {batch}" and
+    // doesn't jump as more thumbnails load. data-index on each tile is the global
+    // index into filteredAssets, so openGallery(index) still maps 1:1.
+    const itemsArray = filteredAssets.map((asset) => {
       const previewUrl = `/share/photo/${realKey}/${asset.id}/preview`;
       const thumbnailUrl = `/share/photo/${realKey}/${asset.id}/thumbnail`;
 
@@ -803,7 +807,10 @@ function GalleryPage({ details }: GalleryPageProps) {
         lgRef.current = null;
       }
     };
-  }, [displayCount, filteredAssets, realKey]);
+  // NB: displayCount intentionally omitted — dynamicEl is built from the full
+  // filteredAssets, so lazy-load growth must NOT tear down and rebuild the
+  // lightbox (which also caused the counter to jump).
+  }, [filteredAssets, realKey]);
 
   // Toggles and selection behaviors
   const onToggleAsset = (id: string, index?: number, shiftKey?: boolean) => {
