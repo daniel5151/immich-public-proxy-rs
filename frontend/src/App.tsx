@@ -470,6 +470,21 @@ function GalleryPage({ details }: GalleryPageProps) {
       const thisTop = activeEl ? activeEl.getBoundingClientRect().top : headerLine;
       const passed = Math.max(0, headerLine - thisTop);
 
+      // Intra-band progress from the ACTIVE group's own pixel height. This is
+      // robust while lazy-loading: it never depends on the *next* group being
+      // in the DOM yet. (Deriving it from the next group's position made
+      // `needed` Infinity for not-yet-rendered groups, which falsely tripped
+      // the tail sweep below and made the indicator race to the bottom and then
+      // snap back as rows streamed in — the erratic jumping.)
+      const activeH = activeEl ? activeEl.offsetHeight : 0;
+      const inBand = activeH > 0 ? passed / activeH : 0;
+      const bandFrac = (seg.top + Math.min(1, Math.max(0, inBand)) * seg.height) / usable;
+
+      // The anchored tail sweep (easing the indicator to the very bottom of the
+      // bar) is only meaningful once the whole album is rendered. Until then the
+      // page is still growing, so scrollHeight / "remaining scroll" is bogus —
+      // gating on allRendered is what stops the jumps during initial load.
+      const allRendered = displayCount >= filteredAssets.length;
       const maxScroll = document.documentElement.scrollHeight - window.innerHeight;
       const scrollRemaining = Math.max(0, maxScroll - window.scrollY);
 
@@ -481,18 +496,10 @@ function GalleryPage({ details }: GalleryPageProps) {
         if (nextEl) needed = Math.max(0, nextEl.getBoundingClientRect().top - headerLine);
       }
 
-      // Position within the active band. For a group that still has a reachable
-      // successor we interpolate by how far we've scrolled through it; for the
-      // last group we anchor at the band top (0) and let the tail sweep below
-      // carry it down.
-      const inBand = activeIdx < groups.length - 1 && isFinite(needed)
-        ? passed / (passed + needed)
-        : 0;
-      const bandFrac = (seg.top + Math.min(1, Math.max(0, inBand)) * seg.height) / usable;
-
       // Tail: the page will bottom out before the next group can activate, so
-      // the active-group walk can't reach the end on its own.
-      const isTail = activeIdx >= groups.length - 1 || scrollRemaining <= needed;
+      // the active-group walk can't reach the end on its own. Only valid once
+      // everything is rendered (see allRendered note above).
+      const isTail = allRendered && (activeIdx >= groups.length - 1 || scrollRemaining <= needed);
 
       if (!isTail) {
         tailAnchorRef.current = null;
@@ -516,7 +523,7 @@ function GalleryPage({ details }: GalleryPageProps) {
     window.addEventListener('scroll', onScroll, { passive: true });
     onScroll(); // set initial
     return () => window.removeEventListener('scroll', onScroll);
-  }, [groups, headerHeight, scrubberSegments, scrubberHeight]);
+  }, [groups, headerHeight, scrubberSegments, scrubberHeight, displayCount, filteredAssets.length]);
 
   // Pixel position of the active date along the bar (for the indicator line).
   const activeIndicatorY = useMemo(() => {
