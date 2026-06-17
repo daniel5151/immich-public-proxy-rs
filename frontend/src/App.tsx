@@ -901,21 +901,78 @@ function GalleryPage({ details }: GalleryPageProps) {
     // IntersectionObserver scoped to the strip) plus a window around the active
     // slide, so the backend only sees thumbnails the user is actually near.
     let thumbObserver: IntersectionObserver | null = null;
-    const loadThumbImg = (img: HTMLImageElement) => {
-      if (img.getAttribute('data-lg-loaded') === '1') return;
-      const idAttr = img.getAttribute('data-lg-item-id');
-      if (idAttr == null) return;
-      const idx = parseInt(idAttr, 10);
-      const url = thumbUrlByIndex[idx];
-      if (!url) return;
-      img.src = url;
-      img.setAttribute('data-lg-loaded', '1');
-      thumbObserver?.unobserve(img);
-    };
+
     // The lightbox (and its filmstrip) mounts on document.body, NOT inside the
     // grid container `el`, so scope these queries to the document. Only one
     // gallery instance exists at a time (destroy() runs before any rebuild).
     const findThumbOuter = () => document.querySelector('.lg-thumb-outer');
+
+    // Concurrency-limited loader for filmstrip thumbnails. Naively setting
+    // img.src the moment a tile is flagged let the observer's initial burst (or
+    // a fast filmstrip drag) kick off dozens of parallel requests at once,
+    // which crippled page performance. Instead we queue requested tiles and let
+    // at most THUMB_MAX_CONCURRENT loads run at a time; when a slot frees we
+    // re-check that the tile is STILL near the visible strip before fetching,
+    // so thumbnails the user has already scrolled past are dropped, not loaded.
+    const THUMB_MAX_CONCURRENT = 6;
+    // Keep this in sync with the observer rootMargin below.
+    const THUMB_NEAR_MARGIN_PX = 300;
+    const thumbQueue: HTMLImageElement[] = [];
+    const thumbQueued = new Set<HTMLImageElement>();
+    let thumbInFlight = 0;
+
+    // Is the tile still within (visible strip ± margin)? Uses live geometry so a
+    // tile that has scrolled far away by the time its turn comes is skipped.
+    const isThumbNearViewport = (img: HTMLImageElement): boolean => {
+      const outer = findThumbOuter();
+      if (!outer) return false;
+      const o = outer.getBoundingClientRect();
+      const r = img.getBoundingClientRect();
+      // Filmstrip scrolls horizontally; only the x-axis matters in practice.
+      return (
+        r.right >= o.left - THUMB_NEAR_MARGIN_PX &&
+        r.left <= o.right + THUMB_NEAR_MARGIN_PX
+      );
+    };
+
+    const pumpThumbQueue = () => {
+      while (thumbInFlight < THUMB_MAX_CONCURRENT && thumbQueue.length > 0) {
+        const img = thumbQueue.shift()!;
+        thumbQueued.delete(img);
+        if (img.getAttribute('data-lg-loaded') === '1') continue;
+        const idAttr = img.getAttribute('data-lg-item-id');
+        if (idAttr == null) continue;
+        const url = thumbUrlByIndex[parseInt(idAttr, 10)];
+        if (!url) continue;
+        // Drop tiles that have since scrolled out of range; the observer will
+        // re-enqueue them if they come back into view.
+        if (!isThumbNearViewport(img)) {
+          thumbObserver?.observe(img);
+          continue;
+        }
+        img.setAttribute('data-lg-loaded', '1');
+        thumbObserver?.unobserve(img);
+        thumbInFlight++;
+        const done = () => {
+          img.removeEventListener('load', done);
+          img.removeEventListener('error', done);
+          thumbInFlight--;
+          pumpThumbQueue();
+        };
+        img.addEventListener('load', done);
+        img.addEventListener('error', done);
+        img.src = url;
+      }
+    };
+
+    const enqueueThumb = (img: HTMLImageElement) => {
+      if (img.getAttribute('data-lg-loaded') === '1') return;
+      if (thumbQueued.has(img)) return;
+      thumbQueued.add(img);
+      thumbQueue.push(img);
+      pumpThumbQueue();
+    };
+
     const ensureThumbObserver = () => {
       const outer = findThumbOuter();
       if (!outer) return;
@@ -923,12 +980,12 @@ function GalleryPage({ details }: GalleryPageProps) {
         thumbObserver = new IntersectionObserver(
           (entries) => {
             for (const entry of entries) {
-              if (entry.isIntersecting) loadThumbImg(entry.target as HTMLImageElement);
+              if (entry.isIntersecting) enqueueThumb(entry.target as HTMLImageElement);
             }
           },
           // Preload roughly a strip-width of thumbnails on either side of the
           // visible filmstrip window before they scroll into view.
-          { root: outer, rootMargin: '0px 300px 0px 300px', threshold: 0 }
+          { root: outer, rootMargin: `0px ${THUMB_NEAR_MARGIN_PX}px 0px ${THUMB_NEAR_MARGIN_PX}px`, threshold: 0 }
         );
       }
       outer.querySelectorAll('img[data-lg-item-id]').forEach((node) => {
@@ -945,7 +1002,7 @@ function GalleryPage({ details }: GalleryPageProps) {
         const img = outer.querySelector(
           `img[data-lg-item-id="${i}"]`
         ) as HTMLImageElement | null;
-        if (img) loadThumbImg(img);
+        if (img) enqueueThumb(img);
       }
     };
 
