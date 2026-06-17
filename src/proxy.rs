@@ -426,6 +426,17 @@ static ADDED_ALBUMS: std::sync::OnceLock<parking_lot::RwLock<std::collections::H
 static TAG_CACHE: std::sync::OnceLock<
     parking_lot::RwLock<std::collections::HashMap<String, String>>,
 > = std::sync::OnceLock::new();
+// Per-cache-key single-flight locks for tag creation. Without this, a burst of
+// concurrent uploads from a brand-new uploader all miss the cache and race to
+// POST /tags for the SAME child tag, tripping Immich's `tag_userId_value_uq`
+// unique constraint. The losing tasks then resolve the id inconsistently and
+// some asset->tag links are silently lost. Serializing creation per (parent,name)
+// means exactly one task creates the tag and the rest await, then read the cache.
+static TAG_LOCKS: std::sync::OnceLock<
+    parking_lot::Mutex<
+        std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>,
+    >,
+> = std::sync::OnceLock::new();
 static PROCESSED_ASSETS: std::sync::OnceLock<
     parking_lot::RwLock<std::collections::HashMap<String, (String, std::time::Instant)>>,
 > = std::sync::OnceLock::new();
@@ -443,6 +454,33 @@ async fn get_or_create_tag(
         None => format!("root:{}", name),
     };
 
+    // Fast path: already cached.
+    {
+        let read_guard = cache.read();
+        if let Some(id) = read_guard.get(&cache_key) {
+            return Some(id.clone());
+        }
+    }
+
+    // Single-flight: serialize creation for this exact (parent,name) so a burst of
+    // concurrent uploads from a new uploader doesn't stampede POST /tags and trip
+    // Immich's tag_userId_value_uq unique constraint. We grab (or create) an async
+    // mutex keyed by cache_key, then do the list/create under it. Other tasks for
+    // the same key block here and, once we release, hit the cache fast-path above
+    // via the post-lock re-check below.
+    let locks = TAG_LOCKS
+        .get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+    let key_lock = {
+        let mut guard = locks.lock();
+        guard
+            .entry(cache_key.clone())
+            .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    };
+    let _create_guard = key_lock.lock().await;
+
+    // Re-check the cache: another task holding the lock before us may have just
+    // created and cached the tag.
     {
         let read_guard = cache.read();
         if let Some(id) = read_guard.get(&cache_key) {
@@ -452,33 +490,14 @@ async fn get_or_create_tag(
 
     let upload_key = client.upload_api_key.as_ref()?;
 
-    // Step 1: List all tags and bulk-cache them
-    let get_url = client.build_url("/tags", &[]);
-    let res = client
-        .http_client
-        .get(&get_url)
-        .header("x-api-key", upload_key)
-        .send()
-        .await
-        .ok()?;
-
-    if res.status().is_success() {
-        if let Ok(tags) = res.json::<Vec<crate::immich_client::model::Tag>>().await {
-            let mut write_guard = cache.write();
-            for tag in &tags {
-                let key = match &tag.parent_id {
-                    Some(p_id) => format!("{}:{}", p_id, tag.name),
-                    None => format!("root:{}", tag.name),
-                };
-                write_guard.entry(key).or_insert_with(|| tag.id.clone());
-            }
-            if let Some(id) = write_guard.get(&cache_key) {
-                return Some(id.clone());
-            }
-        }
+    // Step 1: List all tags and bulk-cache them (authoritative read).
+    if let Some(id) = list_and_cache_tags(client, upload_key, cache, &cache_key).await {
+        return Some(id);
     }
 
-    // Step 2: Create tag if not found
+    // Step 2: Create the tag. Under the single-flight lock this should be the only
+    // in-flight POST for this key from this process, but Immich may still 4xx if the
+    // tag exists from a prior run or another client — which we treat as "go re-read".
     let post_url = client.build_url("/tags", &[]);
     let create_body = serde_json::json!({
         "name": name,
@@ -491,53 +510,129 @@ async fn get_or_create_tag(
         .header("x-api-key", upload_key)
         .json(&create_body)
         .send()
-        .await
-        .ok()?;
+        .await;
 
-    let status = create_res.status();
-    if status.is_success() || status == StatusCode::CREATED {
-        if let Ok(created_tag) = create_res.json::<crate::immich_client::model::Tag>().await {
-            let mut write_guard = cache.write();
-            write_guard.insert(cache_key, created_tag.id.clone());
-            return Some(created_tag.id);
-        }
-    } else {
-        // Tag might have been created concurrently by another thread.
-        // Query /tags again to find the concurrently created tag.
-        let get_url = client.build_url("/tags", &[]);
-        let retry_res = client
-            .http_client
-            .get(&get_url)
-            .header("x-api-key", upload_key)
-            .send()
-            .await
-            .ok()?;
-
-        if retry_res.status().is_success() {
-            if let Ok(tags) = retry_res
-                .json::<Vec<crate::immich_client::model::Tag>>()
-                .await
-            {
+    match create_res {
+        Ok(res) if res.status().is_success() || res.status() == StatusCode::CREATED => {
+            if let Ok(created_tag) = res.json::<crate::immich_client::model::Tag>().await {
                 let mut write_guard = cache.write();
-                for tag in &tags {
-                    let key = match &tag.parent_id {
-                        Some(p_id) => format!("{}:{}", p_id, tag.name),
-                        None => format!("root:{}", tag.name),
-                    };
-                    write_guard.insert(key, tag.id.clone());
-                }
-                if let Some(id) = write_guard.get(&cache_key) {
-                    return Some(id.clone());
-                }
+                write_guard.insert(cache_key.clone(), created_tag.id.clone());
+                return Some(created_tag.id);
             }
+            eprintln!(
+                "upload: tag create for '{}' returned success but body failed to parse; re-reading /tags",
+                cache_key
+            );
+        }
+        Ok(res) => {
+            // Most commonly a duplicate-key conflict: the tag already exists. This is
+            // expected and recoverable — re-read /tags to resolve the authoritative id.
+            // Do NOT swallow it silently; we want this visible if recovery then fails.
+            let status = res.status();
+            let body = res.text().await.unwrap_or_default();
+            eprintln!(
+                "upload: tag create for '{}' returned status {} (likely already exists) — recovering via /tags re-read; body: {}",
+                cache_key,
+                status,
+                body.chars().take(200).collect::<String>()
+            );
+        }
+        Err(e) => {
+            eprintln!(
+                "upload: tag create request for '{}' failed at transport level: {} — recovering via /tags re-read",
+                cache_key, e
+            );
         }
     }
 
+    // Step 3: Recovery re-read. Retry a couple of times to ride out read-after-write
+    // / brief propagation, since this is the path that previously lost the id under load.
+    for attempt in 1..=3 {
+        if let Some(id) = list_and_cache_tags(client, upload_key, cache, &cache_key).await {
+            return Some(id);
+        }
+        if attempt < 3 {
+            tokio::time::sleep(std::time::Duration::from_millis(150 * attempt)).await;
+        }
+    }
+
+    eprintln!(
+        "upload: FAILED to get-or-create tag '{}' after create + 3 recovery reads",
+        cache_key
+    );
     None
+}
+
+/// GET /tags, bulk-cache every tag by (parent,name) key, and return the id for
+/// `cache_key` if present. Returns None on transport/parse failure or cache miss.
+async fn list_and_cache_tags(
+    client: &ImmichClient,
+    upload_key: &str,
+    cache: &parking_lot::RwLock<std::collections::HashMap<String, String>>,
+    cache_key: &str,
+) -> Option<String> {
+    let get_url = client.build_url("/tags", &[]);
+    let res = client
+        .http_client
+        .get(&get_url)
+        .header("x-api-key", upload_key)
+        .send()
+        .await
+        .ok()?;
+
+    if !res.status().is_success() {
+        return None;
+    }
+
+    let tags = res
+        .json::<Vec<crate::immich_client::model::Tag>>()
+        .await
+        .ok()?;
+
+    let mut write_guard = cache.write();
+    for tag in &tags {
+        let key = match &tag.parent_id {
+            Some(p_id) => format!("{}:{}", p_id, tag.name),
+            None => format!("root:{}", tag.name),
+        };
+        // Overwrite: /tags is authoritative, so a fresh listing should win over any
+        // stale cache entry.
+        write_guard.insert(key, tag.id.clone());
+    }
+    write_guard.get(cache_key).cloned()
 }
 
 static IMMICH_API_SEMAPHORE: std::sync::OnceLock<tokio::sync::Semaphore> =
     std::sync::OnceLock::new();
+
+/// Authoritative check that `asset_id` actually carries `tag_id`, by reading the
+/// asset back from Immich. Returns true only on a successful GET whose tag list
+/// contains the id. Any transport/parse error or non-success status returns false
+/// (treated as "not confirmed"), so callers re-link rather than assume success.
+async fn asset_has_tag(client: &ImmichClient, asset_id: &str, tag_id: &str) -> bool {
+    let url = client.build_url(&format!("/assets/{}", asset_id), &[]);
+    let res = client
+        .http_client
+        .get(&url)
+        .header("x-api-key", client.upload_api_key.as_ref().unwrap())
+        .send()
+        .await;
+
+    match res {
+        Ok(r) if r.status().is_success() => match r
+            .json::<crate::immich_client::model::Asset>()
+            .await
+        {
+            Ok(asset_info) => asset_info
+                .tags
+                .as_ref()
+                .map(|tags| tags.iter().any(|t| t.id == tag_id))
+                .unwrap_or(false),
+            Err(_) => false,
+        },
+        _ => false,
+    }
+}
 
 async fn tag_and_associate_asset(
     client: &ImmichClient,
@@ -645,131 +740,93 @@ async fn tag_and_associate_asset(
             }
         }
 
-        // Step 2: Tag the asset with uploader name
+        // Step 2: Tag the asset with uploader name.
+        //
+        // Robustness model (this is the path that produced production orphan tags):
+        // a PUT /tags/{id}/assets can return success:true while the asset->tag link
+        // is later not present (observed under concurrent load through the real edge,
+        // alongside Immich tag_userId_value_uq duplicate-key errors). So we never
+        // trust the PUT response alone: we PUT, then GET the asset and confirm the
+        // tag is actually attached. If it isn't, we re-PUT and re-check. `tagged`
+        // only flips true after a confirming read, so a vanished link self-heals
+        // here instead of being reported as a false-positive success.
         if trash_checked && !tagged {
-            if let Some(parent_tag_id) = get_or_create_tag(client, "SharedBy", None).await {
-                if let Some(child_tag_id) =
-                    get_or_create_tag(client, uploader_name, Some(&parent_tag_id)).await
-                {
-                    let tag_url = client.build_url(&format!("/tags/{}/assets", child_tag_id), &[]);
-                    let tag_res = client
-                        .http_client
-                        .put(&tag_url)
-                        .header("x-api-key", client.upload_api_key.as_ref().unwrap())
-                        .json(&serde_json::json!({ "ids": [asset_id] }))
-                        .send()
-                        .await;
+            let parent_tag_id = get_or_create_tag(client, "SharedBy", None).await;
+            let child_tag_id = match &parent_tag_id {
+                Some(p) => get_or_create_tag(client, uploader_name, Some(p)).await,
+                None => None,
+            };
 
-                    #[derive(serde::Deserialize)]
-                    struct TagResponse {
-                        #[allow(dead_code)]
-                        id: String,
-                        success: bool,
-                    }
+            match (&parent_tag_id, &child_tag_id) {
+                (Some(_), Some(child_tag_id)) => {
+                    // Up to 3 PUT+verify cycles within this outer attempt. Each cycle
+                    // re-issues the link if a fresh read shows it absent.
+                    let mut confirmed = false;
+                    for link_try in 1..=3 {
+                        // Issue (or re-issue) the tag->asset link.
+                        let tag_url =
+                            client.build_url(&format!("/tags/{}/assets", child_tag_id), &[]);
+                        let tag_res = client
+                            .http_client
+                            .put(&tag_url)
+                            .header("x-api-key", client.upload_api_key.as_ref().unwrap())
+                            .json(&serde_json::json!({ "ids": [asset_id] }))
+                            .send()
+                            .await;
 
-                    match tag_res {
-                        Ok(res) if res.status().is_success() => {
-                            if let Ok(results) = res.json::<Vec<TagResponse>>().await {
-                                if let Some(first) = results.first() {
-                                    if first.success {
-                                        // Verify that the tag was actually applied, checking a few times if needed
-                                        let mut actual_tagged = false;
-                                        for check_attempt in 1..=2 {
-                                            if check_attempt > 1 {
-                                                tokio::time::sleep(
-                                                    std::time::Duration::from_millis(500),
-                                                )
-                                                .await;
-                                            }
-
-                                            let verify_asset_url = client
-                                                .build_url(&format!("/assets/{}", asset_id), &[]);
-                                            let verify_res = client
-                                                .http_client
-                                                .get(&verify_asset_url)
-                                                .header(
-                                                    "x-api-key",
-                                                    client.upload_api_key.as_ref().unwrap(),
-                                                )
-                                                .send()
-                                                .await;
-
-                                            if let Ok(r) = verify_res {
-                                                if r.status().is_success() {
-                                                    if let Ok(asset_info) = r
-                                                        .json::<crate::immich_client::model::Asset>(
-                                                        )
-                                                        .await
-                                                    {
-                                                        if let Some(ref asset_tags) =
-                                                            asset_info.tags
-                                                        {
-                                                            if asset_tags
-                                                                .iter()
-                                                                .any(|t| t.id == child_tag_id)
-                                                            {
-                                                                actual_tagged = true;
-                                                                break;
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-
-                                        if actual_tagged {
-                                            tagged = true;
-                                        } else {
-                                            eprintln!(
-                                                "upload: tagging returned success but tag {} was not found on asset {} after verification (attempt {})",
-                                                child_tag_id, asset_id, attempt
-                                            );
-                                        }
-                                    } else {
-                                        eprintln!(
-                                            "upload: tagging returned success:false for asset {} (attempt {})",
-                                            asset_id, attempt
-                                        );
-                                    }
-                                } else {
-                                    eprintln!(
-                                        "upload: tagging returned empty list for asset {} (attempt {})",
-                                        asset_id, attempt
-                                    );
-                                }
-                            } else {
+                        match tag_res {
+                            Ok(res) if res.status().is_success() => { /* fall through to verify */ }
+                            Ok(res) => {
                                 eprintln!(
-                                    "upload: failed to parse tag response for asset {} (attempt {})",
-                                    asset_id, attempt
+                                    "upload: tagging PUT failed for asset {} with status {} (outer {} link_try {})",
+                                    asset_id,
+                                    res.status(),
+                                    attempt,
+                                    link_try
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "upload: tagging PUT request failed for asset {}: {} (outer {} link_try {})",
+                                    asset_id, e, attempt, link_try
                                 );
                             }
                         }
-                        Ok(res) => {
-                            eprintln!(
-                                "upload: tagging failed for asset {} with status {} (attempt {})",
-                                asset_id,
-                                res.status(),
-                                attempt
-                            );
+
+                        // Authoritative verify: read the asset and confirm the tag is
+                        // attached. A short settle wait covers read-after-write.
+                        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                        if asset_has_tag(client, asset_id, child_tag_id).await {
+                            confirmed = true;
+                            break;
                         }
-                        Err(e) => {
-                            eprintln!(
-                                "upload: tagging request failed for asset {}: {} (attempt {})",
-                                asset_id, e, attempt
-                            );
-                        }
+                        eprintln!(
+                            "upload: TAG-VERIFY-MISS asset {} tag {} (uploader {:?}) link absent after PUT (outer {} link_try {}) — retrying",
+                            asset_id, child_tag_id, uploader_name, attempt, link_try
+                        );
+                        // brief backoff before the next PUT+verify cycle
+                        tokio::time::sleep(std::time::Duration::from_millis(250 * link_try)).await;
                     }
-                } else {
+
+                    if confirmed {
+                        tagged = true;
+                    }
+                    // If not confirmed, leave `tagged=false`; the outer retry loop will
+                    // re-enter this block, and the final INCOMPLETE log will fire so the
+                    // miss is never silently reported as success.
+                }
+                (Some(_), None) => {
                     eprintln!(
-                        "upload: failed to get or create child tag '{}' (attempt {})",
-                        uploader_name, attempt
+                        "upload: could not resolve child tag '{}' for asset {} (outer attempt {})",
+                        uploader_name, asset_id, attempt
                     );
                 }
-            } else {
-                eprintln!(
-                    "upload: failed to get or create parent tag 'SharedBy' (attempt {})",
-                    attempt
-                );
+                (None, _) => {
+                    eprintln!(
+                        "upload: could not resolve parent tag 'SharedBy' for asset {} (outer attempt {})",
+                        asset_id, attempt
+                    );
+                }
             }
         }
 
@@ -816,10 +873,17 @@ async fn tag_and_associate_asset(
         tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
     }
 
+    // [tag-debug] Always log the final outcome (previously only on failure) so every
+    // asset's tag/album result can be correlated against the upload-accept line above.
     if !trash_checked || !tagged || !added_to_album {
         eprintln!(
-            "upload: finished processing asset {} with status: trash_checked={}, tagged={}, added_to_album={}",
+            "upload: FINISHED asset {} INCOMPLETE: trash_checked={}, tagged={}, added_to_album={}",
             asset_id, trash_checked, tagged, added_to_album
+        );
+    } else {
+        println!(
+            "upload: FINISHED asset {} ok: tagged + added_to_album",
+            asset_id
         );
     }
 
@@ -991,6 +1055,11 @@ pub async fn upload_asset_handler(
     #[derive(Deserialize)]
     struct AssetUploadResponse {
         id: String,
+        // Immich returns "created" or "duplicate". Logged below to diagnose whether a
+        // missing tag correlates with dedupe (a duplicate returns an existing asset id
+        // possibly already mid-processing under a different uploader name).
+        #[serde(default)]
+        status: Option<String>,
     }
 
     let upload_resp: AssetUploadResponse = match res.json().await {
@@ -1004,6 +1073,14 @@ pub async fn upload_asset_handler(
         }
     };
     let asset_id = upload_resp.id;
+
+    // [tag-debug] Record how the upload resolved. A "duplicate" means Immich returned an
+    // existing asset id; if that asset is concurrently processed under another uploader
+    // name this is where divergence starts.
+    println!(
+        "upload: asset {} accepted (status={:?}, uploader={:?}, key={})",
+        asset_id, upload_resp.status, uploader_name, key
+    );
 
     // Album contents just changed; drop any cached share response so the next load
     // rebuilds (IDEAS #6 invalidation). Re-invalidated below once tagging/association
