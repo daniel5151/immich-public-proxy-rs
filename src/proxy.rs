@@ -545,15 +545,27 @@ async fn tag_and_associate_asset(
     album_id: &str,
     uploader_name: &str,
 ) -> bool {
-    let sem = IMMICH_API_SEMAPHORE.get_or_init(|| tokio::sync::Semaphore::new(1));
+    // Concurrency for the tag/associate background work. Defaults to 4 so multiple
+    // simultaneous uploads can be processed in parallel; the only shared mutable
+    // state (TAG_CACHE / ADDED_ALBUMS) is independently locked, and the tag-create
+    // path already handles concurrent creation via a POST-conflict re-query.
+    let sem = IMMICH_API_SEMAPHORE.get_or_init(|| {
+        let permits = std::env::var("UPLOAD_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n >= 1)
+            .unwrap_or(4);
+        tokio::sync::Semaphore::new(permits)
+    });
     let _permit = sem.acquire().await.ok();
 
     let mut trash_checked = false;
     let mut tagged = false;
     let mut added_to_album = false;
 
-    // Retry loop: we will try up to 10 times to perform the remaining steps
-    for attempt in 1..=10 {
+    // Retry loop: a handful of attempts is plenty; Immich settles read-after-write
+    // quickly, and the per-step backoff below covers the rare transient case.
+    for attempt in 1..=4 {
         // Step 1: Check trash status and restore if needed
         if !trash_checked {
             let get_asset_url = client.build_url(&format!("/assets/{}", asset_id), &[]);
@@ -662,7 +674,7 @@ async fn tag_and_associate_asset(
                                     if first.success {
                                         // Verify that the tag was actually applied, checking a few times if needed
                                         let mut actual_tagged = false;
-                                        for check_attempt in 1..=4 {
+                                        for check_attempt in 1..=2 {
                                             if check_attempt > 1 {
                                                 tokio::time::sleep(
                                                     std::time::Duration::from_millis(500),
