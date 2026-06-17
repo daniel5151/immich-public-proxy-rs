@@ -291,6 +291,9 @@ function GalleryPage({ details }: GalleryPageProps) {
       return;
     }
     setDisplayCount(Math.min(40, filteredAssets.length));
+    // A tail anchor captured under the old filter is meaningless for the new
+    // (differently sized) list; clear it so the indicator re-derives cleanly.
+    tailAnchorRef.current = null;
   }, [enabledUploaders]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // CSP compliance: error boundary for missing thumbnails
@@ -477,13 +480,18 @@ function GalleryPage({ details }: GalleryPageProps) {
       let activeIdx = 0;
       for (let i = 0; i < groups.length; i++) {
         const el = dateGroupRefs.current.get(groups[i].label);
-        if (el && el.getBoundingClientRect().top <= headerLine) activeIdx = i;
+        // isConnected guard: after a filter change, date labels can collide
+        // with a previous render, so the map may hold a DETACHED node. Detached
+        // nodes report rect.top === 0, which would pass the test below and drag
+        // activeIdx to a late group — pinning the indicator near the bottom.
+        if (el && el.isConnected && el.getBoundingClientRect().top <= headerLine) activeIdx = i;
       }
       setActiveDateLabel(groups[activeIdx]?.label ?? '');
 
       const seg = scrubberSegments[activeIdx];
       const activeEl = dateGroupRefs.current.get(groups[activeIdx].label);
-      const thisTop = activeEl ? activeEl.getBoundingClientRect().top : headerLine;
+      const activeConnected = !!activeEl && activeEl.isConnected;
+      const thisTop = activeConnected ? activeEl.getBoundingClientRect().top : headerLine;
       const passed = Math.max(0, headerLine - thisTop);
 
       // Intra-band progress from the ACTIVE group's own pixel height. This is
@@ -492,7 +500,7 @@ function GalleryPage({ details }: GalleryPageProps) {
       // `needed` Infinity for not-yet-rendered groups, which falsely tripped
       // the tail sweep below and made the indicator race to the bottom and then
       // snap back as rows streamed in — the erratic jumping.)
-      const activeH = activeEl ? activeEl.offsetHeight : 0;
+      const activeH = activeConnected ? activeEl.offsetHeight : 0;
       const inBand = activeH > 0 ? passed / activeH : 0;
       const bandFrac = (seg.top + Math.min(1, Math.max(0, inBand)) * seg.height) / usable;
 
@@ -509,7 +517,7 @@ function GalleryPage({ details }: GalleryPageProps) {
       let needed = Infinity;
       if (activeIdx < groups.length - 1) {
         const nextEl = dateGroupRefs.current.get(groups[activeIdx + 1].label);
-        if (nextEl) needed = Math.max(0, nextEl.getBoundingClientRect().top - headerLine);
+        if (nextEl && nextEl.isConnected) needed = Math.max(0, nextEl.getBoundingClientRect().top - headerLine);
       }
 
       // Tail: the page will bottom out before the next group can activate, so
@@ -1367,6 +1375,7 @@ function GalleryPage({ details }: GalleryPageProps) {
               className="gallery-date-group"
               ref={(el) => {
                 if (el) dateGroupRefs.current.set(group.label, el);
+                else dateGroupRefs.current.delete(group.label);
               }}
             >
               <div className="gallery-date-header">
