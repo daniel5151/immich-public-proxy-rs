@@ -43,7 +43,6 @@ graph TD
 .
 ├── .github/workflows/          # GitHub actions (automated release builds)
 ├── assets/                     # Legacy/Original Leptos assets (frozen)
-├── bindings/                   # (Cleaned up) temporary bindings folder
 ├── deploy.sh                   # Deployment script for copying binaries/assets
 ├── frontend/                   # Decoupled React frontend
 │   ├── public/                 # Static assets (fonts, images, lightGallery)
@@ -100,7 +99,9 @@ sequenceDiagram
 ```
 
 ### B. Uploading Media
-If the share link allows uploading, users can upload photos/videos. The client prompts for an uploader name (saved in `localStorage`), attaches it as a custom header (`x-uploader-name`), and sends files to `/share/:key/upload`. The backend proxies this to Immich using the upload service account API key (`IMMICH_API_KEY_UPLOAD_USER`), adds the assets to the album, and tags them with `SharedBy/{name}` in the background.
+If the share link allows uploading, users can upload photos/videos. The client prompts for an uploader name (saved in `localStorage`), attaches it as a custom header (`x-uploader-name`), and sends files to `/share/:key/upload`. The backend proxies this to Immich using the upload service account API key (`IMMICH_API_KEY_UPLOAD_USER`), adds the assets to the album, and tags them with `SharedBy/{name}` in the background. The background tag/album work runs under a concurrency limit (`UPLOAD_CONCURRENCY`, default 4) and the share-details cache for the affected key is invalidated so the new asset appears immediately.
+
+**Deferred tag guard.** Immich's asynchronous metadata-extraction job calls `replaceAssetTags()` with the tags embedded in the uploaded file (~1s after upload). Keyword-less files (e.g. `PXL_*.jpg`) carry an empty embedded tag set, so extraction would replace the asset's entire tag set with `[]` — silently wiping the `SharedBy/{name}` attribution the proxy just applied. After the synchronous tag/album step succeeds, the proxy spawns a detached `deferred_tag_guard` that re-checks the asset's tag on a spaced schedule (`IPP_TAG_GUARD_SCHEDULE`, default `2,4,8,16,30`s) straddling the extraction window. If the tag is gone it re-applies it; it only exits after two consecutive confirmations, so it outlasts a delayed wipe. An inconclusive read defers to the next tick rather than blindly re-PUTting (a blind re-apply races Immich into a `tag_asset_pkey` duplicate-key 500). The guard is on by default and can be disabled with `IPP_TAG_GUARD=0`.
 
 ```mermaid
 sequenceDiagram
@@ -114,7 +115,9 @@ sequenceDiagram
     Immich-->>Axum: Return upload metadata
     Axum->>Immich: Create tag 'SharedBy/{name}'
     Axum->>Immich: Apply tag to uploaded asset
+    Axum->>Axum: Invalidate share-details cache for key
     Axum-->>User: Return 200 OK / Success
+    Note over Axum,Immich: deferred_tag_guard (detached): re-check tag on<br/>2,4,8,16,30s schedule; re-apply if metadata<br/>extraction wiped it; exit after 2 confirmations
 ```
 
 ### C. Filter by Uploader (Frontend)
@@ -214,7 +217,10 @@ The `Secure` flag on password session cookies (`immich_pwd_*`) is conditional: i
 Download responses include both an ASCII fallback `filename="..."` and a UTF-8 `filename*=UTF-8''...` parameter, ensuring filenames with non-ASCII characters display correctly across all browsers.
 
 ### OnceLock Caching
-Environment variables (`PUBLIC_BASE_URL`, `LEPTOS_SITE_ROOT`, `IMMICH_API_KEY_UPLOAD_USER`) and the shared `reqwest::Client` (with a 10-second connect timeout) are initialized once via `std::sync::OnceLock` and reused across requests.
+Environment variables and other process-wide config (e.g. `PUBLIC_BASE_URL`, `LEPTOS_SITE_ROOT`, `IMMICH_API_KEY_UPLOAD_USER`, the share-cache TTL, and the upload concurrency limit) and the shared `reqwest::Client` (with a 10-second connect timeout) are initialized once via `std::sync::OnceLock` and reused across requests.
+
+### Share-Details Cache
+`api/get_share_details.rs` keeps a small in-memory cache of fully-resolved share responses, keyed by share key (and password variant). Entries expire after `SHARE_CACHE_TTL_SECS` (default 45s) and are also proactively invalidated by the upload path whenever an album's contents change. A monotonic per-key generation counter is snapshotted before a rebuild and re-checked under the write lock, so an invalidation that races an in-flight rebuild correctly discards the stale result instead of caching it.
 
 ### Bulk Tag Cache
 The `get_or_create_tag` function in `proxy.rs` populates the tag cache with all tags from a single `/tags` API call, rather than scanning the full list per lookup. This reduces upload latency for albums with many tags/uploaders.

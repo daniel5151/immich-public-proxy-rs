@@ -19,6 +19,7 @@ Share photos and albums from [Immich](https://github.com/immich-app/immich) with
     - **Selection-based Downloads**: Users can select specific assets in the gallery to download as a custom ZIP.
 - **Upload Support**: Users can upload media directly to shared albums via the proxy.
     - Uploaded assets are processed in the background, added to the shared album, and tagged with `SharedBy/{uploader_name}` using the configured upload service account API key (`IMMICH_API_KEY_UPLOAD_USER`).
+    - A **deferred tag guard** re-checks each upload's `SharedBy/{name}` tag on a schedule after upload and re-applies it if Immich's metadata-extraction job strips it (keyword-less files otherwise lose the attribution tag). On by default; tune via `IPP_TAG_GUARD` / `IPP_TAG_GUARD_SCHEDULE`.
 - **Gallery UI**:
     - Chronological grouping of assets by date.
     - Lazy loading of grid tiles using `IntersectionObserver` for performance in large albums.
@@ -90,7 +91,12 @@ Configuration is handled via environment variables.
 | `IMMICH_API_KEY`             |    No    | Admin/owner API key. Enables password detection, link-not-found resolution, and name fallback resolution.                                             |
 | `IMMICH_API_KEY_UPLOAD_USER` |    No    | Service account/user API key for uploads. Enabling upload support requires this key.                                                                  |
 | `PUBLIC_BASE_URL`            |    No    | The public URL of the proxy (e.g., `https://photos.example.com`). Used for SEO/OpenGraph preview tags. Generated dynamically from headers if omitted. |
-| `RUST_LOG`                   |    No    | Logging level (e.g., `info`, `debug`, `warn`). Defaults to `error`.                                                                                   |
+| `SHARE_CACHE_TTL_SECS`       |    No    | TTL (seconds) for the in-memory share-details cache. Defaults to `45`. Entries are also proactively invalidated when an upload mutates an album.       |
+| `UPLOAD_CONCURRENCY`         |    No    | Max number of simultaneous background tag/album jobs across uploads. Defaults to `4` (minimum `1`).                                                    |
+| `IPP_TAG_GUARD`              |    No    | Set to `0`/`false` to disable the deferred uploader-tag guard (see Features → Upload Support). Enabled by default.                                     |
+| `IPP_TAG_GUARD_SCHEDULE`     |    No    | Comma-separated re-check delays in seconds for the tag guard. Defaults to `2,4,8,16,30`.                                                               |
+
+> **Logging:** the proxy writes logs straight to stdout/stderr; there is no log-level filtering and no `RUST_LOG` variable.
 
 ### API Key Permissions and Features
 
