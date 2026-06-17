@@ -248,6 +248,12 @@ function GalleryPage({ details }: GalleryPageProps) {
   const dateGroupRefs = useRef<Map<string, HTMLDivElement>>(new Map());
   const scrubberRef = useRef<HTMLDivElement | null>(null);
   const pendingScrollRef = useRef<string | null>(null);
+  // Lightbox <-> gallery position sync. While the lightbox is open its slide
+  // hash (#lg=1&slide=<assetId>) is the single source of truth for position, so
+  // ?at is dropped; on close we write ?at from the slide last viewed and scroll
+  // the grid there, so the gallery position "comes along" out of the slideshow.
+  const lgOpenRef = useRef(false);
+  const currentSlideIdRef = useRef<string | null>(null);
   const scrubRafRef = useRef<number | null>(null);
   const [scrubberHeight, setScrubberHeight] = useState(0);
   const [scrubberTop, setScrubberTop] = useState(96);
@@ -579,6 +585,44 @@ function GalleryPage({ details }: GalleryPageProps) {
     }
   }, [displayCount]);
 
+  // Scroll the grid so a given asset id sits just under the header, growing the
+  // lazy-load window first if that tile hasn't been rendered yet. Used to carry
+  // the lightbox position back to the gallery when the slideshow closes.
+  const pendingGridScrollIdRef = useRef<string | null>(null);
+  const scrollGridToAssetId = (assetId: string) => {
+    const idx = filteredAssets.findIndex((a) => a.id === assetId);
+    if (idx <= 0) return; // unknown id, or already at the very top
+    const el = galleryContainerRef.current?.querySelector<HTMLElement>(
+      `.gallery-item[data-asset-id="${assetId}"]`
+    );
+    if (el) {
+      const headerOffset = headerHeight + 10;
+      const top = el.getBoundingClientRect().top + window.scrollY - headerOffset;
+      window.scrollTo({ top, behavior: 'auto' });
+      return;
+    }
+    // Not rendered yet — grow the window to include it, then scroll next frame.
+    if (displayCount <= idx) {
+      setDisplayCount(Math.min(idx + 12, filteredAssets.length));
+    }
+    pendingGridScrollIdRef.current = assetId;
+  };
+
+  // Once a pending (deep) lightbox-exit target has rendered, scroll to it.
+  useEffect(() => {
+    const assetId = pendingGridScrollIdRef.current;
+    if (!assetId) return;
+    const el = galleryContainerRef.current?.querySelector<HTMLElement>(
+      `.gallery-item[data-asset-id="${assetId}"]`
+    );
+    if (el) {
+      pendingGridScrollIdRef.current = null;
+      const headerOffset = headerHeight + 10;
+      const top = el.getBoundingClientRect().top + window.scrollY - headerOffset;
+      window.scrollTo({ top, behavior: 'auto' });
+    }
+  }, [displayCount, headerHeight]);
+
   // --- Persist scroll position in the URL (?at=<assetIndex>) -----------------
   // We anchor on the global index of the topmost asset currently under the
   // header rather than a pixel offset or scroll fraction, so the position stays
@@ -634,6 +678,9 @@ function GalleryPage({ details }: GalleryPageProps) {
     let timer: ReturnType<typeof setTimeout> | null = null;
     const writePosition = () => {
       if (!didRestoreScrollRef.current) return;
+      // While the lightbox is open the slide hash owns position; don't fight it
+      // by writing ?at from whatever the grid behind it happens to show.
+      if (lgOpenRef.current) return;
       const container = galleryContainerRef.current;
       if (!container) return;
       const headerLine = headerHeight + 10;
@@ -827,6 +874,52 @@ function GalleryPage({ details }: GalleryPageProps) {
 
     lgRef.current = lightGallery(el, lgConfig);
 
+    // Keep the gallery scroll position in sync with the slideshow. The hash
+    // plugin already mirrors the active slide into #lg=1&slide=<assetId>; we
+    // read that id from each slide event by index into the dynamicEl we built.
+    const slideIdAt = (idx: number): string | null => {
+      const item = itemsArray[idx] as unknown as { slideName?: string };
+      return item?.slideName ?? null;
+    };
+    const onLgAfterOpen = () => {
+      lgOpenRef.current = true;
+      // The slide hash now owns position; drop the redundant ?at so the two
+      // don't disagree (and so a shared in-lightbox URL stays clean).
+      try {
+        const url = new URL(window.location.href);
+        if (url.searchParams.has('at')) {
+          url.searchParams.delete('at');
+          history.replaceState(history.state, '', url.pathname + url.search + url.hash);
+        }
+      } catch { /* ignore */ }
+    };
+    const onLgAfterSlide = (e: Event) => {
+      const idx = (e as CustomEvent<{ index: number }>).detail?.index;
+      if (typeof idx === 'number') currentSlideIdRef.current = slideIdAt(idx);
+    };
+    const onLgAfterClose = () => {
+      lgOpenRef.current = false;
+      const slideId = currentSlideIdRef.current;
+      if (!slideId) return;
+      // Carry the slideshow position back to the gallery: write ?at and scroll
+      // the grid so the photo you left on is where you land. The hash plugin
+      // clears #lg on close, so ?at becomes the surviving position on reload.
+      try {
+        const url = new URL(window.location.href);
+        const idx = filteredAssets.findIndex((a) => a.id === slideId);
+        if (idx > 0) {
+          url.searchParams.set('at', slideId);
+        } else {
+          url.searchParams.delete('at');
+        }
+        history.replaceState(history.state, '', url.pathname + url.search + url.hash);
+      } catch { /* ignore */ }
+      scrollGridToAssetId(slideId);
+    };
+    el.addEventListener('lgAfterOpen', onLgAfterOpen);
+    el.addEventListener('lgAfterSlide', onLgAfterSlide);
+    el.addEventListener('lgAfterClose', onLgAfterClose);
+
     const handleClick = (e: Event) => {
       const target = (e.target as HTMLElement).closest('.gallery-item');
       if (target && el.contains(target)) {
@@ -846,6 +939,9 @@ function GalleryPage({ details }: GalleryPageProps) {
 
     return () => {
       el.removeEventListener('click', handleClick);
+      el.removeEventListener('lgAfterOpen', onLgAfterOpen);
+      el.removeEventListener('lgAfterSlide', onLgAfterSlide);
+      el.removeEventListener('lgAfterClose', onLgAfterClose);
       if (lgRef.current) {
         lgRef.current.destroy();
         lgRef.current = null;
