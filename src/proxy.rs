@@ -1004,11 +1004,18 @@ pub async fn upload_asset_handler(
         }
     };
     let asset_id = upload_resp.id;
+
+    // Album contents just changed; drop any cached share response so the next load
+    // rebuilds (IDEAS #6 invalidation). Re-invalidated below once tagging/association
+    // completes, since that mutates the asset's attribution too.
+    crate::api::get_share_details::share_cache::invalidate(&key);
+
     // Spawn background task to tag and associate the asset, saving it to PROCESSED_ASSETS when done.
     let client_clone = client.clone();
     let asset_id_clone = asset_id.clone();
     let album_id_clone = album_id.clone();
     let uploader_name_clone = uploader_name.clone();
+    let key_clone = key.clone();
 
     tokio::spawn(async move {
         let success = tag_and_associate_asset(
@@ -1018,6 +1025,10 @@ pub async fn upload_asset_handler(
             &uploader_name_clone,
         )
         .await;
+
+        // Attribution/album membership settled — invalidate again so the resolved
+        // uploader name is reflected on the next share load.
+        crate::api::get_share_details::share_cache::invalidate(&key_clone);
 
         if success {
             let cache = PROCESSED_ASSETS

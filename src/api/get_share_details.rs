@@ -26,6 +26,126 @@ pub struct ShareParams {
     pub password: Option<String>,
 }
 
+/// TTL cache for fully-resolved share responses (IDEAS #4 + #6).
+///
+/// A cold `/share/{key}` build does `fetch_share_me` + `/albums/{id}` + per-uploader
+/// tag searches + owner fallback. Caching the finished `ShareDetails` keyed by
+/// (share_key, password) collapses all of that to a single clone on repeat loads,
+/// and—because uploader names are already stamped onto the cached assets—also
+/// resolves the N+1 attribution work (#4). Entries are evicted on TTL expiry and
+/// proactively invalidated by the upload path when an album's contents change.
+pub mod share_cache {
+    use super::ShareDetails;
+    use std::collections::HashMap;
+    use std::hash::{Hash, Hasher};
+    use std::time::{Duration, Instant};
+
+    // hash(key,password) -> (share_key, details, inserted_at). The plaintext share key
+    // is stored alongside so we can invalidate every password variant of a key on
+    // mutation without needing to reverse the hash. The password itself is never stored.
+    static CACHE: std::sync::OnceLock<
+        parking_lot::RwLock<HashMap<u64, (String, ShareDetails, Instant)>>,
+    > = std::sync::OnceLock::new();
+
+    // share_key -> monotonically increasing generation. Bumped on every invalidate so
+    // an in-flight rebuild that began before a mutation can detect it became stale.
+    static GENERATIONS: std::sync::OnceLock<parking_lot::RwLock<HashMap<String, u64>>> =
+        std::sync::OnceLock::new();
+
+    fn generations() -> &'static parking_lot::RwLock<HashMap<String, u64>> {
+        GENERATIONS.get_or_init(|| parking_lot::RwLock::new(HashMap::new()))
+    }
+
+    fn ttl() -> Duration {
+        static TTL: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+        *TTL.get_or_init(|| {
+            let secs = std::env::var("SHARE_CACHE_TTL_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(45);
+            Duration::from_secs(secs)
+        })
+    }
+
+    fn entry_hash(key: &str, password: Option<&str>) -> u64 {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut h);
+        match password {
+            Some(p) => {
+                1u8.hash(&mut h);
+                p.hash(&mut h);
+            }
+            None => 0u8.hash(&mut h),
+        }
+        h.finish()
+    }
+
+    /// Current generation for a key. Capture this *before* starting a rebuild and pass
+    /// it back to `put` so a stale build (one that began before a concurrent mutation)
+    /// can be rejected.
+    pub fn generation(key: &str) -> u64 {
+        generations().read().get(key).copied().unwrap_or(0)
+    }
+
+    pub fn get(key: &str, password: Option<&str>) -> Option<ShareDetails> {
+        let t = ttl();
+        if t.is_zero() {
+            return None;
+        }
+        let cache = CACHE.get()?;
+        let h = entry_hash(key, password);
+        let guard = cache.read();
+        let (_, details, ts) = guard.get(&h)?;
+        if ts.elapsed() < t {
+            Some(details.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Store a freshly-built response, but only if no invalidation occurred for this
+    /// key since `gen_at_start` was captured. Returns true if stored.
+    pub fn put(
+        key: &str,
+        password: Option<&str>,
+        details: &ShareDetails,
+        gen_at_start: u64,
+    ) -> bool {
+        let t = ttl();
+        if t.is_zero() {
+            return false;
+        }
+        let cache = CACHE.get_or_init(|| parking_lot::RwLock::new(HashMap::new()));
+        let h = entry_hash(key, password);
+        let mut guard = cache.write();
+        // Re-check the generation while holding the cache write lock. `invalidate`
+        // bumps the generation *before* taking this lock, so any invalidation that
+        // races our build is observed here and we refuse to store stale data.
+        if generation(key) != gen_at_start {
+            return false;
+        }
+        // Opportunistically drop expired entries to bound memory.
+        guard.retain(|_, (_, _, ts)| ts.elapsed() < t);
+        guard.insert(h, (key.to_string(), details.clone(), Instant::now()));
+        true
+    }
+
+    /// Drop every cached variant of a share key and bump its generation (called when
+    /// its album mutates). The generation bump invalidates any in-flight rebuild that
+    /// started before this point.
+    pub fn invalidate(key: &str) {
+        {
+            let mut gens = generations().write();
+            let g = gens.entry(key.to_string()).or_insert(0);
+            *g = g.wrapping_add(1);
+        }
+        if let Some(cache) = CACHE.get() {
+            let mut guard = cache.write();
+            guard.retain(|_, (k, _, _)| k != key);
+        }
+    }
+}
+
 /// Helper function to fetch share details. Used by the API handler and the HTML meta injector.
 pub async fn get_share_details(
     key: String,
@@ -51,6 +171,20 @@ pub async fn get_share_details(
     // Check cookie for password if not provided
     let password =
         password.or_else(|| crate::immich_client::client::get_cookie_password(headers, &key));
+
+    // Serve a fresh cached response when one is available (IDEAS #4 + #6).
+    if let Some(mut cached) = share_cache::get(&key, password.as_deref()) {
+        // The cached body is request-independent except for these two fields, which
+        // derive from the current request's host header; re-stamp them.
+        cached.public_base_url = public_base_url.clone();
+        cached.request_key = key.clone();
+        return Ok(cached);
+    }
+
+    // Snapshot the cache generation *before* building. If a mutation invalidates this
+    // key while we build, `put` below detects the generation bump and refuses to store
+    // our now-stale result (prevents a read-after-write stampede).
+    let cache_generation = share_cache::generation(&key);
 
     let client = ImmichClient::new();
     let (status, text) = client
@@ -152,12 +286,18 @@ pub async fn get_share_details(
         }
     }
 
-    Ok(ShareDetails {
+    let details = ShareDetails {
         link: safe_link,
         password_required: false,
         public_base_url,
-        request_key: key,
-    })
+        request_key: key.clone(),
+    };
+
+    // Cache the fully-resolved response for fast repeat loads (no-op if a concurrent
+    // mutation bumped the generation while we were building).
+    share_cache::put(&key, password.as_deref(), &details, cache_generation);
+
+    Ok(details)
 }
 
 /// Axum JSON API handler
