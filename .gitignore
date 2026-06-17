@@ -16,3 +16,4 @@ Cargo.lock
 # has some personal deets
 .agents/skills/
 deploy.sh
+.env.local
