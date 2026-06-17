@@ -815,9 +815,21 @@ function GalleryPage({ details }: GalleryPageProps) {
     // lightGallery's counter reads "N of {total}" instead of "N of {batch}" and
     // doesn't jump as more thumbnails load. data-index on each tile is the global
     // index into filteredAssets, so openGallery(index) still maps 1:1.
-    const itemsArray = filteredAssets.map((asset) => {
+    //
+    // The lgThumbnail filmstrip plugin sets <img>.src eagerly for EVERY item in
+    // dynamicEl at construction time (no lazy-load option), which would fetch
+    // every thumbnail in the album the moment the page loads — even if the
+    // lightbox is never opened. To avoid that we hand each item a 1x1 transparent
+    // placeholder as its `thumb` and stash the real thumbnail URL in
+    // thumbUrlByIndex; the real URLs are swapped in lazily once the filmstrip is
+    // open and scrolling (see the IntersectionObserver wiring below).
+    const THUMB_PLACEHOLDER =
+      'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
+    const thumbUrlByIndex: string[] = new Array(filteredAssets.length);
+    const itemsArray = filteredAssets.map((asset, i) => {
       const previewUrl = `/share/photo/${realKey}/${asset.id}/preview`;
       const thumbnailUrl = `/share/photo/${realKey}/${asset.id}/thumbnail`;
+      thumbUrlByIndex[i] = thumbnailUrl;
 
       if (asset.type === 'VIDEO') {
         const item = {
@@ -840,7 +852,7 @@ function GalleryPage({ details }: GalleryPageProps) {
             }
           },
           poster: previewUrl,
-          thumb: thumbnailUrl,
+          thumb: THUMB_PLACEHOLDER,
           downloadUrl: asset.downloadUrl
         };
         return item as unknown as GalleryItem;
@@ -848,7 +860,7 @@ function GalleryPage({ details }: GalleryPageProps) {
         const item = {
           slideName: asset.id,
           src: previewUrl,
-          thumb: thumbnailUrl,
+          thumb: THUMB_PLACEHOLDER,
           downloadUrl: asset.downloadUrl
         };
         return item as GalleryItem;
@@ -882,6 +894,61 @@ function GalleryPage({ details }: GalleryPageProps) {
 
     lgRef.current = lightGallery(el, lgConfig);
 
+    // --- Lazy filmstrip thumbnails -----------------------------------------
+    // dynamicEl handed every item a 1x1 placeholder thumb (see above) so the
+    // lgThumbnail plugin can't eager-fetch the whole album. Swap in the real
+    // thumbnail URL only for filmstrip tiles near the viewport (via an
+    // IntersectionObserver scoped to the strip) plus a window around the active
+    // slide, so the backend only sees thumbnails the user is actually near.
+    let thumbObserver: IntersectionObserver | null = null;
+    const loadThumbImg = (img: HTMLImageElement) => {
+      if (img.getAttribute('data-lg-loaded') === '1') return;
+      const idAttr = img.getAttribute('data-lg-item-id');
+      if (idAttr == null) return;
+      const idx = parseInt(idAttr, 10);
+      const url = thumbUrlByIndex[idx];
+      if (!url) return;
+      img.src = url;
+      img.setAttribute('data-lg-loaded', '1');
+      thumbObserver?.unobserve(img);
+    };
+    // The lightbox (and its filmstrip) mounts on document.body, NOT inside the
+    // grid container `el`, so scope these queries to the document. Only one
+    // gallery instance exists at a time (destroy() runs before any rebuild).
+    const findThumbOuter = () => document.querySelector('.lg-thumb-outer');
+    const ensureThumbObserver = () => {
+      const outer = findThumbOuter();
+      if (!outer) return;
+      if (!thumbObserver) {
+        thumbObserver = new IntersectionObserver(
+          (entries) => {
+            for (const entry of entries) {
+              if (entry.isIntersecting) loadThumbImg(entry.target as HTMLImageElement);
+            }
+          },
+          // Preload roughly a strip-width of thumbnails on either side of the
+          // visible filmstrip window before they scroll into view.
+          { root: outer, rootMargin: '0px 300px 0px 300px', threshold: 0 }
+        );
+      }
+      outer.querySelectorAll('img[data-lg-item-id]').forEach((node) => {
+        const img = node as HTMLImageElement;
+        if (img.getAttribute('data-lg-loaded') !== '1') thumbObserver!.observe(img);
+      });
+    };
+    const loadThumbsAround = (idx: number, radius = 8) => {
+      const outer = findThumbOuter();
+      if (!outer) return;
+      const lo = Math.max(0, idx - radius);
+      const hi = Math.min(thumbUrlByIndex.length - 1, idx + radius);
+      for (let i = lo; i <= hi; i++) {
+        const img = outer.querySelector(
+          `img[data-lg-item-id="${i}"]`
+        ) as HTMLImageElement | null;
+        if (img) loadThumbImg(img);
+      }
+    };
+
     // Keep the gallery scroll position in sync with the slideshow. The hash
     // plugin already mirrors the active slide into #lg=1&slide=<assetId>; we
     // read that id from each slide event by index into the dynamicEl we built.
@@ -891,6 +958,13 @@ function GalleryPage({ details }: GalleryPageProps) {
     };
     const onLgAfterOpen = () => {
       lgOpenRef.current = true;
+      // The filmstrip DOM is now visible; start lazily filling its thumbnails.
+      // Retry on the next frame in case the strip isn't queryable yet this tick.
+      ensureThumbObserver();
+      requestAnimationFrame(() => {
+        ensureThumbObserver();
+        if (lgRef.current) loadThumbsAround(lgRef.current.index ?? 0);
+      });
       // The slide hash now owns position; drop the redundant ?at so the two
       // don't disagree (and so a shared in-lightbox URL stays clean).
       try {
@@ -903,7 +977,13 @@ function GalleryPage({ details }: GalleryPageProps) {
     };
     const onLgAfterSlide = (e: Event) => {
       const idx = (e as CustomEvent<{ index: number }>).detail?.index;
-      if (typeof idx === 'number') currentSlideIdRef.current = slideIdAt(idx);
+      if (typeof idx === 'number') {
+        currentSlideIdRef.current = slideIdAt(idx);
+        // Eagerly fill the filmstrip around the active slide so the visible
+        // thumbnails are present even before the observer catches up.
+        ensureThumbObserver();
+        loadThumbsAround(idx);
+      }
     };
     const onLgAfterClose = () => {
       lgOpenRef.current = false;
@@ -950,6 +1030,10 @@ function GalleryPage({ details }: GalleryPageProps) {
       el.removeEventListener('lgAfterOpen', onLgAfterOpen);
       el.removeEventListener('lgAfterSlide', onLgAfterSlide);
       el.removeEventListener('lgAfterClose', onLgAfterClose);
+      if (thumbObserver) {
+        thumbObserver.disconnect();
+        thumbObserver = null;
+      }
       if (lgRef.current) {
         lgRef.current.destroy();
         lgRef.current = null;
