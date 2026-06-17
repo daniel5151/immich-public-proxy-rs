@@ -605,11 +605,24 @@ async fn list_and_cache_tags(
 static IMMICH_API_SEMAPHORE: std::sync::OnceLock<tokio::sync::Semaphore> =
     std::sync::OnceLock::new();
 
-/// Authoritative check that `asset_id` actually carries `tag_id`, by reading the
-/// asset back from Immich. Returns true only on a successful GET whose tag list
-/// contains the id. Any transport/parse error or non-success status returns false
-/// (treated as "not confirmed"), so callers re-link rather than assume success.
-async fn asset_has_tag(client: &ImmichClient, asset_id: &str, tag_id: &str) -> bool {
+/// Tri-state result of reading an asset's tag list back from Immich.
+///
+/// The distinction matters for the deferred guard: it must only re-issue a tag
+/// link when the tag is *confirmed absent*. A transport error, timeout, or parse
+/// failure is `Unknown`, NOT absent — re-applying on an inconclusive read races
+/// Immich into a `tag_asset_pkey` duplicate-key 500 (the link was actually there;
+/// our read just failed). `Unknown` therefore means "don't act this tick".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TagState {
+    Present,
+    Absent,
+    Unknown,
+}
+
+/// Authoritative read of whether `asset_id` carries `tag_id`. Returns `Present`
+/// or `Absent` only on a successful GET we could parse; any transport/parse error
+/// or non-success status is `Unknown` (caller must not treat it as absent).
+async fn asset_tag_state(client: &ImmichClient, asset_id: &str, tag_id: &str) -> TagState {
     let url = client.build_url(&format!("/assets/{}", asset_id), &[]);
     let res = client
         .http_client
@@ -623,14 +636,113 @@ async fn asset_has_tag(client: &ImmichClient, asset_id: &str, tag_id: &str) -> b
             .json::<crate::immich_client::model::Asset>()
             .await
         {
-            Ok(asset_info) => asset_info
-                .tags
-                .as_ref()
-                .map(|tags| tags.iter().any(|t| t.id == tag_id))
-                .unwrap_or(false),
-            Err(_) => false,
+            Ok(asset_info) => {
+                let has = asset_info
+                    .tags
+                    .as_ref()
+                    .map(|tags| tags.iter().any(|t| t.id == tag_id))
+                    .unwrap_or(false);
+                if has {
+                    TagState::Present
+                } else {
+                    TagState::Absent
+                }
+            }
+            Err(_) => TagState::Unknown,
         },
-        _ => false,
+        _ => TagState::Unknown,
+    }
+}
+
+/// Convenience wrapper for callers that only need "confirmed present". A `Present`
+/// state is `true`; both `Absent` and `Unknown` are `false` ("not confirmed"), so
+/// the synchronous PUT+verify path keeps re-linking within its bounded cycles.
+async fn asset_has_tag(client: &ImmichClient, asset_id: &str, tag_id: &str) -> bool {
+    asset_tag_state(client, asset_id, tag_id).await == TagState::Present
+}
+
+/// Outcome of issuing `PUT /tags/{id}/assets` for a single asset, decoded from the
+/// per-asset response body rather than the HTTP status alone.
+///
+/// Immich returns `200 OK` with a body like `[{"id":..,"success":false,"error":
+/// "duplicate"}]` when the link already exists — that is NOT a fresh application
+/// and must not be reported as a restore. A `5xx`/transport failure or a genuine
+/// per-asset error is `Failed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelinkOutcome {
+    /// The tag link was freshly created by this call.
+    Applied,
+    /// The link already existed (`"error":"duplicate"`); nothing changed.
+    AlreadyPresent,
+    /// The call failed (non-success status, transport error, or per-asset error).
+    Failed,
+}
+
+/// Issue `PUT /tags/{id}/assets` for one asset and classify the result from the
+/// per-asset body. Distinguishes a genuine fresh link (`Applied`) from a no-op
+/// duplicate (`AlreadyPresent`) so callers don't mistake an already-present tag
+/// for a restore (and don't fire spurious cache invalidations).
+async fn relink_tag(client: &ImmichClient, asset_id: &str, tag_id: &str) -> RelinkOutcome {
+    let tag_url = client.build_url(&format!("/tags/{}/assets", tag_id), &[]);
+    let res = client
+        .http_client
+        .put(&tag_url)
+        .header("x-api-key", client.upload_api_key.as_ref().unwrap())
+        .json(&serde_json::json!({ "ids": [asset_id] }))
+        .send()
+        .await;
+
+    match res {
+        Ok(r) if r.status().is_success() => {
+            // Body is an array of per-asset results: [{id, success, error?}].
+            match r.json::<serde_json::Value>().await {
+                Ok(body) => {
+                    let entry = body
+                        .as_array()
+                        .and_then(|a| {
+                            a.iter()
+                                .find(|e| e.get("id").and_then(|v| v.as_str()) == Some(asset_id))
+                                .or_else(|| a.first())
+                        });
+                    let success = entry
+                        .and_then(|e| e.get("success").and_then(|v| v.as_bool()))
+                        .unwrap_or(false);
+                    let err = entry
+                        .and_then(|e| e.get("error").and_then(|v| v.as_str()))
+                        .unwrap_or("");
+                    if success {
+                        RelinkOutcome::Applied
+                    } else if err.eq_ignore_ascii_case("duplicate") {
+                        RelinkOutcome::AlreadyPresent
+                    } else {
+                        eprintln!(
+                            "relink: asset {} tag {} PUT 200 but success=false error={:?}",
+                            asset_id, tag_id, err
+                        );
+                        RelinkOutcome::Failed
+                    }
+                }
+                // 200 with an unparseable body: the op was accepted, but don't claim
+                // a fresh apply we can't prove.
+                Err(_) => RelinkOutcome::AlreadyPresent,
+            }
+        }
+        Ok(r) => {
+            eprintln!(
+                "relink: asset {} tag {} PUT returned status {}",
+                asset_id,
+                tag_id,
+                r.status()
+            );
+            RelinkOutcome::Failed
+        }
+        Err(e) => {
+            eprintln!(
+                "relink: asset {} tag {} PUT request failed: {}",
+                asset_id, tag_id, e
+            );
+            RelinkOutcome::Failed
+        }
     }
 }
 
@@ -890,6 +1002,158 @@ async fn tag_and_associate_asset(
     trash_checked && tagged && added_to_album
 }
 
+/// Deferred tag guard: defends against Immich's async metadata-extraction job.
+///
+/// Immich (observed on 2.7.5) runs a metadata-extraction job ~1s after upload that
+/// calls `replaceAssetTags(id, tags_parsed_from_file)`. For files with no embedded
+/// keyword metadata (e.g. Pixel `PXL_*` JPEGs) the parsed set is empty, so the job
+/// REPLACES the asset's whole tag set with `[]` — silently wiping the `SharedBy/...`
+/// tag the proxy applied over the API. Because that wipe can land AFTER the
+/// synchronous PUT+verify in `tag_and_associate_asset` has already confirmed the
+/// tag, the upload is logged `FINISHED ok` yet ends up an orphan.
+///
+/// This guard runs detached, well past the synchronous path, and re-applies the tag
+/// if it has vanished. It terminates only after seeing the tag present on two spaced
+/// checks — i.e. the metadata job has already run and there is no pending wipe — so
+/// it is robust even when extraction is delayed under load. It re-resolves the child
+/// tag id itself (TAG_CACHE fast-path) to stay decoupled from the tagging path.
+async fn deferred_tag_guard(client: &ImmichClient, asset_id: &str, uploader_name: &str, key: &str) {
+    // Guard is on by default; set IPP_TAG_GUARD=0 to disable.
+    let enabled = std::env::var("IPP_TAG_GUARD")
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(true);
+    if !enabled {
+        return;
+    }
+
+    // Inter-check delays in seconds. The first checks straddle the typical ~1s
+    // extraction window; the later ones extend coverage when extraction is delayed
+    // under load. Override with IPP_TAG_GUARD_SCHEDULE="2,4,8,16,30".
+    let schedule: Vec<u64> = std::env::var("IPP_TAG_GUARD_SCHEDULE")
+        .ok()
+        .map(|s| {
+            s.split(',')
+                .filter_map(|p| p.trim().parse::<u64>().ok())
+                .filter(|n| *n > 0)
+                .collect::<Vec<_>>()
+        })
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| vec![2, 4, 8, 16, 30]);
+
+    // Re-resolve the child tag id (cached after the synchronous tagging path ran).
+    let parent_tag_id = get_or_create_tag(client, "SharedBy", None).await;
+    let child_tag_id = match &parent_tag_id {
+        Some(p) => get_or_create_tag(client, uploader_name, Some(p)).await,
+        None => None,
+    };
+    let child_tag_id = match child_tag_id {
+        Some(id) => id,
+        None => {
+            eprintln!(
+                "guard: asset {} could not resolve child tag for uploader {:?}; skipping guard",
+                asset_id, uploader_name
+            );
+            return;
+        }
+    };
+
+    let mut consecutive_present = 0u8;
+    // Tracks whether THIS guard actually re-created a link that Immich had wiped.
+    // Only a real re-apply justifies invalidating the share cache. A no-op
+    // duplicate (link was already there; our prior read was just inconclusive)
+    // must NOT set this.
+    let mut restored = false;
+    for delay in &schedule {
+        tokio::time::sleep(std::time::Duration::from_secs(*delay)).await;
+
+        match asset_tag_state(client, asset_id, &child_tag_id).await {
+            TagState::Present => {
+                consecutive_present += 1;
+                // Two spaced confirmations => extraction has run and link is stable.
+                if consecutive_present >= 2 {
+                    if restored {
+                        // Attribution was genuinely restored after a wipe; refresh
+                        // the share cache so viewers see the corrected uploader.
+                        crate::api::get_share_details::share_cache::invalidate(key);
+                        println!(
+                            "guard: asset {} tag {} restored and now stable",
+                            asset_id, child_tag_id
+                        );
+                    }
+                    return;
+                }
+                continue;
+            }
+            TagState::Unknown => {
+                // Inconclusive read (GET failed/timed out). Do NOT re-PUT: the link
+                // may well be present, and a blind re-apply races Immich into a
+                // tag_asset_pkey duplicate-key 500. Reset the streak and retry next
+                // tick. Don't count this as a confirmed wipe either.
+                consecutive_present = 0;
+                eprintln!(
+                    "guard: asset {} tag {} read inconclusive — deferring to next tick",
+                    asset_id, child_tag_id
+                );
+                continue;
+            }
+            TagState::Absent => {
+                // Confirmed absent — Immich wiped it (or it never settled). Re-apply.
+                consecutive_present = 0;
+                match relink_tag(client, asset_id, &child_tag_id).await {
+                    RelinkOutcome::Applied => {
+                        restored = true;
+                        eprintln!(
+                            "guard: asset {} tag {} (uploader {:?}) was MISSING — re-applied (metadata-extraction wipe)",
+                            asset_id, child_tag_id, uploader_name
+                        );
+                    }
+                    RelinkOutcome::AlreadyPresent => {
+                        // Read said absent, write said duplicate: a benign race
+                        // (the link reappeared between our GET and PUT). Treat as
+                        // present; do not claim a restore or invalidate the cache.
+                        consecutive_present = 1;
+                        eprintln!(
+                            "guard: asset {} tag {} re-link reported duplicate — link already present, no action",
+                            asset_id, child_tag_id
+                        );
+                    }
+                    RelinkOutcome::Failed => {
+                        eprintln!(
+                            "guard: asset {} tag {} re-apply failed — will retry next tick",
+                            asset_id, child_tag_id
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // Schedule exhausted — report final state so a stubborn miss is never silent.
+    match asset_tag_state(client, asset_id, &child_tag_id).await {
+        TagState::Present => {
+            if restored {
+                crate::api::get_share_details::share_cache::invalidate(key);
+            }
+            println!(
+                "guard: asset {} tag {} present at end of guard schedule",
+                asset_id, child_tag_id
+            );
+        }
+        TagState::Unknown => {
+            eprintln!(
+                "guard: asset {} tag {} final read inconclusive — state unverified",
+                asset_id, child_tag_id
+            );
+        }
+        TagState::Absent => {
+            eprintln!(
+                "guard: asset {} tag {} STILL MISSING after guard schedule — orphan persists",
+                asset_id, child_tag_id
+            );
+        }
+    }
+}
+
 pub async fn upload_asset_handler(
     headers: HeaderMap,
     Path(key): Path<String>,
@@ -1117,7 +1381,23 @@ pub async fn upload_asset_handler(
             let expiry = std::time::Duration::from_secs(600); // 10 minutes
             write_guard.retain(|_, (_, timestamp)| now.duration_since(*timestamp) < expiry);
 
-            write_guard.insert(asset_id_clone, (uploader_name_clone, now));
+            write_guard.insert(asset_id_clone.clone(), (uploader_name_clone.clone(), now));
+        }
+
+        // Deferred guard: Immich's async metadata-extraction job can REPLACE this
+        // asset's tag set (with the empty set parsed from a keyword-less file) AFTER
+        // the synchronous PUT+verify above already confirmed the tag, silently
+        // orphaning it. Run a detached guard that re-checks across the extraction
+        // window and re-applies the tag if it vanishes. Only runs once the initial
+        // tag/associate succeeded, so it defends a known-good attribution.
+        if success {
+            let guard_client = client_clone.clone();
+            let guard_asset = asset_id_clone.clone();
+            let guard_uploader = uploader_name_clone.clone();
+            let guard_key = key_clone.clone();
+            tokio::spawn(async move {
+                deferred_tag_guard(&guard_client, &guard_asset, &guard_uploader, &guard_key).await;
+            });
         }
     });
 
