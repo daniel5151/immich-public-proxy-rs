@@ -191,16 +191,21 @@ function GalleryPage({ details }: GalleryPageProps) {
     let needed = defaultInitial;
     try {
       const params = new URLSearchParams(window.location.hash.substring(1));
-      const slideStr = params.get('slide');
-      if (slideStr) {
-        const slideIndex = parseInt(slideStr, 10);
-        if (!isNaN(slideIndex) && slideIndex >= 0) {
-          if (slideIndex < assets.length) {
-            needed = Math.max(needed, Math.min(slideIndex + 1, assets.length));
-          } else {
-            // The requested slide is out of bounds. Clear the hash to prevent lightGallery from crashing.
-            window.location.hash = '';
-          }
+      const slideName = params.get('slide');
+      if (slideName) {
+        // slide is now an asset id (customSlideName). Resolve it to an index in
+        // the full asset list so we pre-render enough tiles for lightGallery to
+        // open it. Falls back to legacy numeric indices for old shared links.
+        let slideIndex = assets.findIndex((a) => a.id === slideName);
+        if (slideIndex < 0) {
+          const legacy = parseInt(slideName, 10);
+          slideIndex = !isNaN(legacy) && legacy >= 0 && legacy < assets.length ? legacy : -1;
+        }
+        if (slideIndex >= 0) {
+          needed = Math.max(needed, Math.min(slideIndex + 1, assets.length));
+        } else {
+          // Unknown slide id. Clear the hash so lightGallery can't crash on it.
+          window.location.hash = '';
         }
       }
     } catch {
@@ -209,8 +214,13 @@ function GalleryPage({ details }: GalleryPageProps) {
     try {
       const atStr = new URLSearchParams(window.location.search).get('at');
       if (atStr) {
-        const at = parseInt(atStr, 10);
-        if (!isNaN(at) && at > 0 && at < assets.length) {
+        // ?at is an asset id; resolve to an index (legacy numeric fallback).
+        let at = assets.findIndex((a) => a.id === atStr);
+        if (at < 0) {
+          const legacy = parseInt(atStr, 10);
+          at = !isNaN(legacy) && legacy > 0 && legacy < assets.length ? legacy : -1;
+        }
+        if (at > 0) {
           // +12 so a little of the next row is rendered below the anchor.
           needed = Math.max(needed, Math.min(at + 12, assets.length));
         }
@@ -584,13 +594,24 @@ function GalleryPage({ details }: GalleryPageProps) {
   const didRestoreScrollRef = useRef(false);
   useEffect(() => {
     if (didRestoreScrollRef.current) return;
-    let targetIdx = NaN;
+    // ?at is now an asset id (filter-independent), so a position captured while
+    // a filter was active still resolves correctly after reload, when the
+    // filter is gone. Legacy numeric ?at values still work as a fallback.
+    let targetId: string | null = null;
     try {
-      const atStr = new URLSearchParams(window.location.search).get('at');
-      if (atStr) targetIdx = parseInt(atStr, 10);
+      targetId = new URLSearchParams(window.location.search).get('at');
     } catch { /* ignore */ }
-    if (isNaN(targetIdx) || targetIdx <= 0 || targetIdx >= filteredAssets.length) {
-      didRestoreScrollRef.current = true; // nothing valid to restore
+    if (!targetId) {
+      didRestoreScrollRef.current = true; // nothing to restore
+      return;
+    }
+    let targetIdx = filteredAssets.findIndex((a) => a.id === targetId);
+    if (targetIdx < 0) {
+      const legacy = parseInt(targetId, 10);
+      targetIdx = !isNaN(legacy) && legacy > 0 && legacy < filteredAssets.length ? legacy : -1;
+    }
+    if (targetIdx <= 0) {
+      didRestoreScrollRef.current = true; // not in the current (filtered) view
       return;
     }
     const el = galleryContainerRef.current?.querySelector<HTMLElement>(
@@ -616,19 +637,23 @@ function GalleryPage({ details }: GalleryPageProps) {
       const container = galleryContainerRef.current;
       if (!container) return;
       const headerLine = headerHeight + 10;
-      // Topmost asset still (partly) below the header line.
+      // Topmost asset still (partly) below the header line. Anchor on its asset
+      // id rather than its list position, so the saved ?at survives a reload
+      // even if the active uploader filter (not persisted) changes the list.
+      let topId: string | null = null;
       let topIdx = 0;
       const items = container.querySelectorAll<HTMLElement>('.gallery-item[data-index]');
       for (const item of items) {
         if (item.getBoundingClientRect().bottom > headerLine) {
+          topId = item.getAttribute('data-asset-id');
           topIdx = parseInt(item.getAttribute('data-index') || '0', 10) || 0;
           break;
         }
       }
       try {
         const url = new URL(window.location.href);
-        if (topIdx > 0) {
-          url.searchParams.set('at', String(topIdx));
+        if (topIdx > 0 && topId) {
+          url.searchParams.set('at', topId);
         } else {
           url.searchParams.delete('at'); // at the top -> clean URL
         }
@@ -741,6 +766,7 @@ function GalleryPage({ details }: GalleryPageProps) {
 
       if (asset.type === 'VIDEO') {
         const item = {
+          slideName: asset.id,
           video: {
             source: [
               {
@@ -765,6 +791,7 @@ function GalleryPage({ details }: GalleryPageProps) {
         return item as unknown as GalleryItem;
       } else {
         const item = {
+          slideName: asset.id,
           src: previewUrl,
           thumb: thumbnailUrl,
           downloadUrl: asset.downloadUrl
@@ -785,6 +812,11 @@ function GalleryPage({ details }: GalleryPageProps) {
       selector: '.gallery-item',
       download: true,
       counter: true,
+      // Identify slides by asset id, not list position. The hash becomes
+      // #lg=1&slide=<assetId>, which resolves to the right photo even when the
+      // active uploader filter (deliberately not persisted in the URL) makes
+      // the filtered list differ from the one the link was created against.
+      customSlideName: true,
       hideScrollbar: true,
       swipeToClose: true,
       preload: 2,
@@ -1279,6 +1311,7 @@ function GalleryPage({ details }: GalleryPageProps) {
                       <a
                         className="gallery-item"
                         data-index={globalIndex}
+                        data-asset-id={asset.id}
                         href={`/share/photo/${realKey}/${asset.id}/preview`}
                         onClick={(e) => {
                           e.preventDefault();
