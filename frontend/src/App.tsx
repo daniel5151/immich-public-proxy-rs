@@ -744,8 +744,13 @@ function GalleryPage({ details }: GalleryPageProps) {
           video: {
             source: [
               {
+                // The proxy serves Immich's /video/playback, which always
+                // transcodes to H.264/AAC MP4 regardless of the original
+                // container. Advertising the original MIME (e.g.
+                // video/quicktime) makes the browser reject the <source> it
+                // can actually play, so always declare video/mp4.
                 src: `/share/video/${realKey}/${asset.id}`,
-                type: asset.originalMimeType || 'video/mp4'
+                type: 'video/mp4'
               }
             ],
             attributes: {
