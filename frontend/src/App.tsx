@@ -479,92 +479,6 @@ function GalleryPage({ details }: GalleryPageProps) {
     return out;
   }, [groups, filteredAssets.length, scrubberHeight]);
 
-  // Track active date group via scroll position
-  useEffect(() => {
-    if (groups.length === 0) return;
-    const headerOffset = headerHeight + HEADER_GAP;
-
-    const onScroll = () => {
-      const headerLine = headerOffset + ACTIVE_LINE_GAP;
-      const usable = scrubberHeight - SCRUBBER_PAD * 2;
-      if (usable <= 0 || scrubberSegments.length === 0) return;
-
-      // Active group = the last one whose top has scrolled up past the header
-      // line. The trailing groups in the final viewport never reach it (the
-      // page bottoms out first), which is exactly why we need the tail handling
-      // below to still carry the indicator to the bottom.
-      let activeIdx = 0;
-      for (let i = 0; i < groups.length; i++) {
-        const el = dateGroupRefs.current.get(groups[i].label);
-        // isConnected guard: after a filter change, date labels can collide
-        // with a previous render, so the map may hold a DETACHED node. Detached
-        // nodes report rect.top === 0, which would pass the test below and drag
-        // activeIdx to a late group — pinning the indicator near the bottom.
-        if (el && el.isConnected && el.getBoundingClientRect().top <= headerLine) activeIdx = i;
-      }
-      setActiveDateLabel(groups[activeIdx]?.label ?? '');
-
-      const seg = scrubberSegments[activeIdx];
-      const activeEl = dateGroupRefs.current.get(groups[activeIdx].label);
-      const activeConnected = !!activeEl && activeEl.isConnected;
-      const thisTop = activeConnected ? activeEl.getBoundingClientRect().top : headerLine;
-      const passed = Math.max(0, headerLine - thisTop);
-
-      // Intra-band progress from the ACTIVE group's own pixel height. This is
-      // robust while lazy-loading: it never depends on the *next* group being
-      // in the DOM yet. (Deriving it from the next group's position made
-      // `needed` Infinity for not-yet-rendered groups, which falsely tripped
-      // the tail sweep below and made the indicator race to the bottom and then
-      // snap back as rows streamed in — the erratic jumping.)
-      const activeH = activeConnected ? activeEl.offsetHeight : 0;
-      const inBand = activeH > 0 ? passed / activeH : 0;
-      const bandFrac = (seg.top + Math.min(1, Math.max(0, inBand)) * seg.height) / usable;
-
-      // The anchored tail sweep (easing the indicator to the very bottom of the
-      // bar) is only meaningful once the whole album is rendered. Until then the
-      // page is still growing, so scrollHeight / "remaining scroll" is bogus —
-      // gating on allRendered is what stops the jumps during initial load.
-      const allRendered = displayCount >= filteredAssets.length;
-      const maxScroll = document.documentElement.scrollHeight - window.innerHeight;
-      const scrollRemaining = Math.max(0, maxScroll - window.scrollY);
-
-      // Distance the page must still scroll for the *next* group to reach the
-      // header line. Infinite for the last group (there is no next).
-      let needed = Infinity;
-      if (activeIdx < groups.length - 1) {
-        const nextEl = dateGroupRefs.current.get(groups[activeIdx + 1].label);
-        if (nextEl && nextEl.isConnected) needed = Math.max(0, nextEl.getBoundingClientRect().top - headerLine);
-      }
-
-      // Tail: the page will bottom out before the next group can activate, so
-      // the active-group walk can't reach the end on its own. Only valid once
-      // everything is rendered (see allRendered note above).
-      const isTail = allRendered && (activeIdx >= groups.length - 1 || scrollRemaining <= needed);
-
-      if (!isTail) {
-        tailAnchorRef.current = null;
-        setIndicatorFrac(Math.min(1, Math.max(0, bandFrac)));
-        return;
-      }
-
-      // Anchor the tail at the band position where we entered it (so there's no
-      // jump), then sweep continuously to the very bottom of the bar as the
-      // remaining page scroll is consumed.
-      if (!tailAnchorRef.current) {
-        tailAnchorRef.current = { startFrac: bandFrac, startScroll: window.scrollY };
-      }
-      const anchor = tailAnchorRef.current;
-      const span = Math.max(1, maxScroll - anchor.startScroll);
-      const sweep = Math.min(1, Math.max(0, (window.scrollY - anchor.startScroll) / span));
-      const frac = anchor.startFrac + (1 - anchor.startFrac) * sweep;
-      setIndicatorFrac(Math.min(1, Math.max(0, frac)));
-    };
-
-    window.addEventListener('scroll', onScroll, { passive: true });
-    onScroll(); // set initial
-    return () => window.removeEventListener('scroll', onScroll);
-  }, [groups, headerHeight, scrubberSegments, scrubberHeight, displayCount, filteredAssets.length]);
-
   // Pixel position of the active date along the bar (for the indicator line).
   const activeIndicatorY = useMemo(() => {
     const usable = scrubberHeight - SCRUBBER_PAD * 2;
@@ -685,11 +599,92 @@ function GalleryPage({ details }: GalleryPageProps) {
     // pass retries (the initializer should have grown the window already).
   }, [displayCount, filteredAssets.length, headerHeight, scrollElementUnderHeader]);
 
-  // Write the current position to the URL, debounced so we don't spam history.
-  // Skipped until the initial restore has settled, so we never overwrite the
-  // incoming ?at= before it's applied.
+  // Track active date group via scroll position
   useEffect(() => {
-    let timer: ReturnType<typeof setTimeout> | null = null;
+    if (groups.length === 0) return;
+    const headerOffset = headerHeight + HEADER_GAP;
+
+    // Visual scroll response: active date label + scrubber indicator position.
+    // Heavy (O(groups) DOM walk), so it runs at most once per frame via rAF.
+    const updateIndicator = () => {
+      const headerLine = headerOffset + ACTIVE_LINE_GAP;
+      const usable = scrubberHeight - SCRUBBER_PAD * 2;
+      if (usable <= 0 || scrubberSegments.length === 0) return;
+
+      // Active group = the last one whose top has scrolled up past the header
+      // line. The trailing groups in the final viewport never reach it (the
+      // page bottoms out first), which is exactly why we need the tail handling
+      // below to still carry the indicator to the bottom.
+      let activeIdx = 0;
+      for (let i = 0; i < groups.length; i++) {
+        const el = dateGroupRefs.current.get(groups[i].label);
+        // isConnected guard: after a filter change, date labels can collide
+        // with a previous render, so the map may hold a DETACHED node. Detached
+        // nodes report rect.top === 0, which would pass the test below and drag
+        // activeIdx to a late group — pinning the indicator near the bottom.
+        if (el && el.isConnected && el.getBoundingClientRect().top <= headerLine) activeIdx = i;
+      }
+      setActiveDateLabel(groups[activeIdx]?.label ?? '');
+
+      const seg = scrubberSegments[activeIdx];
+      const activeEl = dateGroupRefs.current.get(groups[activeIdx].label);
+      const activeConnected = !!activeEl && activeEl.isConnected;
+      const thisTop = activeConnected ? activeEl.getBoundingClientRect().top : headerLine;
+      const passed = Math.max(0, headerLine - thisTop);
+
+      // Intra-band progress from the ACTIVE group's own pixel height. This is
+      // robust while lazy-loading: it never depends on the *next* group being
+      // in the DOM yet. (Deriving it from the next group's position made
+      // `needed` Infinity for not-yet-rendered groups, which falsely tripped
+      // the tail sweep below and made the indicator race to the bottom and then
+      // snap back as rows streamed in — the erratic jumping.)
+      const activeH = activeConnected ? activeEl.offsetHeight : 0;
+      const inBand = activeH > 0 ? passed / activeH : 0;
+      const bandFrac = (seg.top + Math.min(1, Math.max(0, inBand)) * seg.height) / usable;
+
+      // The anchored tail sweep (easing the indicator to the very bottom of the
+      // bar) is only meaningful once the whole album is rendered. Until then the
+      // page is still growing, so scrollHeight / "remaining scroll" is bogus —
+      // gating on allRendered is what stops the jumps during initial load.
+      const allRendered = displayCount >= filteredAssets.length;
+      const maxScroll = document.documentElement.scrollHeight - window.innerHeight;
+      const scrollRemaining = Math.max(0, maxScroll - window.scrollY);
+
+      // Distance the page must still scroll for the *next* group to reach the
+      // header line. Infinite for the last group (there is no next).
+      let needed = Infinity;
+      if (activeIdx < groups.length - 1) {
+        const nextEl = dateGroupRefs.current.get(groups[activeIdx + 1].label);
+        if (nextEl && nextEl.isConnected) needed = Math.max(0, nextEl.getBoundingClientRect().top - headerLine);
+      }
+
+      // Tail: the page will bottom out before the next group can activate, so
+      // the active-group walk can't reach the end on its own. Only valid once
+      // everything is rendered (see allRendered note above).
+      const isTail = allRendered && (activeIdx >= groups.length - 1 || scrollRemaining <= needed);
+
+      if (!isTail) {
+        tailAnchorRef.current = null;
+        setIndicatorFrac(Math.min(1, Math.max(0, bandFrac)));
+        return;
+      }
+
+      // Anchor the tail at the band position where we entered it (so there's no
+      // jump), then sweep continuously to the very bottom of the bar as the
+      // remaining page scroll is consumed.
+      if (!tailAnchorRef.current) {
+        tailAnchorRef.current = { startFrac: bandFrac, startScroll: window.scrollY };
+      }
+      const anchor = tailAnchorRef.current;
+      const span = Math.max(1, maxScroll - anchor.startScroll);
+      const sweep = Math.min(1, Math.max(0, (window.scrollY - anchor.startScroll) / span));
+      const frac = anchor.startFrac + (1 - anchor.startFrac) * sweep;
+      setIndicatorFrac(Math.min(1, Math.max(0, frac)));
+    };
+
+    // Persist the current top asset to the URL (?at=<assetId>), debounced so we
+    // don't spam history. Skipped until the initial restore has settled, so we
+    // never overwrite the incoming ?at= before it's applied.
     const writePosition = () => {
       if (!didRestoreScrollRef.current) return;
       // While the lightbox is open the slide hash owns position; don't fight it
@@ -722,16 +717,28 @@ function GalleryPage({ details }: GalleryPageProps) {
         history.replaceState(history.state, '', url.pathname + url.search + url.hash);
       } catch { /* ignore */ }
     };
+
+    // Single scroll subscription feeding both consumers: the indicator update is
+    // rAF-throttled (coalesces bursts to one run per frame), the URL write is
+    // debounced (fires 200ms after scrolling settles).
+    let rafId: number | null = null;
+    let writeTimer: ReturnType<typeof setTimeout> | null = null;
     const onScroll = () => {
-      if (timer) clearTimeout(timer);
-      timer = setTimeout(writePosition, 200);
+      if (rafId == null) {
+        rafId = requestAnimationFrame(() => { rafId = null; updateIndicator(); });
+      }
+      if (writeTimer) clearTimeout(writeTimer);
+      writeTimer = setTimeout(writePosition, 200);
     };
+
     window.addEventListener('scroll', onScroll, { passive: true });
+    updateIndicator(); // set initial indicator (no URL write until user scrolls)
     return () => {
       window.removeEventListener('scroll', onScroll);
-      if (timer) clearTimeout(timer);
+      if (rafId != null) cancelAnimationFrame(rafId);
+      if (writeTimer) clearTimeout(writeTimer);
     };
-  }, [headerHeight]);
+  }, [groups, headerHeight, scrubberSegments, scrubberHeight, displayCount, filteredAssets.length]);
 
   // Map a pointer Y (relative to the bar's usable area) to the date group whose
   // proportional band contains it, and scrub the page there.
