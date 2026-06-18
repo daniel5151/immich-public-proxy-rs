@@ -46,6 +46,15 @@ body {
     font-family: 'Inter', system-ui, -apple-system, sans-serif;
     margin: 0;
     padding: 0;
+    /* Hide the native window scrollbar — navigation is via the custom date
+       scrubber, which now keeps a faint always-on resting state so there is
+       still a "you are here / more below" affordance. Scoped to the window
+       scroller only; inner scrollers (e.g. .filter-list) keep their bars. */
+    scrollbar-width: none; /* Firefox */
+}
+html::-webkit-scrollbar,
+body::-webkit-scrollbar {
+    display: none; /* Chrome / Safari / Edge */
 }
 
 button,
@@ -555,11 +564,14 @@ body.selection-mode .tile-selector {
     box-sizing: border-box;
     cursor: row-resize;
     touch-action: none;
-    opacity: 0;
+    /* Faint resting state (not fully hidden): with the native scrollbar gone
+       this is the only scroll-position affordance on desktop, so it must stay
+       visible. Goes fully opaque on hover / while scrubbing. */
+    opacity: 0.28;
     transition: opacity 0.25s ease;
 }
 
-/* Reveal on hover, while scrubbing, or on touch devices */
+/* Full reveal on hover, while scrubbing, or on touch devices */
 #lightgallery:hover ~ .date-scrubber,
 .date-scrubber:hover,
 .date-scrubber.scrubbing {
