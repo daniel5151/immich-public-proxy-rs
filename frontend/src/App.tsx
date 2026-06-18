@@ -633,21 +633,34 @@ function GalleryPage({ details }: GalleryPageProps) {
       }
       setActiveDateLabel(groups[activeIdx]?.label ?? '');
 
-      const seg = scrubberSegments[activeIdx];
-      const activeEl = dateGroupRefs.current.get(groups[activeIdx].label);
-      const activeConnected = !!activeEl && activeEl.isConnected;
-      const thisTop = activeConnected ? activeEl.getBoundingClientRect().top : headerLine;
-      const passed = Math.max(0, headerLine - thisTop);
-
-      // Intra-band progress from the ACTIVE group's own pixel height. This is
-      // robust while lazy-loading: it never depends on the *next* group being
-      // in the DOM yet. (Deriving it from the next group's position made
-      // `needed` Infinity for not-yet-rendered groups, which falsely tripped
-      // the tail sweep below and made the indicator race to the bottom and then
-      // snap back as rows streamed in — the erratic jumping.)
-      const activeH = activeConnected ? activeEl.offsetHeight : 0;
-      const inBand = activeH > 0 ? passed / activeH : 0;
-      const bandFrac = (seg.top + Math.min(1, Math.max(0, inBand)) * seg.height) / usable;
+      // --- Indicator position: drive it straight off the TOP-VISIBLE asset's
+      // global index, not accumulated per-group DOM geometry. Loading more
+      // content *below* the viewport cannot change which asset sits at the top
+      // or its index, so this is immune to the lazy-load reflow that made the
+      // indicator bob as rows streamed in. It is mathematically equivalent to
+      // the old proportional band math (segment heights are themselves
+      // asset-count proportional, so band position == index / total), just
+      // measured from one stable number instead of many shifting ones.
+      //
+      // Sub-tile interpolation off the top tile's own height keeps the glide
+      // smooth between index steps. We still find activeIdx above for the date
+      // label and the tail-sweep detection; only the fraction changed.
+      const total = filteredAssets.length;
+      let topIdx = groups[activeIdx]?.items[0].globalIndex ?? 0;
+      let intraTile = 0;
+      const gridEl = galleryContainerRef.current;
+      if (gridEl) {
+        const tiles = gridEl.querySelectorAll<HTMLElement>('.gallery-item[data-index]');
+        for (const tile of tiles) {
+          const r = tile.getBoundingClientRect();
+          if (r.bottom > headerLine) {
+            topIdx = parseInt(tile.getAttribute('data-index') || '0', 10) || 0;
+            if (r.height > 0) intraTile = Math.min(1, Math.max(0, (headerLine - r.top) / r.height));
+            break;
+          }
+        }
+      }
+      const bandFrac = total > 0 ? (topIdx + intraTile) / total : 0;
 
       // The anchored tail sweep (easing the indicator to the very bottom of the
       // bar) is only meaningful once the whole album is rendered. Until then the
