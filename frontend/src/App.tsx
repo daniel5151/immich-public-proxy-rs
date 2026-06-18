@@ -1395,6 +1395,133 @@ function GalleryPage({ details }: GalleryPageProps) {
     };
   };
 
+  // ---------------------------------------------------------------------------
+  // SSE variant of the upload-status flow (server push instead of client poll).
+  //
+  // Toggle this to A/B the two strategies against the same backend. `false` keeps
+  // the existing batched poll loop (`startBatchStatusPoll`); `true` uses the
+  // EventSource stream below (`startStatusStream`). Both expose the SAME controller
+  // shape — `{ add(id), done() }` — so `uploadFiles` doesn't care which it got.
+  const USE_SSE = true;
+
+  // Server-Sent Events alternative to `startBatchStatusPoll`. Instead of the client
+  // re-requesting `/status?ids=...` on a backoff timer, we open ONE long-lived
+  // EventSource and the server pushes each asset as it finishes. That collapses an
+  // entire album drop to a single connection (zero per-tick requests), which is the
+  // friendliest possible shape for the edge rate-limiter (CrowdSec) that the whole
+  // batching effort exists to appease.
+  //
+  // SESSION-SCOPED design (the key improvement): the server now owns the pending
+  // set, keyed by a session token we mint here (`sessionToken`) and send on every
+  // upload POST. The stream is opened for that SESSION, not a frozen id list, so the
+  // server picks up assets uploaded AFTER the stream opened. That removes the old
+  // "open at done()" compromise — we can open the stream the moment the FIRST upload
+  // is dispatched, so photos stream back into the gallery while later files are still
+  // uploading (real progressive appearance, best-possible time-to-first-photo).
+  //
+  // Why not WebSocket (which would also give a dynamic set)? A WS upgrade reintroduces
+  // the edge-layer fragility (1006 drops behind cloudflared/CrowdSec) that plain-HTTP
+  // SSE survives, and we'd lose EventSource's free auto-reconnect. Keeping SSE and
+  // moving the set server-side gets the dynamic behavior at no transport risk.
+  //
+  // `add(id)` is now essentially bookkeeping — the server already learned the id from
+  // the upload POST's `?session=` param. We use the first `add` only as the trigger
+  // to open the stream. `done()` fires the finish beacon so the server can end the
+  // stream as soon as the set drains (instead of waiting out its wall clock).
+  //
+  // Reconnect note: the browser auto-reconnects an EventSource on transient drops; we
+  // don't set event ids, so a reconnect just re-opens the same session URL and the
+  // server re-resolves whatever is still pending (resolved assets were removed from
+  // both PROCESSED_ASSETS and the session registry server-side, so they won't
+  // reappear). We close on the terminal `done` event to stop the auto-reconnect loop.
+  const startStatusStream = () => {
+    // Client-minted session token, tying this drop's uploads to one stream. UUID is
+    // alphanumeric + '-', which the server's is_safe_param validation already allows.
+    const sessionToken =
+      typeof crypto !== 'undefined' && 'randomUUID' in crypto
+        ? crypto.randomUUID()
+        : `sess-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+    let uploadsDone = false;
+    let es: EventSource | null = null;
+
+    const open = () => {
+      if (es) return;
+      es = new EventSource(
+        `/share/${realKey}/status/stream?session=${encodeURIComponent(sessionToken)}`,
+      );
+
+      // `ready` — a fully processed asset; insert exactly like the poll path does.
+      es.addEventListener('ready', (ev) => {
+        try {
+          const asset: SafeAsset = JSON.parse((ev as MessageEvent).data);
+          insertAndSortAsset(asset);
+        } catch (err) {
+          console.error('SSE: failed to parse ready asset:', err);
+        }
+      });
+
+      // `errored` — the server gave up on this id; log and move on (matches poll).
+      es.addEventListener('errored', (ev) => {
+        console.error(`SSE reported error for asset ${(ev as MessageEvent).data}`);
+      });
+
+      // `done` — terminal: the server resolved everything (or hit its wall clock).
+      // Close so the browser doesn't auto-reconnect to a finished stream.
+      es.addEventListener('done', (ev) => {
+        try {
+          const payload: { resolved: number; pending: string[] } = JSON.parse(
+            (ev as MessageEvent).data,
+          );
+          if (payload.pending && payload.pending.length > 0) {
+            console.warn(`SSE stream ended with ${payload.pending.length} asset(s) still pending`);
+          }
+        } catch {
+          // bare `done` fallback carries no JSON — nothing to read, just close.
+        }
+        es?.close();
+        es = null;
+      });
+
+      // Transport-level error. EventSource will try to reconnect on its own; if the
+      // uploads are already finished and we're not making progress, give up so we
+      // don't hold a doomed connection open.
+      es.onerror = () => {
+        console.error('SSE stream connection error');
+        if (uploadsDone) {
+          es?.close();
+          es = null;
+        }
+      };
+    };
+
+    return {
+      // Expose the session token so uploadFiles can attach it to each upload POST.
+      sessionToken,
+      // The server already knows this id (via the upload POST's ?session= param); we
+      // only use the first add() as the cue to open the stream, so assets start
+      // streaming back while later files in the drop are still uploading.
+      add: (_id: string) => {
+        open();
+      },
+      done: () => {
+        uploadsDone = true;
+        // Fire-and-forget finish beacon so the server can end the stream as soon as
+        // the pending set drains rather than waiting out its wall clock. keepalive
+        // lets it survive if the tab is closing. A failure here is non-fatal — the
+        // server's wall-clock guard still terminates the stream.
+        void fetch(
+          `/share/${realKey}/upload/finish?session=${encodeURIComponent(sessionToken)}`,
+          { method: 'POST', keepalive: true },
+        ).catch(() => {
+          /* best-effort; wall clock is the backstop */
+        });
+        // If no uploads ever succeeded the stream was never opened — nothing to do.
+      },
+    };
+  };
+
+
   const uploadFiles = async (files: File[]) => {
     if (files.length === 0) return;
 
@@ -1407,9 +1534,20 @@ function GalleryPage({ details }: GalleryPageProps) {
     let success = true;
     let failedName = '';
 
-    // Start the single streaming poll loop up front so each asset can flow back
-    // into the gallery the moment its own upload completes.
-    const poller = startBatchStatusPoll();
+    // Start the status watcher up front so each asset can flow back into the
+    // gallery as soon as it's ready. Both implementations share the same
+    // { add(id), done() } controller shape; `USE_SSE` selects server-push (SSE)
+    // vs. the batched client poll. (For SSE, `add` only buffers ids and the stream
+    // actually opens on `done()` — see startStatusStream for why.)
+    const poller = USE_SSE ? startStatusStream() : startBatchStatusPoll();
+
+    // SSE uses a server-tracked, session-scoped pending set: tag every upload with
+    // the controller's session token so the open stream picks the asset up on its
+    // next tick. The poll path has no session token, so the param is simply omitted.
+    const sessionToken = 'sessionToken' in poller ? poller.sessionToken : undefined;
+    const uploadUrl = sessionToken
+      ? `/share/${realKey}/upload?session=${encodeURIComponent(sessionToken)}`
+      : `/share/${realKey}/upload`;
 
     for (let i = 0; i < count; i++) {
       const file = files[i];
@@ -1423,7 +1561,7 @@ function GalleryPage({ details }: GalleryPageProps) {
       formData.append('fileModifiedAt', fileDate);
 
       try {
-        const res = await fetch(`/share/${realKey}/upload`, {
+        const res = await fetch(uploadUrl, {
           method: 'POST',
           body: formData,
           headers: {

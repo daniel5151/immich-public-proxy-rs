@@ -9,6 +9,9 @@ use axum::http::HeaderMap;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::response::Redirect;
+use axum::response::sse::Event;
+use axum::response::sse::KeepAlive;
+use axum::response::sse::Sse;
 use serde::Deserialize;
 
 pub trait ProxyRoutes {
@@ -32,9 +35,25 @@ impl<T: Clone + Send + Sync + 'static> ProxyRoutes for axum::Router<T> {
             "/share/{key}/upload",
             axum::routing::post(upload_asset_handler),
         )
+        // Finish beacon for the session-scoped SSE stream: the client hits this once
+        // its upload loop ends so the stream can terminate promptly (see
+        // `mark_upload_session_done_handler` / `mod upload_sessions`).
+        .route(
+            "/share/{key}/upload/finish",
+            axum::routing::post(mark_upload_session_done_handler),
+        )
         .route(
             "/share/{key}/status",
             axum::routing::get(upload_status_batch_handler),
+        )
+        // SSE variant of the batched status endpoint. Server-push alternative to the
+        // poll loop above, kept side-by-side for comparison/testing (see
+        // `upload_status_stream_handler`). NB: this route must be registered *before*
+        // the `/status/{asset_id}` catch-all below, otherwise axum would match the
+        // literal segment "stream" as an `asset_id`.
+        .route(
+            "/share/{key}/status/stream",
+            axum::routing::get(upload_status_stream_handler),
         )
         .route(
             "/share/{key}/status/{asset_id}",
@@ -444,6 +463,116 @@ static TAG_LOCKS: std::sync::OnceLock<
 static PROCESSED_ASSETS: std::sync::OnceLock<
     parking_lot::RwLock<std::collections::HashMap<String, (String, std::time::Instant)>>,
 > = std::sync::OnceLock::new();
+
+// ---------------------------------------------------------------------------
+// Upload-session registry — backs the SESSION-SCOPED SSE status stream.
+//
+// History / rationale (keep this — it's the whole reason this module exists):
+// The first SSE cut took a fixed `ids=` list captured when the EventSource was
+// opened. EventSource is GET-only with an immutable URL, so the id set could not
+// grow on an open stream; the client therefore had to wait until *every* upload
+// had been dispatched before opening the stream with the final id list. That
+// defeated the entire point of progressive appearance — time-to-first-photo on a
+// big drop was gated on the slowest-to-dispatch upload.
+//
+// A WebSocket was considered for the dynamic client->server channel and rejected:
+// a WS upgrade reintroduces the edge-layer fragility (1006 drops behind the
+// cloudflared/CrowdSec proxy) that plain-HTTP SSE/polling survive cleanly, and
+// EventSource gives auto-reconnect for free. So instead we keep SSE (HTTP-only,
+// robust through the edge) and move pending-set OWNERSHIP server-side:
+//
+//   * Each upload is tagged with a client-generated session token.
+//   * The stream is opened for that *session*, not a frozen id list.
+//   * Every tick the stream re-reads the session's CURRENT pending set, so assets
+//     uploaded *after* the stream opened are picked up automatically — no URL
+//     churn, no second connection, no client->server push channel.
+//
+// The session token is minted by the client (crypto.randomUUID) and passed as the
+// `session` query param on each upload POST and on the stream open. It's validated
+// with the same `is_safe_param` rule as every other path segment (a UUID is
+// alphanumeric + '-', which that rule already permits).
+mod upload_sessions {
+    use std::collections::{HashMap, HashSet};
+    use std::time::{Duration, Instant};
+
+    struct Session {
+        /// Asset ids uploaded under this session not yet resolved by a stream.
+        /// GROWS as uploads land mid-stream; shrinks as the stream resolves them.
+        pending: HashSet<String>,
+        /// Set once the client's finish beacon fires: no more uploads are coming.
+        /// The stream ends when this is true AND `pending` has drained.
+        uploads_finished: bool,
+        /// Creation time, for TTL sweeping of abandoned sessions.
+        created: Instant,
+    }
+
+    static SESSIONS: std::sync::OnceLock<parking_lot::RwLock<HashMap<String, Session>>> =
+        std::sync::OnceLock::new();
+
+    /// Abandoned-session TTL. Generous (matches PROCESSED_ASSETS' 10-min expiry) so a
+    /// slow-processing batch or a brief reconnect gap never drops a live session; the
+    /// stream's own ~120s wall-clock is the real per-connection bound.
+    const SESSION_TTL: Duration = Duration::from_secs(600);
+
+    fn map() -> &'static parking_lot::RwLock<HashMap<String, Session>> {
+        SESSIONS.get_or_init(|| parking_lot::RwLock::new(HashMap::new()))
+    }
+
+    /// Register a freshly-uploaded asset id under `session`, creating the session on
+    /// first use. Also lazily sweeps sessions older than the TTL (same cheap
+    /// retain-on-write pattern as `status_link_cache::put`) so abandoned ones can't
+    /// leak.
+    pub(super) fn add_pending(session: &str, asset_id: &str) {
+        let mut guard = map().write();
+        let now = Instant::now();
+        guard.retain(|_, s| now.duration_since(s.created) < SESSION_TTL);
+        let entry = guard.entry(session.to_string()).or_insert_with(|| Session {
+            pending: HashSet::new(),
+            uploads_finished: false,
+            created: now,
+        });
+        entry.pending.insert(asset_id.to_string());
+    }
+
+    /// Mark a session's uploads complete. No-op if the session is unknown (e.g. the
+    /// finish beacon raced ahead of registration — unlikely, but harmless).
+    pub(super) fn mark_finished(session: &str) {
+        if let Some(s) = map().write().get_mut(session) {
+            s.uploads_finished = true;
+        }
+    }
+
+    /// Snapshot the session's current pending ids. `None` if the session is unknown
+    /// (never created, or already cleaned up).
+    pub(super) fn snapshot_pending(session: &str) -> Option<Vec<String>> {
+        map()
+            .read()
+            .get(session)
+            .map(|s| s.pending.iter().cloned().collect())
+    }
+
+    /// True once the client has signaled no more uploads are coming. Unknown sessions
+    /// report false (keep waiting until the stream's wall-clock guard fires).
+    pub(super) fn is_finished(session: &str) -> bool {
+        map()
+            .read()
+            .get(session)
+            .map(|s| s.uploads_finished)
+            .unwrap_or(false)
+    }
+
+    /// Drop an id from the session's pending set once the stream has resolved it.
+    pub(super) fn remove_pending(session: &str, asset_id: &str) {
+        if let Some(s) = map().write().get_mut(session) {
+            s.pending.remove(asset_id);
+        }
+    }
+
+    /// Remove the whole session (called when its stream terminates).
+    pub(super) fn remove_session(session: &str) {
+        map().write().remove(session);
+    }
+}
 
 async fn get_or_create_tag(
     client: &ImmichClient,
@@ -1161,6 +1290,10 @@ async fn deferred_tag_guard(client: &ImmichClient, asset_id: &str, uploader_name
 pub async fn upload_asset_handler(
     headers: HeaderMap,
     Path(key): Path<String>,
+    // Optional `?session=TOKEN` ties this upload to a session-scoped SSE stream (see
+    // `mod upload_sessions`). `Query` reads only the URI, so it's safe to extract
+    // before the body-consuming `Request`.
+    Query(params): Query<std::collections::HashMap<String, String>>,
     req: Request,
 ) -> impl IntoResponse {
     if !is_safe_param(&key) {
@@ -1349,6 +1482,18 @@ pub async fn upload_asset_handler(
         "upload: asset {} accepted (status={:?}, uploader={:?}, key={})",
         asset_id, upload_resp.status, uploader_name, key
     );
+
+    // Session-scoped SSE support: if the client supplied an upload session token,
+    // register this asset id under it so an already-open status stream picks it up on
+    // its next tick (see `mod upload_sessions`). This is what lets photos stream back
+    // while later files in the same drop are still uploading. The token is validated
+    // with the same is_safe_param rule as every path segment; an absent/invalid token
+    // is a no-op, so the poll path and the legacy ids= stream are unaffected.
+    if let Some(session) = params.get("session") {
+        if !session.is_empty() && is_safe_param(session) {
+            upload_sessions::add_pending(session, &asset_id);
+        }
+    }
 
     // Album contents just changed; drop any cached share response so the next load
     // rebuilds (IDEAS #6 invalidation). Re-invalidated below once tagging/association
@@ -1707,6 +1852,326 @@ pub async fn upload_status_batch_handler(
     )
         .into_response()
 }
+
+/// Session-scoped SSE upload-status stream:
+/// `GET /share/{key}/status/stream?session=TOKEN`
+/// (legacy `?ids=a,b,c` is still accepted for back-compat — see below).
+///
+/// This is a *server-push* alternative to `upload_status_batch_handler`, kept
+/// deliberately side-by-side with the poll endpoints (not a replacement) so the
+/// two strategies can be A/B'd against the same backend. The motivation is the
+/// same polling-storm / CrowdSec rationale documented on the batch handler: a big
+/// album drop used to spray the edge with request bursts. The batch endpoint
+/// already collapses that to one request per tick; SSE goes one step further and
+/// collapses it to a *single* long-lived connection for the whole batch — the
+/// client opens one stream and the server pushes each asset as it finishes, so
+/// there are zero per-tick HTTP requests hitting the rate-limiter.
+///
+/// ## Why session-scoped (the important evolution over the first SSE cut)
+/// The first version froze a `?ids=` list at stream-open time. Because EventSource
+/// is GET-only with an immutable URL, the id set couldn't grow once the stream was
+/// open, so the client had to defer opening the stream until *every* upload was
+/// dispatched — killing time-to-first-photo, which is the entire point of
+/// progressive appearance. A WebSocket (the obvious dynamic client->server channel)
+/// was considered and rejected: a WS upgrade reintroduces the edge-layer fragility
+/// (1006 drops behind cloudflared/CrowdSec) that plain-HTTP SSE survives, and loses
+/// EventSource's free auto-reconnect. The fix keeps SSE but moves pending-set
+/// ownership server-side: the upload handler tags each asset with a client-minted
+/// `session` token, and this stream watches the session's CURRENT pending set every
+/// tick. Assets uploaded *after* the stream opened are therefore picked up
+/// automatically — no URL churn, no second connection, no client push channel. The
+/// client can (and does) open the stream as soon as the first upload is dispatched.
+///
+/// Protocol (named SSE events; the client uses `addEventListener` per name):
+///   - `ready`   — data is the finished `SafeAsset` as JSON (one event per asset).
+///   - `errored` — data is the bare asset id string that failed to resolve.
+///   - `done`    — terminal event; data is `{ "resolved": N, "pending": [id...] }`.
+///     Sent exactly once, after which the server closes the stream.
+///
+/// ## Termination
+/// A session stream can't end just because its pending set is momentarily empty —
+/// more uploads in the same drop may still be in flight. It ends when EITHER:
+///   * the client's finish beacon (`POST /share/{key}/upload/finish?session=...`)
+///     has fired AND the pending set has drained, OR
+///   * the ~120s wall-clock ceiling is hit (guards a stuck asset / lost beacon).
+///
+/// On termination we emit `done` and remove the session from the registry.
+///
+/// Validation mirrors the batch endpoint: `is_safe_param` on the key and token,
+/// the 256-id `MAX_BATCH` cap on the legacy ids path, and a single
+/// `validate_upload_link` call (which reuses the short-TTL permission cache), so the
+/// share key is validated ONCE for the life of the stream rather than once per poll.
+/// Inside the stream we reuse `resolve_uploaded_asset` for every id — no
+/// upstream-call logic is duplicated.
+pub async fn upload_status_stream_handler(
+    headers: HeaderMap,
+    Path(key): Path<String>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    if !is_safe_param(&key) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
+    const MAX_BATCH: usize = 256;
+
+    // Two modes, primary first:
+    //   * session mode (`?session=TOKEN`): server-tracked, dynamically-growing set.
+    //   * legacy ids mode (`?ids=a,b,c`): a fixed list, kept for back-compat with the
+    //     first SSE cut. Mutually exclusive; `session` wins if both are present.
+    let session = params
+        .get("session")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let legacy_ids: Vec<String> = params
+        .get("ids")
+        .map(|raw| {
+            raw.split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Validate whichever selector we got.
+    match &session {
+        Some(tok) => {
+            if !is_safe_param(tok) {
+                return StatusCode::BAD_REQUEST.into_response();
+            }
+        }
+        None => {
+            if legacy_ids.is_empty() {
+                return StatusCode::BAD_REQUEST.into_response();
+            }
+            if legacy_ids.len() > MAX_BATCH || legacy_ids.iter().any(|id| !is_safe_param(id)) {
+                return StatusCode::BAD_REQUEST.into_response();
+            }
+        }
+    }
+
+    let client = ImmichClient::new();
+    if client.upload_api_key.is_none() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+
+    // Validate the share key ONCE for the whole stream (reuses the permission cache).
+    let cookie_password = get_cookie_password(&headers, &key);
+    let meta = match validate_upload_link(&client, &key, cookie_password.as_deref()).await {
+        Ok(m) => m,
+        Err(status) => return status.into_response(),
+    };
+    if !meta.is_album || !meta.allow_upload {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+
+    // Per-connection driver state. `stream::unfold` calls our async closure once per
+    // yielded item; we keep a small output buffer because a single poll tick can
+    // resolve several assets at once (each becomes its own SSE event) while unfold
+    // yields one item per call.
+    //
+    // `session` distinguishes the two modes: `Some` => read the live pending set from
+    // the registry each tick (it can grow); `None` => babysit the frozen `pending`
+    // list captured from the legacy `ids=` param.
+    struct StreamState {
+        client: ImmichClient,
+        key: String,
+        allow_download: bool,
+        session: Option<String>,
+        pending: Vec<String>,
+        resolved: usize,
+        out: std::collections::VecDeque<Event>,
+        start: std::time::Instant,
+        delay_ms: u64,
+        finished: bool,
+    }
+
+    // Same cadence spirit as the poll loop: 500ms -> 1s -> 2s (capped). A freshly
+    // resolved asset resets the delay so its siblings stream in quickly.
+    const MIN_DELAY_MS: u64 = 500;
+    const MAX_DELAY_MS: u64 = 2000;
+    const MAX_WALL_MS: u128 = 120_000;
+
+    let init = StreamState {
+        client,
+        key,
+        allow_download: meta.allow_download,
+        session,
+        pending: legacy_ids, // empty in session mode; the registry is the source of truth there
+        resolved: 0,
+        out: std::collections::VecDeque::new(),
+        start: std::time::Instant::now(),
+        delay_ms: MIN_DELAY_MS,
+        finished: false,
+    };
+
+    // The done payload reports how many resolved and which ids (if any) were still
+    // pending at termination, so the client can stop waiting on them.
+    #[derive(serde::Serialize)]
+    struct DonePayload {
+        resolved: usize,
+        pending: Vec<String>,
+    }
+
+    let stream = futures_util::stream::unfold(init, move |mut st| async move {
+        loop {
+            // 1) Drain any already-buffered events first (one per unfold call).
+            if let Some(ev) = st.out.pop_front() {
+                return Some((Ok::<Event, std::convert::Infallible>(ev), st));
+            }
+
+            // 2) Nothing buffered and we've already sent `done` — end the stream.
+            if st.finished {
+                // Session mode: tear down the registry entry now that we're closing.
+                if let Some(ref sess) = st.session {
+                    upload_sessions::remove_session(sess);
+                }
+                return None;
+            }
+
+            // 3) Refresh the pending set.
+            //    * session mode: re-read the registry — this is where newly-uploaded
+            //      ids (added after the stream opened) enter the working set.
+            //    * legacy mode: `st.pending` is already the working set.
+            let timed_out = st.start.elapsed().as_millis() >= MAX_WALL_MS;
+            let uploads_finished = match st.session {
+                Some(ref sess) => {
+                    if let Some(live) = upload_sessions::snapshot_pending(sess) {
+                        st.pending = live;
+                    }
+                    upload_sessions::is_finished(sess)
+                }
+                // Legacy ids mode has no finish beacon; it's "finished" by definition
+                // (the id list never grows), so draining the list ends the stream.
+                None => true,
+            };
+
+            // 4) Terminal conditions. In session mode we must NOT end on an empty
+            //    pending set alone — more uploads may still be coming; we wait until
+            //    the client's finish beacon has fired (uploads_finished) AND the set
+            //    has drained. The wall clock is the backstop for a lost beacon or a
+            //    permanently stuck asset.
+            let drained_and_done = st.pending.is_empty() && uploads_finished;
+            if drained_and_done || timed_out {
+                if timed_out && !st.pending.is_empty() {
+                    eprintln!("status stream: timed out for {} asset(s)", st.pending.len());
+                }
+                let payload = DonePayload {
+                    resolved: st.resolved,
+                    pending: std::mem::take(&mut st.pending),
+                };
+                let done = match Event::default().event("done").json_data(&payload) {
+                    Ok(ev) => ev,
+                    // Serializing a Vec<String>/usize cannot realistically fail; if it
+                    // somehow does, fall back to a bare `done` so the client still closes.
+                    Err(_) => Event::default().event("done").data(""),
+                };
+                st.finished = true;
+                return Some((Ok(done), st));
+            }
+
+            // 5) If the set is momentarily empty but uploads aren't finished (session
+            //    mode, waiting for the next file to land), idle one short tick rather
+            //    than busy-looping, then re-check.
+            if st.pending.is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(MIN_DELAY_MS)).await;
+                continue;
+            }
+
+            // 6) Otherwise wait one tick, then resolve the still-pending ids. Same
+            //    backoff as the poll loop — but here it just paces a single in-process
+            //    loop, it does NOT translate into client requests.
+            tokio::time::sleep(std::time::Duration::from_millis(st.delay_ms)).await;
+            st.delay_ms = (st.delay_ms * 2).min(MAX_DELAY_MS);
+
+            let mut still_pending: Vec<String> = Vec::with_capacity(st.pending.len());
+            let mut made_progress = false;
+            // Iterate over a snapshot so we can rebuild `pending` cleanly.
+            let snapshot = std::mem::take(&mut st.pending);
+            for id in snapshot {
+                match resolve_uploaded_asset(&st.client, &st.key, &id, st.allow_download).await {
+                    UploadedAssetStatus::Ready(asset) => {
+                        match Event::default().event("ready").json_data(&*asset) {
+                            Ok(ev) => st.out.push_back(ev),
+                            Err(e) => {
+                                eprintln!("status stream: failed to serialize asset: {}", e);
+                            }
+                        }
+                        // Resolved — drop it from the session registry too so a
+                        // reconnect (which re-reads the registry) won't re-emit it.
+                        if let Some(ref sess) = st.session {
+                            upload_sessions::remove_pending(sess, &id);
+                        }
+                        st.resolved += 1;
+                        made_progress = true;
+                    }
+                    UploadedAssetStatus::Error => {
+                        st.out.push_back(Event::default().event("errored").data(id.clone()));
+                        if let Some(ref sess) = st.session {
+                            upload_sessions::remove_pending(sess, &id);
+                        }
+                        made_progress = true;
+                    }
+                    UploadedAssetStatus::Pending => still_pending.push(id),
+                }
+            }
+            // In session mode the registry is authoritative and may have grown while we
+            // were resolving; don't clobber it with our stale snapshot. We only need to
+            // carry `still_pending` forward in legacy mode (no registry to re-read).
+            if st.session.is_none() {
+                st.pending = still_pending;
+            }
+
+            // A resolved/errored asset resets the cadence so siblings stream in fast.
+            if made_progress {
+                st.delay_ms = MIN_DELAY_MS;
+            }
+            // Loop back: emit buffered events, or (if all still pending) tick again.
+        }
+    });
+
+    // KeepAlive holds the connection through quiet stretches (e.g. a slow-to-process
+    // asset) so intermediaries don't reap an idle stream; it emits a `: comment` line
+    // every 15s, which EventSource silently ignores.
+    Sse::new(stream)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(std::time::Duration::from_secs(15))
+                .text("keep-alive"),
+        )
+        .into_response()
+}
+
+/// Finish beacon for the session-scoped SSE stream:
+/// `POST /share/{key}/upload/finish?session=TOKEN`.
+///
+/// The client calls this once its upload loop ends. It flips the session's
+/// `uploads_finished` flag so the stream can terminate as soon as the pending set
+/// drains, instead of waiting out the full wall-clock ceiling. Body-less; returns
+/// 204. An unknown/invalid token is a harmless no-op (still 204) — the stream's
+/// wall clock is the backstop either way. CSRF-checked like the upload endpoint
+/// since it mutates session state.
+pub async fn mark_upload_session_done_handler(
+    headers: HeaderMap,
+    Path(key): Path<String>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    if !is_safe_param(&key) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    if !check_csrf(&headers) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    match params.get("session") {
+        Some(tok) if !tok.is_empty() && is_safe_param(tok) => {
+            upload_sessions::mark_finished(tok);
+            StatusCode::NO_CONTENT.into_response()
+        }
+        _ => StatusCode::BAD_REQUEST.into_response(),
+    }
+}
+
 
 pub async fn upload_status_handler(
     headers: HeaderMap,
