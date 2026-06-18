@@ -1554,7 +1554,16 @@ function GalleryPage({ details }: GalleryPageProps) {
                   return (
                     <div
                       key={asset.id}
-                      className={`tile-wrapper ${isAssetSelected ? 'selected' : ''} ${loadedAssetsRef.current.has(asset.id) ? 'loaded' : ''}`}
+                      className={`tile-wrapper ${isAssetSelected ? 'selected' : ''}`}
+                      // Seed the 'loaded' class from a ref callback (post-render,
+                      // so reading the ref is allowed) rather than during render.
+                      // This keeps an already-loaded thumbnail from replaying the
+                      // shimmer/fade-in when the tile re-renders (e.g. on selection
+                      // or filter changes), while the <img> onLoad below is what
+                      // first adds the class as each thumbnail finishes loading.
+                      ref={(el) => {
+                        if (el && loadedAssetsRef.current.has(asset.id)) el.classList.add('loaded');
+                      }}
                       style={{ flexBasis, flexGrow: aspect }}
                     >
                       <div
