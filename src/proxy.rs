@@ -1361,6 +1361,20 @@ pub async fn upload_asset_handler(
         }
     };
 
+    // The upload (service-account) key may itself OWN the album, in which case it can
+    // already add assets directly and does not need to be granted editor access. Only
+    // attempt the admin editor-grant when the upload user is a *different* user from the
+    // album owner. Note: after an API-key rotation the admin key can belong to a
+    // different user than the album owner, so the grant 400s with "no album.share
+    // access" — but that grant is unnecessary whenever the upload user is the owner
+    // (the common case), so we skip it rather than retrying (and re-logging) per upload.
+    let upload_user_is_owner = share_link
+        .album
+        .as_ref()
+        .and_then(|a| a.owner.as_ref())
+        .map(|o| o.id == service_account_user_id)
+        .unwrap_or(false);
+
     let is_added = {
         let cache =
             ADDED_ALBUMS.get_or_init(|| parking_lot::RwLock::new(std::collections::HashSet::new()));
@@ -1368,7 +1382,7 @@ pub async fn upload_asset_handler(
         read_guard.contains(album_id)
     };
 
-    if !is_added {
+    if !is_added && !upload_user_is_owner {
         let add_users_body = serde_json::json!({
             "albumUsers": [
                 {
@@ -1380,24 +1394,22 @@ pub async fn upload_asset_handler(
         let add_res = client
             .admin_put(&format!("/albums/{}/users", album_id), &add_users_body)
             .await;
-        let mut add_success = false;
         if let Some(res) = add_res {
             let status = res.status();
             if status.is_success() || status == StatusCode::CONFLICT {
-                add_success = true;
+                // granted (or already a member)
             } else if status == StatusCode::BAD_REQUEST {
                 let body = res.text().await.unwrap_or_default();
-                if body.contains("already") {
-                    add_success = true;
-                } else {
+                if !body.contains("already") {
                     eprintln!(
-                        "upload: failed to add service account to album {}: status {} — {}",
+                        "upload: could not grant service account editor on album {} (status {} — {}); \
+                         proceeding (upload user may already have access via the share)",
                         album_id, status, body
                     );
                 }
             } else {
                 eprintln!(
-                    "upload: failed to add service account to album {}: status {}",
+                    "upload: could not grant service account editor on album {}: status {}",
                     album_id, status
                 );
             }
@@ -1405,11 +1417,12 @@ pub async fn upload_asset_handler(
             eprintln!("upload: failed to send add user request (admin key missing)");
         }
 
-        if add_success {
-            let cache = ADDED_ALBUMS.get().unwrap();
-            let mut write_guard = cache.write();
-            write_guard.insert(album_id.clone());
-        }
+        // Record the attempt regardless of outcome: the editor-grant is best-effort and
+        // non-transient failures (e.g. admin key not the album owner) would just repeat
+        // and spam the log on every subsequent upload. One attempt per album per process.
+        let cache = ADDED_ALBUMS.get().unwrap();
+        let mut write_guard = cache.write();
+        write_guard.insert(album_id.clone());
     }
 
     // Extract crucial headers from the incoming request.
