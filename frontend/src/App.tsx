@@ -391,8 +391,12 @@ function GalleryPage({ details }: GalleryPageProps) {
 
   // Album stats
   const albumStats = useMemo(() => {
-    const photos = filteredAssets.filter(a => a.type !== 'VIDEO').length;
-    const videos = filteredAssets.filter(a => a.type === 'VIDEO').length;
+    let photos = 0;
+    let videos = 0;
+    for (const a of filteredAssets) {
+      if (a.type === 'VIDEO') videos++;
+      else photos++;
+    }
     const parts: string[] = [];
     if (photos > 0) parts.push(`${photos} photo${photos !== 1 ? 's' : ''}`);
     if (videos > 0) parts.push(`${videos} video${videos !== 1 ? 's' : ''}`);
@@ -505,12 +509,15 @@ function GalleryPage({ details }: GalleryPageProps) {
       scrollElementUnderHeader(el, !isScrubbing);
       return;
     }
-    // Not rendered yet — grow displayCount to include it, then let the pending
-    // effect scroll once it mounts.
+    // Not rendered yet — grow displayCount to include it if needed, then always
+    // queue the pending scroll so the jump still lands once the group's ref
+    // attaches. (Previously this only queued inside the displayCount<=startIndex
+    // branch, so a group already inside the window but not yet mounted — its ref
+    // not in the map — would silently fail to scroll.)
     if (displayCount <= startIndex) {
       setDisplayCount(Math.min(startIndex + 24, filteredAssets.length));
-      pendingScrollRef.current = () => dateGroupRefs.current.get(label);
     }
+    pendingScrollRef.current = () => dateGroupRefs.current.get(label);
   };
 
   // Scroll the grid so a given asset id sits just under the header, growing the
@@ -592,6 +599,11 @@ function GalleryPage({ details }: GalleryPageProps) {
     }
     // If not rendered yet, leave the guard unset so the next displayCount/render
     // pass retries (the initializer should have grown the window already).
+    //
+    // Intentionally keyed on filteredAssets.length, not the array: this restores
+    // ONCE on mount and must not re-run (re-jump) when the same-length list is
+    // re-derived.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [displayCount, filteredAssets.length, headerHeight, scrollElementUnderHeader]);
 
   // Track active date group via scroll position
@@ -782,6 +794,10 @@ function GalleryPage({ details }: GalleryPageProps) {
         scrubRafRef.current = null;
       }
     };
+    // scrubToClientY is re-created every render; depending on it would tear down
+    // and re-bind the drag listeners mid-drag. The deps that actually affect the
+    // mapping are listed.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isScrubbing, scrubberSegments, scrubberHeight]);
 
   // Lazy load intersection observer — operates on filteredAssets
@@ -1106,7 +1122,10 @@ function GalleryPage({ details }: GalleryPageProps) {
     };
   // NB: displayCount intentionally omitted — dynamicEl is built from the full
   // filteredAssets, so lazy-load growth must NOT tear down and rebuild the
-  // lightbox (which also caused the counter to jump).
+  // lightbox (which also caused the counter to jump). scrollGridToAssetId is
+  // likewise omitted on purpose: it's re-created each render and only invoked
+  // from the lightbox close callback, not needed as a re-init trigger.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [filteredAssets, realKey]);
 
   // Toggles and selection behaviors
