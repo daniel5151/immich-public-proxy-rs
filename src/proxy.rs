@@ -33,6 +33,10 @@ impl<T: Clone + Send + Sync + 'static> ProxyRoutes for axum::Router<T> {
             axum::routing::post(upload_asset_handler),
         )
         .route(
+            "/share/{key}/status",
+            axum::routing::get(upload_status_batch_handler),
+        )
+        .route(
             "/share/{key}/status/{asset_id}",
             axum::routing::get(upload_status_handler),
         )
@@ -1413,10 +1417,305 @@ pub async fn upload_asset_handler(
         .into_response()
 }
 
+// ---------------------------------------------------------------------------
+// Upload-status validation + resolution helpers (shared by the single-asset and
+// batched status endpoints). See IDEAS.local.md "avoid slamming the status
+// endpoint": a big album drop used to spawn one 500ms poll loop *per asset*, and
+// every poll re-validated the share key via `fetch_share_me` (an upstream hit) on
+// top of the thumbnail/asset reads. That amplified N uploads into ~3N upstream
+// calls/sec. These helpers let the batched endpoint validate once per request and
+// reuse a short-TTL permission cache across polls, collapsing the storm.
+// ---------------------------------------------------------------------------
+
+/// Immutable permission facts about a share link, as far as the upload-status
+/// path cares. All `Copy`, so the cache hands back values without cloning.
+#[derive(Clone, Copy)]
+struct UploadLinkMeta {
+    is_album: bool,
+    allow_upload: bool,
+    allow_download: bool,
+}
+
+/// Short-TTL cache of share-link *permission* metadata, keyed by (key, password).
+///
+/// Deliberately separate from `share_cache`: that one caches album *contents* and
+/// is invalidated on every upload, so it would miss constantly during an active
+/// drop. A link's *permissions* (type / allow_upload / allow_download) don't change
+/// when its album contents do, so a stale-but-valid read within the TTL is safe and
+/// lets a burst of status polls skip re-hitting Immich's `/shared-links/me`.
+mod status_link_cache {
+    use super::UploadLinkMeta;
+    use std::collections::HashMap;
+    use std::hash::{Hash, Hasher};
+    use std::time::{Duration, Instant};
+
+    static CACHE: std::sync::OnceLock<
+        parking_lot::RwLock<HashMap<u64, (UploadLinkMeta, Instant)>>,
+    > = std::sync::OnceLock::new();
+
+    fn ttl() -> Duration {
+        static TTL: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+        *TTL.get_or_init(|| {
+            let secs = std::env::var("STATUS_LINK_CACHE_TTL_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(60);
+            Duration::from_secs(secs)
+        })
+    }
+
+    fn entry_hash(key: &str, password: Option<&str>) -> u64 {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut h);
+        match password {
+            Some(p) => {
+                1u8.hash(&mut h);
+                p.hash(&mut h);
+            }
+            None => 0u8.hash(&mut h),
+        }
+        h.finish()
+    }
+
+    pub(super) fn get(key: &str, password: Option<&str>) -> Option<UploadLinkMeta> {
+        let t = ttl();
+        if t.is_zero() {
+            return None;
+        }
+        let cache = CACHE.get()?;
+        let guard = cache.read();
+        let (meta, ts) = guard.get(&entry_hash(key, password))?;
+        if ts.elapsed() < t {
+            Some(*meta)
+        } else {
+            None
+        }
+    }
+
+    pub(super) fn put(key: &str, password: Option<&str>, meta: UploadLinkMeta) {
+        let t = ttl();
+        if t.is_zero() {
+            return;
+        }
+        let cache = CACHE.get_or_init(|| parking_lot::RwLock::new(HashMap::new()));
+        let mut guard = cache.write();
+        guard.retain(|_, (_, ts)| ts.elapsed() < t);
+        guard.insert(entry_hash(key, password), (meta, Instant::now()));
+    }
+}
+
+/// Validate that `key` is an upload-enabled album share, reusing a short-TTL
+/// permission cache so repeated status polls don't each hit Immich. On a cache
+/// miss this calls `fetch_share_me` once and memoizes the result.
+///
+/// `Ok(meta)` means the key resolved; the caller still checks `is_album` /
+/// `allow_upload`. `Err(status)` is an upstream/parse failure to surface verbatim.
+async fn validate_upload_link(
+    client: &ImmichClient,
+    key: &str,
+    password: Option<&str>,
+) -> Result<UploadLinkMeta, StatusCode> {
+    if let Some(meta) = status_link_cache::get(key, password) {
+        return Ok(meta);
+    }
+
+    let share_link = match client.fetch_share_me(key, password).await {
+        Ok((status, text)) if status.is_success() => {
+            match serde_json::from_str::<crate::immich_client::model::SharedLink>(&text) {
+                Ok(link) => link,
+                Err(e) => {
+                    eprintln!("status: failed to parse share link response: {}", e);
+                    return Err(StatusCode::INTERNAL_SERVER_ERROR);
+                }
+            }
+        }
+        Ok((status, _)) => {
+            return Err(StatusCode::from_u16(status.as_u16())
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR));
+        }
+        Err(e) => {
+            eprintln!("status: failed to fetch share link: {}", e);
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
+
+    let meta = UploadLinkMeta {
+        is_album: share_link.r#type.as_deref() == Some("ALBUM"),
+        allow_upload: share_link.allow_upload.unwrap_or(false),
+        allow_download: share_link.allow_download.unwrap_or(false),
+    };
+    status_link_cache::put(key, password, meta);
+    Ok(meta)
+}
+
+/// Outcome of resolving a single just-uploaded asset.
+enum UploadedAssetStatus {
+    /// Still tagging/associating, or thumbnail not yet generated. Keep polling.
+    Pending,
+    /// Fully processed; carries the finished `SafeAsset`.
+    Ready(Box<crate::dto::SafeAsset>),
+    /// A non-recoverable upstream/parse error while resolving this asset.
+    Error,
+}
+
+/// Resolve one asset by id: pending until it's in `PROCESSED_ASSETS` *and* Immich
+/// has generated its thumbnail, then fetch the full asset and build a `SafeAsset`.
+/// On `Ready` the asset is removed from `PROCESSED_ASSETS`. No upstream calls are
+/// made for a still-pending asset (the in-memory map check short-circuits first),
+/// so polling a not-yet-ready batch costs nothing upstream.
+async fn resolve_uploaded_asset(
+    client: &ImmichClient,
+    key: &str,
+    asset_id: &str,
+    allow_download: bool,
+) -> UploadedAssetStatus {
+    let uploader_name = {
+        let cache = PROCESSED_ASSETS
+            .get_or_init(|| parking_lot::RwLock::new(std::collections::HashMap::new()));
+        let read_guard = cache.read();
+        match read_guard.get(asset_id) {
+            Some((name, _)) => name.clone(),
+            None => return UploadedAssetStatus::Pending,
+        }
+    };
+
+    // Thumbnail generated yet?
+    let get_thumb_url =
+        client.build_url(&format!("/assets/{}/thumbnail", asset_id), &[("size", "thumbnail")]);
+    let thumb_res = client
+        .http_client
+        .head(&get_thumb_url)
+        .header("x-api-key", client.upload_api_key.as_ref().unwrap())
+        .send()
+        .await;
+    match thumb_res {
+        Ok(r) if r.status().is_success() => {}
+        _ => return UploadedAssetStatus::Pending,
+    }
+
+    // Fetch final asset info to build a complete SafeAsset.
+    let get_asset_url = client.build_url(&format!("/assets/{}", asset_id), &[]);
+    let asset_res = client
+        .http_client
+        .get(&get_asset_url)
+        .header("x-api-key", client.upload_api_key.as_ref().unwrap())
+        .send()
+        .await;
+    let asset = match asset_res {
+        Ok(r) if r.status().is_success() => match r.json::<crate::immich_client::model::Asset>().await {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("status: failed to parse asset response: {}", e);
+                return UploadedAssetStatus::Error;
+            }
+        },
+        Ok(r) => {
+            eprintln!("status: fetch asset returned status {}", r.status());
+            return UploadedAssetStatus::Error;
+        }
+        Err(e) => {
+            eprintln!("status: fetch asset request failed: {}", e);
+            return UploadedAssetStatus::Error;
+        }
+    };
+
+    let mut safe_asset = crate::dto::SafeAsset::from_base(asset);
+    safe_asset.uploader_name = Some(uploader_name);
+    safe_asset.uploader_is_fallback = false;
+    if allow_download {
+        safe_asset.download_url = Some(format!("/share/photo/{}/{}/original", key, safe_asset.id));
+    }
+
+    // Resolved — drop it from the pending map.
+    {
+        let cache = PROCESSED_ASSETS
+            .get_or_init(|| parking_lot::RwLock::new(std::collections::HashMap::new()));
+        cache.write().remove(asset_id);
+    }
+
+    UploadedAssetStatus::Ready(Box::new(safe_asset))
+}
+
+/// Batched upload-status endpoint: `GET /share/{key}/status?ids=a,b,c`.
+///
+/// Replaces the per-asset polling storm. The frontend keeps a single poll loop for
+/// the whole in-flight batch and sends the still-pending ids; the share key is
+/// validated once per request (cached across polls). Response:
+/// `{ "ready": [SafeAsset...], "pending": ["id"...], "errored": ["id"...] }`.
+pub async fn upload_status_batch_handler(
+    headers: HeaderMap,
+    Path(key): Path<String>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    if !is_safe_param(&key) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
+    // Parse + validate the id list (comma-separated). Cap the batch to bound work.
+    const MAX_BATCH: usize = 256;
+    let ids: Vec<String> = params
+        .get("ids")
+        .map(|raw| {
+            raw.split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    if ids.is_empty() {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    if ids.len() > MAX_BATCH || ids.iter().any(|id| !is_safe_param(id)) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
+    let client = ImmichClient::new();
+    if client.upload_api_key.is_none() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+
+    let cookie_password = get_cookie_password(&headers, &key);
+    let meta = match validate_upload_link(&client, &key, cookie_password.as_deref()).await {
+        Ok(m) => m,
+        Err(status) => return status.into_response(),
+    };
+    if !meta.is_album || !meta.allow_upload {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+
+    let mut ready: Vec<crate::dto::SafeAsset> = Vec::new();
+    let mut pending: Vec<String> = Vec::new();
+    let mut errored: Vec<String> = Vec::new();
+    for id in &ids {
+        match resolve_uploaded_asset(&client, &key, id, meta.allow_download).await {
+            UploadedAssetStatus::Ready(a) => ready.push(*a),
+            UploadedAssetStatus::Pending => pending.push(id.clone()),
+            UploadedAssetStatus::Error => errored.push(id.clone()),
+        }
+    }
+
+    #[derive(serde::Serialize)]
+    struct BatchStatusResponse {
+        ready: Vec<crate::dto::SafeAsset>,
+        pending: Vec<String>,
+        errored: Vec<String>,
+    }
+    (
+        StatusCode::OK,
+        axum::Json(BatchStatusResponse { ready, pending, errored }),
+    )
+        .into_response()
+}
+
 pub async fn upload_status_handler(
     headers: HeaderMap,
     Path((key, asset_id)): Path<(String, String)>,
 ) -> impl IntoResponse {
+    // Back-compat single-asset endpoint. Prefer the batched `/share/{key}/status`
+    // endpoint; this remains so older clients/bookmarks keep working. Shares the
+    // same validation + resolution helpers (and their permission cache) as the
+    // batch path, so it no longer re-implements the upstream calls inline.
     if !is_safe_param(&key) || !is_safe_param(&asset_id) {
         return StatusCode::BAD_REQUEST.into_response();
     }
@@ -1427,104 +1726,18 @@ pub async fn upload_status_handler(
     }
 
     let cookie_password = get_cookie_password(&headers, &key);
-
-    // Validate share key first
-    let share_link = match client
-        .fetch_share_me(&key, cookie_password.as_deref())
-        .await
-    {
-        Ok((status, text)) if status.is_success() => {
-            match serde_json::from_str::<crate::immich_client::model::SharedLink>(&text) {
-                Ok(link) => link,
-                Err(e) => {
-                    eprintln!("status: failed to parse share link response: {}", e);
-                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-                }
-            }
-        }
-        Ok((status, _)) => return status.into_response(),
-        Err(e) => {
-            eprintln!("status: failed to fetch share link: {}", e);
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
+    let meta = match validate_upload_link(&client, &key, cookie_password.as_deref()).await {
+        Ok(m) => m,
+        Err(status) => return status.into_response(),
     };
-
-    if share_link.r#type.as_deref() != Some("ALBUM") || !share_link.allow_upload.unwrap_or(false) {
+    if !meta.is_album || !meta.allow_upload {
         return StatusCode::FORBIDDEN.into_response();
     }
 
-    // Check if the asset is in the PROCESSED_ASSETS map
-    let uploader_name = {
-        let cache = PROCESSED_ASSETS
-            .get_or_init(|| parking_lot::RwLock::new(std::collections::HashMap::new()));
-        let read_guard = cache.read();
-        match read_guard.get(&asset_id) {
-            Some((name, _)) => name.clone(),
-            None => return StatusCode::ACCEPTED.into_response(), // 202 Accepted: still processing tagging / album association
-        }
-    };
-
-    // Check if the thumbnail has been generated by Immich
-    let get_thumb_url = client.build_url(
-        &format!("/assets/{}/thumbnail", asset_id),
-        &[("size", "thumbnail")],
-    );
-    let thumb_res = client
-        .http_client
-        .head(&get_thumb_url)
-        .header("x-api-key", client.upload_api_key.as_ref().unwrap())
-        .send()
-        .await;
-
-    match thumb_res {
-        Ok(r) if r.status().is_success() => {}
-        _ => return StatusCode::ACCEPTED.into_response(), // 202 Accepted: thumbnail not ready yet
+    match resolve_uploaded_asset(&client, &key, &asset_id, meta.allow_download).await {
+        // 202 Accepted: still processing tagging/association or thumbnail not ready.
+        UploadedAssetStatus::Pending => StatusCode::ACCEPTED.into_response(),
+        UploadedAssetStatus::Ready(asset) => (StatusCode::OK, axum::Json(*asset)).into_response(),
+        UploadedAssetStatus::Error => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
-
-    // Fetch the final asset info from Immich to construct a complete SafeAsset
-    let get_asset_url = client.build_url(&format!("/assets/{}", asset_id), &[]);
-    let asset_res = client
-        .http_client
-        .get(&get_asset_url)
-        .header("x-api-key", client.upload_api_key.as_ref().unwrap())
-        .send()
-        .await;
-
-    let asset = match asset_res {
-        Ok(r) if r.status().is_success() => {
-            match r.json::<crate::immich_client::model::Asset>().await {
-                Ok(a) => a,
-                Err(e) => {
-                    eprintln!("status: failed to parse asset response: {}", e);
-                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-                }
-            }
-        }
-        Ok(r) => {
-            eprintln!("status: fetch asset returned status {}", r.status());
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-        Err(e) => {
-            eprintln!("status: fetch asset request failed: {}", e);
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    };
-
-    let mut safe_asset = crate::dto::SafeAsset::from_base(asset);
-    safe_asset.uploader_name = Some(uploader_name);
-    safe_asset.uploader_is_fallback = false;
-
-    if share_link.allow_download.unwrap_or(false) {
-        safe_asset.download_url = Some(format!("/share/photo/{}/{}/original", key, safe_asset.id));
-    }
-
-    // Successfully processed, clean up the cache
-    {
-        let cache = PROCESSED_ASSETS
-            .get_or_init(|| parking_lot::RwLock::new(std::collections::HashMap::new()));
-        let mut write_guard = cache.write();
-        write_guard.remove(&asset_id);
-    }
-
-    (StatusCode::OK, axum::Json(safe_asset)).into_response()
 }

@@ -1301,26 +1301,98 @@ function GalleryPage({ details }: GalleryPageProps) {
     setDisplayCount((c) => c + 1);
   };
 
-  const pollAssetStatus = async (assetId: string) => {
-    // Poll every 500ms up to 40 times (20 seconds max)
-    const maxAttempts = 40;
-    for (let attempt = 0; attempt < maxAttempts; attempt++) {
-      try {
-        const res = await fetch(`/share/${realKey}/status/${assetId}`);
-        if (res.status === 200) {
-          const newAsset: SafeAsset = await res.json();
-          insertAndSortAsset(newAsset);
-          return;
-        } else if (res.status !== 202) {
-          console.error(`Status polling failed for asset ${assetId}: ${res.status}`);
-          return;
-        }
-      } catch (err) {
-        console.error(`Status polling request failed for asset ${assetId}:`, err);
+  // Poll the batched status endpoint for a whole set of just-uploaded assets with a
+  // SINGLE loop, instead of one fetch-loop per asset. A large album drop used to
+  // open N concurrent 500ms loops (~2N req/s, each re-validating the share key
+  // upstream) which is exactly what trips edge rate-limiters like CrowdSec. Here
+  // we keep one pending set, ask the server only about ids that are still pending,
+  // and back off 500ms -> 1s -> 2s (capped). One request per tick for the batch.
+  // Streaming batched poller. Returns a controller so the upload loop can feed in
+  // asset ids the moment each individual upload finishes — assets stream back into
+  // the gallery as they're ready, rather than waiting for the whole batch to upload.
+  //
+  // Still a SINGLE poll loop (not one per asset): a large album drop used to open N
+  // concurrent 500ms loops (~2N req/s, each re-validating the share key upstream),
+  // which is exactly what trips edge rate-limiters like CrowdSec. Here we keep one
+  // pending set, ask the server only about ids still pending, and back off
+  // 500ms -> 1s -> 2s (capped). One request per tick for the whole batch.
+  const startBatchStatusPoll = () => {
+    const pending = new Set<string>();
+    let uploadsDone = false;
+
+    const MAX_IDS_PER_REQUEST = 256;
+    const MAX_WALL_MS = 120_000; // overall ceiling, measured from first id added
+
+    const loop = async () => {
+      let started = 0;
+      let delay = 500;
+
+      // Wait for the first id before starting the wall-clock ceiling.
+      while (pending.size === 0 && !uploadsDone) {
+        await new Promise((resolve) => setTimeout(resolve, 250));
       }
-      await new Promise((resolve) => setTimeout(resolve, 500));
-    }
-    console.warn(`Status polling timed out for asset ${assetId}`);
+      if (pending.size === 0) return; // nothing uploaded successfully
+      started = Date.now();
+
+      while ((pending.size > 0 || !uploadsDone) && Date.now() - started < MAX_WALL_MS) {
+        await new Promise((resolve) => setTimeout(resolve, delay));
+        delay = Math.min(delay * 2, 2000);
+
+        if (pending.size === 0) {
+          // Drained, but more uploads may still be in flight — keep waiting cheaply.
+          if (uploadsDone) break;
+          delay = 500;
+          continue;
+        }
+
+        // Chunk in the unlikely event the pending set exceeds the server-side id cap.
+        const ids = Array.from(pending).slice(0, MAX_IDS_PER_REQUEST);
+        try {
+          const res = await fetch(
+            `/share/${realKey}/status?ids=${encodeURIComponent(ids.join(','))}`,
+          );
+          if (res.status !== 200) {
+            console.error(`Batch status polling failed: ${res.status}`);
+            return;
+          }
+          const body: {
+            ready: SafeAsset[];
+            pending: string[];
+            errored: string[];
+          } = await res.json();
+
+          for (const asset of body.ready) {
+            insertAndSortAsset(asset);
+            pending.delete(asset.id);
+          }
+          for (const id of body.errored) {
+            console.error(`Status polling reported error for asset ${id}`);
+            pending.delete(id);
+          }
+          // A ready/errored asset resets the cadence so siblings stream in quickly.
+          if (body.ready.length > 0 || body.errored.length > 0) delay = 500;
+          // Anything the server didn't mention stays pending for the next tick.
+        } catch (err) {
+          console.error('Batch status polling request failed:', err);
+          // Transient network error — keep the pending set and retry after backoff.
+        }
+      }
+
+      if (pending.size > 0) {
+        console.warn(`Batch status polling timed out for ${pending.size} asset(s)`);
+      }
+    };
+
+    void loop();
+
+    return {
+      add: (id: string) => {
+        pending.add(id);
+      },
+      done: () => {
+        uploadsDone = true;
+      },
+    };
   };
 
   const uploadFiles = async (files: File[]) => {
@@ -1334,6 +1406,10 @@ function GalleryPage({ details }: GalleryPageProps) {
     const encodedName = encodeURIComponent(uploaderName.trim());
     let success = true;
     let failedName = '';
+
+    // Start the single streaming poll loop up front so each asset can flow back
+    // into the gallery the moment its own upload completes.
+    const poller = startBatchStatusPoll();
 
     for (let i = 0; i < count; i++) {
       const file = files[i];
@@ -1360,7 +1436,7 @@ function GalleryPage({ details }: GalleryPageProps) {
           break;
         }
         const uploadResult: { id: string } = await res.json();
-        pollAssetStatus(uploadResult.id);
+        poller.add(uploadResult.id);
       } catch {
         success = false;
         failedName = file.name;
@@ -1369,6 +1445,9 @@ function GalleryPage({ details }: GalleryPageProps) {
 
       setUploadProgress((p) => ({ ...p, completed: p.completed + 1 }));
     }
+
+    // Signal the poller that no more ids are coming; it finishes draining and exits.
+    poller.done();
 
     if (success) {
       setUploadStatus({ type: 'success' });
