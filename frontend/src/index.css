@@ -576,22 +576,28 @@ body.selection-mode .tile-selector {
     min-height: 0;
 }
 
-/* Dots sit at the bottom edge of their segment, right-aligned */
+/* Dots sit at the TOP edge of their segment (where that date range begins),
+   right-aligned. Top-anchoring matches the active indicator (placed at seg.top),
+   so dots and the indicator agree; bottom-anchoring pushed the first/largest
+   group's dot to the bottom of its segment, leaving the top of the bar empty
+   whenever one day dominated the album. */
 .scrubber-dot {
     position: absolute;
     right: 10px;
-    bottom: 0;
+    top: 0;
     width: 4px;
     height: 4px;
     border-radius: 50%;
     background: var(--hatch-widget-muted, rgba(255, 255, 255, 0.35));
-    transform: translateY(50%);
+    transform: translateY(-50%);
 }
 
+/* Year label marks where that year STARTS — anchored to the top of the year's
+   first segment, so pips of the newer year sit above the label. */
 .scrubber-year {
     position: absolute;
     right: 20px;
-    bottom: -7px;
+    top: -7px;
     font-size: 11px;
     font-variant-numeric: tabular-nums;
     color: var(--hatch-widget-muted, rgba(255, 255, 255, 0.6));
