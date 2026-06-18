@@ -247,7 +247,11 @@ function GalleryPage({ details }: GalleryPageProps) {
   const galleryContainerRef = useRef<HTMLDivElement>(null);
   const dateGroupRefs = useRef<Map<string, HTMLDivElement>>(new Map());
   const scrubberRef = useRef<HTMLDivElement | null>(null);
-  const pendingScrollRef = useRef<string | null>(null);
+  // Holds a resolver for a scroll target that isn't in the DOM yet: after we
+  // grow the lazy-load window, the effect below runs it each render until it
+  // returns the element, then scrolls to it once and clears. Shared by the
+  // date-group jump and the lightbox-exit asset jump.
+  const pendingScrollRef = useRef<(() => HTMLElement | null | undefined) | null>(null);
   // Lightbox <-> gallery position sync. While the lightbox is open its slide
   // hash (#lg=1&slide=<assetId>) is the single source of truth for position, so
   // ?at is dropped; on close we write ?at from the slide last viewed and scroll
@@ -501,54 +505,45 @@ function GalleryPage({ details }: GalleryPageProps) {
       scrollElementUnderHeader(el, !isScrubbing);
       return;
     }
-    // Not rendered yet — grow displayCount to include it, then scroll next frame.
+    // Not rendered yet — grow displayCount to include it, then let the pending
+    // effect scroll once it mounts.
     if (displayCount <= startIndex) {
       setDisplayCount(Math.min(startIndex + 24, filteredAssets.length));
-      pendingScrollRef.current = label;
+      pendingScrollRef.current = () => dateGroupRefs.current.get(label);
     }
   };
-
-  // Once a pending (far-jump) group has been rendered, scroll to it.
-  useEffect(() => {
-    const label = pendingScrollRef.current;
-    if (!label) return;
-    const el = dateGroupRefs.current.get(label);
-    if (el) {
-      pendingScrollRef.current = null;
-      scrollElementUnderHeader(el);
-    }
-  }, [displayCount, headerHeight, scrollElementUnderHeader]);
 
   // Scroll the grid so a given asset id sits just under the header, growing the
   // lazy-load window first if that tile hasn't been rendered yet. Used to carry
   // the lightbox position back to the gallery when the slideshow closes.
-  const pendingGridScrollIdRef = useRef<string | null>(null);
   const scrollGridToAssetId = (assetId: string) => {
     const idx = filteredAssets.findIndex((a) => a.id === assetId);
     if (idx <= 0) return; // unknown id, or already at the very top
-    const el = galleryContainerRef.current?.querySelector<HTMLElement>(
+    const findEl = () => galleryContainerRef.current?.querySelector<HTMLElement>(
       `.gallery-item[data-asset-id="${assetId}"]`
     );
+    const el = findEl();
     if (el) {
       scrollElementUnderHeader(el);
       return;
     }
-    // Not rendered yet — grow the window to include it, then scroll next frame.
+    // Not rendered yet — grow the window to include it, then let the pending
+    // effect scroll once it mounts.
     if (displayCount <= idx) {
       setDisplayCount(Math.min(idx + 12, filteredAssets.length));
     }
-    pendingGridScrollIdRef.current = assetId;
+    pendingScrollRef.current = findEl;
   };
 
-  // Once a pending (deep) lightbox-exit target has rendered, scroll to it.
+  // Once a pending far-jump target (date group or lightbox-exit asset) has been
+  // rendered, scroll to it and clear. The resolver returns the element when it
+  // finally exists; until then this is a no-op on each displayCount render.
   useEffect(() => {
-    const assetId = pendingGridScrollIdRef.current;
-    if (!assetId) return;
-    const el = galleryContainerRef.current?.querySelector<HTMLElement>(
-      `.gallery-item[data-asset-id="${assetId}"]`
-    );
+    const resolve = pendingScrollRef.current;
+    if (!resolve) return;
+    const el = resolve();
     if (el) {
-      pendingGridScrollIdRef.current = null;
+      pendingScrollRef.current = null;
       scrollElementUnderHeader(el);
     }
   }, [displayCount, headerHeight, scrollElementUnderHeader]);
