@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useMemo } from 'react';
+import { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import type { ShareDetails } from './types/generated/ShareDetails';
 import type { SafeAsset } from './types/generated/SafeAsset';
 import lightGallery from 'lightgallery';
@@ -419,6 +419,22 @@ function GalleryPage({ details }: GalleryPageProps) {
 
   const SCRUBBER_PAD = 6; // top & bottom breathing room inside the bar
 
+  // Layout offsets used when anchoring the page under the sticky header.
+  // HEADER_GAP: breathing room left below the header when we scroll an element
+  // to the top. ACTIVE_LINE_GAP: extra drop to the notional "active line" used
+  // by the date tracker to decide which group is current.
+  const HEADER_GAP = 10;
+  const ACTIVE_LINE_GAP = 20;
+
+  // Scroll the page so `el` sits just under the sticky header. Centralises the
+  // getBoundingClientRect()+scrollY-headerOffset math that was copy-pasted in
+  // five places. Closes over the current headerHeight, so callers that run
+  // inside effects must keep headerHeight in their dependency list.
+  const scrollElementUnderHeader = useCallback((el: HTMLElement, smooth = false) => {
+    const top = el.getBoundingClientRect().top + window.scrollY - (headerHeight + HEADER_GAP);
+    window.scrollTo({ top, behavior: smooth ? 'smooth' : 'auto' });
+  }, [headerHeight]);
+
   // Proportional segments (immich-style): each date group gets a pixel height
   // proportional to its asset share, so the whole album maps onto the bar and
   // the first/last dates are always pinned to the very top/bottom. Dots and
@@ -466,10 +482,10 @@ function GalleryPage({ details }: GalleryPageProps) {
   // Track active date group via scroll position
   useEffect(() => {
     if (groups.length === 0) return;
-    const headerOffset = headerHeight + 10;
+    const headerOffset = headerHeight + HEADER_GAP;
 
     const onScroll = () => {
-      const headerLine = headerOffset + 20;
+      const headerLine = headerOffset + ACTIVE_LINE_GAP;
       const usable = scrubberHeight - SCRUBBER_PAD * 2;
       if (usable <= 0 || scrubberSegments.length === 0) return;
 
@@ -566,11 +582,9 @@ function GalleryPage({ details }: GalleryPageProps) {
     if (idx < 0) return;
     const group = groups[idx];
     const startIndex = group.items[0].globalIndex;
-    const headerOffset = headerHeight + 10;
     const el = dateGroupRefs.current.get(label);
     if (el) {
-      const top = el.getBoundingClientRect().top + window.scrollY - headerOffset;
-      window.scrollTo({ top, behavior: isScrubbing ? 'auto' : 'smooth' });
+      scrollElementUnderHeader(el, !isScrubbing);
       return;
     }
     // Not rendered yet — grow displayCount to include it, then scroll next frame.
@@ -587,11 +601,9 @@ function GalleryPage({ details }: GalleryPageProps) {
     const el = dateGroupRefs.current.get(label);
     if (el) {
       pendingScrollRef.current = null;
-      const headerOffset = headerHeight + 10;
-      const top = el.getBoundingClientRect().top + window.scrollY - headerOffset;
-      window.scrollTo({ top, behavior: 'auto' });
+      scrollElementUnderHeader(el);
     }
-  }, [displayCount]);
+  }, [displayCount, headerHeight, scrollElementUnderHeader]);
 
   // Scroll the grid so a given asset id sits just under the header, growing the
   // lazy-load window first if that tile hasn't been rendered yet. Used to carry
@@ -604,9 +616,7 @@ function GalleryPage({ details }: GalleryPageProps) {
       `.gallery-item[data-asset-id="${assetId}"]`
     );
     if (el) {
-      const headerOffset = headerHeight + 10;
-      const top = el.getBoundingClientRect().top + window.scrollY - headerOffset;
-      window.scrollTo({ top, behavior: 'auto' });
+      scrollElementUnderHeader(el);
       return;
     }
     // Not rendered yet — grow the window to include it, then scroll next frame.
@@ -625,11 +635,9 @@ function GalleryPage({ details }: GalleryPageProps) {
     );
     if (el) {
       pendingGridScrollIdRef.current = null;
-      const headerOffset = headerHeight + 10;
-      const top = el.getBoundingClientRect().top + window.scrollY - headerOffset;
-      window.scrollTo({ top, behavior: 'auto' });
+      scrollElementUnderHeader(el);
     }
-  }, [displayCount, headerHeight]);
+  }, [displayCount, headerHeight, scrollElementUnderHeader]);
 
   // --- Persist scroll position in the URL (?at=<assetIndex>) -----------------
   // We anchor on the global index of the topmost asset currently under the
@@ -671,13 +679,11 @@ function GalleryPage({ details }: GalleryPageProps) {
     );
     if (el) {
       didRestoreScrollRef.current = true;
-      const headerOffset = headerHeight + 10;
-      const top = el.getBoundingClientRect().top + window.scrollY - headerOffset;
-      window.scrollTo({ top, behavior: 'auto' });
+      scrollElementUnderHeader(el);
     }
     // If not rendered yet, leave the guard unset so the next displayCount/render
     // pass retries (the initializer should have grown the window already).
-  }, [displayCount, filteredAssets.length, headerHeight]);
+  }, [displayCount, filteredAssets.length, headerHeight, scrollElementUnderHeader]);
 
   // Write the current position to the URL, debounced so we don't spam history.
   // Skipped until the initial restore has settled, so we never overwrite the
@@ -691,7 +697,7 @@ function GalleryPage({ details }: GalleryPageProps) {
       if (lgOpenRef.current) return;
       const container = galleryContainerRef.current;
       if (!container) return;
-      const headerLine = headerHeight + 10;
+      const headerLine = headerHeight + HEADER_GAP;
       // Topmost asset still (partly) below the header line. Anchor on its asset
       // id rather than its list position, so the saved ?at survives a reload
       // even if the active uploader filter (not persisted) changes the list.
