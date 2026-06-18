@@ -428,7 +428,13 @@ pub async fn download_all(
     );
     let ascii_filename: String = filename
         .chars()
-        .map(|c| if c.is_ascii_graphic() || c == ' ' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_graphic() || c == ' ' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     let encoded_filename = urlencoding::encode(&filename);
     headers.insert(
@@ -456,9 +462,7 @@ static TAG_CACHE: std::sync::OnceLock<
 // some asset->tag links are silently lost. Serializing creation per (parent,name)
 // means exactly one task creates the tag and the rest await, then read the cache.
 static TAG_LOCKS: std::sync::OnceLock<
-    parking_lot::Mutex<
-        std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>,
-    >,
+    parking_lot::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
 > = std::sync::OnceLock::new();
 static PROCESSED_ASSETS: std::sync::OnceLock<
     parking_lot::RwLock<std::collections::HashMap<String, (String, std::time::Instant)>>,
@@ -601,8 +605,7 @@ async fn get_or_create_tag(
     // mutex keyed by cache_key, then do the list/create under it. Other tasks for
     // the same key block here and, once we release, hit the cache fast-path above
     // via the post-lock re-check below.
-    let locks = TAG_LOCKS
-        .get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+    let locks = TAG_LOCKS.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
     let key_lock = {
         let mut guard = locks.lock();
         guard
@@ -765,24 +768,23 @@ async fn asset_tag_state(client: &ImmichClient, asset_id: &str, tag_id: &str) ->
         .await;
 
     match res {
-        Ok(r) if r.status().is_success() => match r
-            .json::<crate::immich_client::model::Asset>()
-            .await
-        {
-            Ok(asset_info) => {
-                let has = asset_info
-                    .tags
-                    .as_ref()
-                    .map(|tags| tags.iter().any(|t| t.id == tag_id))
-                    .unwrap_or(false);
-                if has {
-                    TagState::Present
-                } else {
-                    TagState::Absent
+        Ok(r) if r.status().is_success() => {
+            match r.json::<crate::immich_client::model::Asset>().await {
+                Ok(asset_info) => {
+                    let has = asset_info
+                        .tags
+                        .as_ref()
+                        .map(|tags| tags.iter().any(|t| t.id == tag_id))
+                        .unwrap_or(false);
+                    if has {
+                        TagState::Present
+                    } else {
+                        TagState::Absent
+                    }
                 }
+                Err(_) => TagState::Unknown,
             }
-            Err(_) => TagState::Unknown,
-        },
+        }
         _ => TagState::Unknown,
     }
 }
@@ -830,13 +832,11 @@ async fn relink_tag(client: &ImmichClient, asset_id: &str, tag_id: &str) -> Reli
             // Body is an array of per-asset results: [{id, success, error?}].
             match r.json::<serde_json::Value>().await {
                 Ok(body) => {
-                    let entry = body
-                        .as_array()
-                        .and_then(|a| {
-                            a.iter()
-                                .find(|e| e.get("id").and_then(|v| v.as_str()) == Some(asset_id))
-                                .or_else(|| a.first())
-                        });
+                    let entry = body.as_array().and_then(|a| {
+                        a.iter()
+                            .find(|e| e.get("id").and_then(|v| v.as_str()) == Some(asset_id))
+                            .or_else(|| a.first())
+                    });
                     let success = entry
                         .and_then(|e| e.get("success").and_then(|v| v.as_bool()))
                         .unwrap_or(false);
@@ -1643,11 +1643,7 @@ mod status_link_cache {
         let cache = CACHE.get()?;
         let guard = cache.read();
         let (meta, ts) = guard.get(&entry_hash(key, password))?;
-        if ts.elapsed() < t {
-            Some(*meta)
-        } else {
-            None
-        }
+        if ts.elapsed() < t { Some(*meta) } else { None }
     }
 
     pub(super) fn put(key: &str, password: Option<&str>, meta: UploadLinkMeta) {
@@ -1688,8 +1684,9 @@ async fn validate_upload_link(
             }
         }
         Ok((status, _)) => {
-            return Err(StatusCode::from_u16(status.as_u16())
-                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR));
+            return Err(
+                StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+            );
         }
         Err(e) => {
             eprintln!("status: failed to fetch share link: {}", e);
@@ -1738,8 +1735,10 @@ async fn resolve_uploaded_asset(
     };
 
     // Thumbnail generated yet?
-    let get_thumb_url =
-        client.build_url(&format!("/assets/{}/thumbnail", asset_id), &[("size", "thumbnail")]);
+    let get_thumb_url = client.build_url(
+        &format!("/assets/{}/thumbnail", asset_id),
+        &[("size", "thumbnail")],
+    );
     let thumb_res = client
         .http_client
         .head(&get_thumb_url)
@@ -1760,13 +1759,15 @@ async fn resolve_uploaded_asset(
         .send()
         .await;
     let asset = match asset_res {
-        Ok(r) if r.status().is_success() => match r.json::<crate::immich_client::model::Asset>().await {
-            Ok(a) => a,
-            Err(e) => {
-                eprintln!("status: failed to parse asset response: {}", e);
-                return UploadedAssetStatus::Error;
+        Ok(r) if r.status().is_success() => {
+            match r.json::<crate::immich_client::model::Asset>().await {
+                Ok(a) => a,
+                Err(e) => {
+                    eprintln!("status: failed to parse asset response: {}", e);
+                    return UploadedAssetStatus::Error;
+                }
             }
-        },
+        }
         Ok(r) => {
             eprintln!("status: fetch asset returned status {}", r.status());
             return UploadedAssetStatus::Error;
@@ -1861,7 +1862,11 @@ pub async fn upload_status_batch_handler(
     }
     (
         StatusCode::OK,
-        axum::Json(BatchStatusResponse { ready, pending, errored }),
+        axum::Json(BatchStatusResponse {
+            ready,
+            pending,
+            errored,
+        }),
     )
         .into_response()
 }
@@ -2120,7 +2125,8 @@ pub async fn upload_status_stream_handler(
                         made_progress = true;
                     }
                     UploadedAssetStatus::Error => {
-                        st.out.push_back(Event::default().event("errored").data(id.clone()));
+                        st.out
+                            .push_back(Event::default().event("errored").data(id.clone()));
                         if let Some(ref sess) = st.session {
                             upload_sessions::remove_pending(sess, &id);
                         }
@@ -2184,7 +2190,6 @@ pub async fn mark_upload_session_done_handler(
         _ => StatusCode::BAD_REQUEST.into_response(),
     }
 }
-
 
 pub async fn upload_status_handler(
     headers: HeaderMap,

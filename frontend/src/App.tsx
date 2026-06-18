@@ -1324,7 +1324,6 @@ function GalleryPage({ details }: GalleryPageProps) {
     const MAX_WALL_MS = 120_000; // overall ceiling, measured from first id added
 
     const loop = async () => {
-      let started = 0;
       let delay = 500;
 
       // Wait for the first id before starting the wall-clock ceiling.
@@ -1332,7 +1331,7 @@ function GalleryPage({ details }: GalleryPageProps) {
         await new Promise((resolve) => setTimeout(resolve, 250));
       }
       if (pending.size === 0) return; // nothing uploaded successfully
-      started = Date.now();
+      const started = Date.now();
 
       while ((pending.size > 0 || !uploadsDone) && Date.now() - started < MAX_WALL_MS) {
         await new Promise((resolve) => setTimeout(resolve, delay));
