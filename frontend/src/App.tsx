@@ -497,29 +497,6 @@ function GalleryPage({ details }: GalleryPageProps) {
     return SCRUBBER_PAD + indicatorFrac * usable;
   }, [scrubberHeight, indicatorFrac]);
 
-  // Scroll the page to a given date group, expanding the lazy-load window first
-  // if that group hasn't been rendered yet (so far-away jumps actually work).
-  const scrollToGroup = (label: string) => {
-    const idx = groups.findIndex((g) => g.label === label);
-    if (idx < 0) return;
-    const group = groups[idx];
-    const startIndex = group.items[0].globalIndex;
-    const el = dateGroupRefs.current.get(label);
-    if (el) {
-      scrollElementUnderHeader(el, !isScrubbing);
-      return;
-    }
-    // Not rendered yet — grow displayCount to include it if needed, then always
-    // queue the pending scroll so the jump still lands once the group's ref
-    // attaches. (Previously this only queued inside the displayCount<=startIndex
-    // branch, so a group already inside the window but not yet mounted — its ref
-    // not in the map — would silently fail to scroll.)
-    if (displayCount <= startIndex) {
-      setDisplayCount(Math.min(startIndex + 24, filteredAssets.length));
-    }
-    pendingScrollRef.current = () => dateGroupRefs.current.get(label);
-  };
-
   // Scroll the grid so a given asset id sits just under the header, growing the
   // lazy-load window first if that tile hasn't been rendered yet. Used to carry
   // the lightbox position back to the gallery when the slideshow closes.
@@ -538,6 +515,26 @@ function GalleryPage({ details }: GalleryPageProps) {
     // effect scroll once it mounts.
     if (displayCount <= idx) {
       setDisplayCount(Math.min(idx + 12, filteredAssets.length));
+    }
+    pendingScrollRef.current = findEl;
+  };
+
+  // Scroll the grid so the asset at a given GLOBAL INDEX sits just under the
+  // header, growing the lazy-load window first if needed. This is the scrubber
+  // drag target: mapping the pointer to a fractional asset index (rather than a
+  // whole date group) lets a drag scroll *through* a large day's photos
+  // proportionally to pointer travel, instead of snapping to the day's start.
+  // Mirrors the indicator, which is also keyed on global index / total.
+  const scrollToAssetIndex = (idx: number) => {
+    const clamped = Math.max(0, Math.min(filteredAssets.length - 1, idx));
+    const findEl = () => galleryContainerRef.current?.querySelector<HTMLElement>(
+      `.gallery-item[data-index="${clamped}"]`
+    );
+    if (clamped <= 0) { window.scrollTo({ top: 0 }); return; }
+    const el = findEl();
+    if (el) { scrollElementUnderHeader(el); return; }
+    if (displayCount <= clamped) {
+      setDisplayCount(Math.min(clamped + 24, filteredAssets.length));
     }
     pendingScrollRef.current = findEl;
   };
@@ -768,6 +765,15 @@ function GalleryPage({ details }: GalleryPageProps) {
     const rect = bar.getBoundingClientRect();
     const usable = scrubberHeight - SCRUBBER_PAD * 2;
     const y = Math.max(0, Math.min(usable, clientY - rect.top - SCRUBBER_PAD));
+    // Map pointer -> fractional GLOBAL asset index (same space as the
+    // indicator). Because segment heights are asset-count proportional, the
+    // pointer's pixel position over the bar is already a linear measure of
+    // album progress, so dragging through a thick day scrolls through its
+    // photos proportionally instead of locking to the day's first photo.
+    const total = filteredAssets.length;
+    const frac = usable > 0 ? y / usable : 0;
+    const targetIdx = Math.max(0, Math.min(total - 1, Math.round(frac * total)));
+    // Label bubble: show the date of the band the pointer is over.
     let target = scrubberSegments[0];
     for (const seg of scrubberSegments) {
       if (y >= seg.top && y < seg.top + seg.height) { target = seg; break; }
@@ -775,7 +781,7 @@ function GalleryPage({ details }: GalleryPageProps) {
     }
     setScrubY(SCRUBBER_PAD + y);
     setScrubLabel(target.label);
-    scrollToGroup(target.label);
+    scrollToAssetIndex(targetIdx);
   };
 
   // While dragging the scrubber, track pointer globally (mouse + touch).
