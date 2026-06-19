@@ -99,7 +99,7 @@ sequenceDiagram
 ```
 
 ### B. Uploading Media
-If the share link allows uploading, users can upload photos/videos. The client prompts for an uploader name (saved in `localStorage`), attaches it as a custom header (`x-uploader-name`), and sends files to `/share/:key/upload`. The backend proxies this to Immich using the upload service account API key (`IMMICH_API_KEY_UPLOAD_USER`), adds the assets to the album, and tags them with `SharedBy/{name}` in the background. The background tag/album work runs under a concurrency limit (`UPLOAD_CONCURRENCY`, default 4) and the share-details cache for the affected key is invalidated so the new asset appears immediately.
+If the share link allows uploading, users can upload photos/videos. The client prompts for an uploader name (saved in `localStorage`), attaches it as a custom header (`x-uploader-name`), and sends files to `/share/:key/upload`. The backend proxies this to Immich using the upload service account API key (`IMMICH_API_KEY_UPLOAD_USER`), adds the assets to the album, and tags them with `SharedBy/{name}` in the background. The background tag/album work runs under a concurrency limit (`IPP_UPLOAD_CONCURRENCY`, default 4) and the share-details cache for the affected key is invalidated so the new asset appears immediately.
 
 **Deferred tag guard.** Immich's asynchronous metadata-extraction job calls `replaceAssetTags()` with the tags embedded in the uploaded file (~1s after upload). Keyword-less files (e.g. `PXL_*.jpg`) carry an empty embedded tag set, so extraction would replace the asset's entire tag set with `[]` — silently wiping the `SharedBy/{name}` attribution the proxy just applied. After the synchronous tag/album step succeeds, the proxy spawns a detached `deferred_tag_guard` that re-checks the asset's tag on a spaced schedule (`IPP_TAG_GUARD_SCHEDULE`, default `2,4,8,16,30`s) straddling the extraction window. If the tag is gone it re-applies it; it only exits after two consecutive confirmations, so it outlasts a delayed wipe. An inconclusive read defers to the next tick rather than blindly re-PUTting (a blind re-apply races Immich into a `tag_asset_pkey` duplicate-key 500). The guard is on by default and can be disabled with `IPP_TAG_GUARD=0`.
 
@@ -120,12 +120,71 @@ sequenceDiagram
     Note over Axum,Immich: deferred_tag_guard (detached): re-check tag on<br/>2,4,8,16,30s schedule; re-apply if metadata<br/>extraction wiped it; exit after 2 confirmations
 ```
 
-### C. Filter by Uploader (Frontend)
+### C. Upload Status Tracking & SSE Streaming
+In a multi-file upload drop, checking the status of each uploaded asset individually (to verify background tagging and album association are complete) would spam the backend with HTTP requests. This can trigger rate limiters (like CrowdSec). The proxy implements two mechanisms to prevent this:
+
+1. **Session-Scoped SSE (Server-Sent Events) Streaming**:
+   - At the start of a batch upload, the frontend generates a unique session token using `crypto.randomUUID()`.
+   - The frontend opens a single, long-lived EventSource connection to `/share/{key}/status/stream?session=TOKEN`.
+   - Each upload POST request includes `?session=TOKEN`. The backend registers the uploaded asset ID in an in-memory session registry (`upload_sessions`) mapping the session token to its pending asset set.
+   - The backend stream handler checks the status of these assets. As assets finish processing, it pushes named events (`ready`, `errored`, `done`) back to the frontend.
+   - The stream terminates once the client sends a "finish" beacon (`POST /share/{key}/upload/finish?session=TOKEN`) AND all pending assets have finished, or after a 120-second safety backstop timeout.
+   - This collapses the status monitoring of large batches to a single HTTP connection.
+
+2. **Batched Status Polling (Fallback)**:
+   - If SSE is disabled, the client falls back to batched status polling by sending requests to `/share/{key}/status?ids=a,b,c` at progressive intervals (500ms, 1s, 2s).
+
+```mermaid
+sequenceDiagram
+    participant User as React Frontend
+    participant Axum as Axum Server
+    participant Immich as Immich API
+
+    User->>User: Generate session UUID
+    User->>Axum: GET /share/:key/status/stream?session=UUID (EventSource)
+    Note over Axum: Server opens stream and monitors session registry
+
+    par Uploading files
+        User->>Axum: POST /share/:key/upload?session=UUID (File 1)
+        Note over Axum: Register File 1 ID in session
+        Axum->>Immich: Proxy upload to Immich
+        Axum-->>User: Return 200 OK (Asset ID 1)
+    and
+        User->>Axum: POST /share/:key/upload?session=UUID (File 2)
+        Note over Axum: Register File 2 ID in session
+        Axum->>Immich: Proxy upload to Immich
+        Axum-->>User: Return 200 OK (Asset ID 2)
+    end
+
+    Note over Axum,Immich: Backend runs tag & album tasks in background
+
+    loop Stream Status Check
+        Axum->>Immich: Fetch asset status (using cached permission check)
+        alt Asset 1 Ready
+            Axum->>User: SSE event: ready (File 1 SafeAsset JSON)
+        end
+    end
+
+    User->>Axum: POST /share/:key/upload/finish?session=UUID
+    Note over Axum: Mark session as finished uploading
+
+    loop Stream Status Check (remainder)
+        alt Asset 2 Ready
+            Axum->>User: SSE event: ready (File 2 SafeAsset JSON)
+        end
+    end
+
+    Note over Axum: All assets processed & finish beacon received
+    Axum->>User: SSE event: done (resolved count)
+    Note over User,Axum: Connection closed
+```
+
+### D. Filter by Uploader (Frontend)
 When an album has assets from multiple uploaders (i.e., ≥2 distinct `uploaderName` values), the frontend displays a settings gear button with a unified Settings modal. The modal contains a checkbox filter list showing each uploader's name and photo count (alphabetically sorted). Filtering is applied via `useMemo` before date-grouping and lightGallery index construction, so the lightbox, lazy loading, and grid all operate on the filtered set. Asset selection is independent of the filter — selected assets remain selected even when hidden by the filter. The filter state is ephemeral (not persisted to `localStorage`).
 
 The Settings modal also houses the existing "Uploader Name" input when uploads are enabled, unifying both settings into one panel.
 
-### D. ZIP Downloads
+### E. ZIP Downloads
 Downloads can be requested for the entire share or a custom selection of checkboxes. The backend handles this by streaming each asset from Immich on-the-fly and wrapping it into a compressed ZIP stream in real-time, avoiding large temporary disk usage.
 
 ---
@@ -217,13 +276,19 @@ The `Secure` flag on password session cookies (`immich_pwd_*`) is conditional: i
 Download responses include both an ASCII fallback `filename="..."` and a UTF-8 `filename*=UTF-8''...` parameter, ensuring filenames with non-ASCII characters display correctly across all browsers.
 
 ### OnceLock Caching
-Environment variables and other process-wide config (e.g. `PUBLIC_BASE_URL`, `LEPTOS_SITE_ROOT`, `IMMICH_API_KEY_UPLOAD_USER`, the share-cache TTL, and the upload concurrency limit) and the shared `reqwest::Client` (with a 10-second connect timeout) are initialized once via `std::sync::OnceLock` and reused across requests.
+Environment variables and other process-wide config (e.g. `IPP_PUBLIC_BASE_URL`, `LEPTOS_SITE_ROOT`, `IMMICH_API_KEY_UPLOAD_USER`, the share-cache TTL, and the upload concurrency limit) and the shared `reqwest::Client` (with a 10-second connect timeout) are initialized once via `std::sync::OnceLock` and reused across requests.
 
 ### Share-Details Cache
-`api/get_share_details.rs` keeps a small in-memory cache of fully-resolved share responses, keyed by share key (and password variant). Entries expire after `SHARE_CACHE_TTL_SECS` (default 45s) and are also proactively invalidated by the upload path whenever an album's contents change. A monotonic per-key generation counter is snapshotted before a rebuild and re-checked under the write lock, so an invalidation that races an in-flight rebuild correctly discards the stale result instead of caching it.
+`api/get_share_details.rs` keeps a small in-memory cache of fully-resolved share responses, keyed by share key (and password variant). Entries expire after `IPP_TTL_SHARE_CACHE_SECS` (default 45s) and are also proactively invalidated by the upload path whenever an album's contents change. A monotonic per-key generation counter is snapshotted before a rebuild and re-checked under the write lock, so an invalidation that races an in-flight rebuild correctly discards the stale result instead of caching it.
 
 ### Bulk Tag Cache
 The `get_or_create_tag` function in `proxy.rs` populates the tag cache with all tags from a single `/tags` API call, rather than scanning the full list per lookup. This reduces upload latency for albums with many tags/uploaders.
+
+### Upload Status Permission Cache
+`/share/{key}/status` and `/share/{key}/status/stream` reuse a short-lived permission validation cache (`IPP_TTL_STATUS_LINK_CACHE_SECS`, default 60s) to avoid validating the share key on every single poll tick or SSE stream loop iteration. This prevents overloading the upstream Immich `/shared-links/me` endpoint.
+
+### Upload Sessions Sweep
+To prevent memory leaks from abandoned or failed upload sessions (e.g., if a client disconnects without sending the finish beacon), the in-memory `upload_sessions` registry maps session tokens to their pending asset sets and finished flag, running a lazy 600-second TTL cleanup sweep.
 
 ## 6. Development & Builds
 

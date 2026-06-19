@@ -17,7 +17,7 @@ use ts_rs::TS;
 pub struct ShareDetails {
     pub link: SafeSharedLink,
     pub password_required: bool,
-    pub public_base_url: String,
+    pub ipp_public_base_url: String,
     pub request_key: String,
 }
 
@@ -59,7 +59,7 @@ pub mod share_cache {
     fn ttl() -> Duration {
         static TTL: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
         *TTL.get_or_init(|| {
-            let secs = std::env::var("SHARE_CACHE_TTL_SECS")
+            let secs = std::env::var("IPP_TTL_SHARE_CACHE_SECS")
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(45);
@@ -162,9 +162,10 @@ pub async fn get_share_details(
         .and_then(|p| p.to_str().ok())
         .unwrap_or("http");
 
-    static PUBLIC_BASE_URL_ENV: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    let public_base_url = PUBLIC_BASE_URL_ENV
-        .get_or_init(|| std::env::var("PUBLIC_BASE_URL").ok())
+    static IPP_PUBLIC_BASE_URL_ENV: std::sync::OnceLock<Option<String>> =
+        std::sync::OnceLock::new();
+    let ipp_public_base_url = IPP_PUBLIC_BASE_URL_ENV
+        .get_or_init(|| std::env::var("IPP_PUBLIC_BASE_URL").ok())
         .clone()
         .unwrap_or_else(|| format!("{}://{}", proto, host));
 
@@ -176,7 +177,7 @@ pub async fn get_share_details(
     if let Some(mut cached) = share_cache::get(&key, password.as_deref()) {
         // The cached body is request-independent except for these two fields, which
         // derive from the current request's host header; re-stamp them.
-        cached.public_base_url = public_base_url.clone();
+        cached.ipp_public_base_url = ipp_public_base_url.clone();
         cached.request_key = key.clone();
         return Ok(cached);
     }
@@ -193,7 +194,7 @@ pub async fn get_share_details(
         .map_err(|e| e.to_string())?;
 
     if status == 401 {
-        return server_helpers::handle_unauthorized(&client, &key, public_base_url).await;
+        return server_helpers::handle_unauthorized(&client, &key, ipp_public_base_url).await;
     }
 
     if !status.is_success() {
@@ -289,7 +290,7 @@ pub async fn get_share_details(
     let details = ShareDetails {
         link: safe_link,
         password_required: false,
-        public_base_url,
+        ipp_public_base_url,
         request_key: key.clone(),
     };
 
@@ -329,12 +330,12 @@ mod server_helpers {
     pub async fn handle_unauthorized(
         client: &ImmichClient,
         key: &str,
-        public_base_url: String,
+        ipp_public_base_url: String,
     ) -> Result<ShareDetails, String> {
         match client.get_admin_shared_link(key).await {
             Ok(Some(link)) if link.password.is_some() => {
                 eprintln!("Share '{}' requires a password", key);
-                Ok(password_required_response(key, public_base_url))
+                Ok(password_required_response(key, ipp_public_base_url))
             }
             Ok(Some(_)) => {
                 eprintln!(
@@ -358,13 +359,13 @@ mod server_helpers {
                     "Share '{}' returned 401 and admin API is unavailable — assuming password required",
                     key
                 );
-                Ok(password_required_response(key, public_base_url))
+                Ok(password_required_response(key, ipp_public_base_url))
             }
         }
     }
 
     /// Builds a `ShareDetails` indicating a password is required.
-    fn password_required_response(key: &str, public_base_url: String) -> ShareDetails {
+    fn password_required_response(key: &str, ipp_public_base_url: String) -> ShareDetails {
         ShareDetails {
             link: SafeSharedLink {
                 key: key.to_string(),
@@ -376,7 +377,7 @@ mod server_helpers {
                 album: None,
             },
             password_required: true,
-            public_base_url,
+            ipp_public_base_url,
             request_key: key.to_string(),
         }
     }

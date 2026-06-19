@@ -70,8 +70,11 @@ async fn serve_share_html(Path(key): Path<String>, headers: HeaderMap) -> Respon
                     )
                 });
 
-            let public_base_url = details.public_base_url.trim_end_matches('/').to_string();
-            let current_url = format!("{}/share/{}", public_base_url, details.request_key);
+            let ipp_public_base_url = details
+                .ipp_public_base_url
+                .trim_end_matches('/')
+                .to_string();
+            let current_url = format!("{}/share/{}", ipp_public_base_url, details.request_key);
 
             let cover_asset_id = details
                 .link
@@ -84,7 +87,7 @@ async fn serve_share_html(Path(key): Path<String>, headers: HeaderMap) -> Respon
                 .map(|id| {
                     format!(
                         "{}/share/photo/{}/{}/preview",
-                        public_base_url, details.link.key, id
+                        ipp_public_base_url, details.link.key, id
                     )
                 })
                 .unwrap_or_default();

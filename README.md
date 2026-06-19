@@ -20,12 +20,14 @@ Share photos and albums from [Immich](https://github.com/immich-app/immich) with
 - **Upload Support**: Users can upload media directly to shared albums via the proxy.
     - Uploaded assets are processed in the background, added to the shared album, and tagged with `SharedBy/{uploader_name}` using the configured upload service account API key (`IMMICH_API_KEY_UPLOAD_USER`).
     - A **deferred tag guard** re-checks each upload's `SharedBy/{name}` tag on a schedule after upload and re-applies it if Immich's metadata-extraction job strips it (keyword-less files otherwise lose the attribution tag). On by default; tune via `IPP_TAG_GUARD` / `IPP_TAG_GUARD_SCHEDULE`.
+    - **Real-Time Upload Status**: See photos stream into the album as they're uploaded!
 - **Gallery UI**:
     - Chronological grouping of assets by date.
     - Lazy loading of grid tiles using `IntersectionObserver` for performance in large albums.
     - Responsive layout for desktop and mobile browsers.
     - Render Uploader Attribution Badges (pulled from `SharedBy/{name}` tags).
     - **Filter by Uploader**: When an album has multiple uploaders, a settings gear appears with a checkbox filter to show/hide photos by uploader. Includes photo counts per uploader, Select All / Clear All, and a visual indicator on the gear when filtering is active.
+    - **Precision Date Scrubber**: Customized date scrubber with top-visible asset tracking, custom resting states, and proportional drag-scrubbing.
 - **SEO/Metadata**: Server-side rendering (SSR) provides OpenGraph meta tags for link previews. Meta tag values are HTML-escaped and URL-encoded to prevent stored XSS.
 
 ---
@@ -42,6 +44,7 @@ This project implements the core functionality of the original Node.js proxy wit
 | **Bulk Selection**        | Native UI for selecting and downloading a subset of assets as a ZIP.                             |
 | **Lazy Loading**          | Explicit `IntersectionObserver` implementation for large grids.                                  |
 | **Filter by Uploader**    | Settings panel to filter gallery view by uploader name in multi-contributor albums.              |
+| **Real-Time Uploads**     | Session-scoped SSE streaming and batched polling for upload processing updates.                  |
 | **Single Binary**         | Compiles to a single binary for easier deployment outside of Docker.                             |
 
 ### Upstream Features Not Currently Implemented
@@ -83,20 +86,21 @@ bash -c "$(wget -qLO - https://raw.githubusercontent.com/daniel5151/immich-publi
 
 Configuration is handled via environment variables.
 
-| Variable                     | Required | Description                                                                                                                                           |
-| :--------------------------- | :------: | :---------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `IMMICH_URL`                 |   Yes    | The internal URL of your Immich instance (e.g., `http://192.168.1.50:2283`).                                                                          |
-| `LEPTOS_SITE_ROOT`           |    No    | Path to the static assets directory. Defaults to `target/site`.                                                                                       |
-| `LEPTOS_SITE_ADDR`           |    No    | Address and port to bind to. Defaults to `127.0.0.1:3000`.                                                                                            |
-| `IMMICH_API_KEY`             |    No    | Admin/owner API key. Enables password detection, link-not-found resolution, and name fallback resolution.                                             |
-| `IMMICH_API_KEY_UPLOAD_USER` |    No    | Service account/user API key for uploads. Enabling upload support requires this key.                                                                  |
-| `PUBLIC_BASE_URL`            |    No    | The public URL of the proxy (e.g., `https://photos.example.com`). Used for SEO/OpenGraph preview tags. Generated dynamically from headers if omitted. |
-| `SHARE_CACHE_TTL_SECS`       |    No    | TTL (seconds) for the in-memory share-details cache. Defaults to `45`. Entries are also proactively invalidated when an upload mutates an album.       |
-| `UPLOAD_CONCURRENCY`         |    No    | Max number of simultaneous background tag/album jobs across uploads. Defaults to `4` (minimum `1`).                                                    |
-| `IPP_TAG_GUARD`              |    No    | Set to `0`/`false` to disable the deferred uploader-tag guard (see Features → Upload Support). Enabled by default.                                     |
-| `IPP_TAG_GUARD_SCHEDULE`     |    No    | Comma-separated re-check delays in seconds for the tag guard. Defaults to `2,4,8,16,30`.                                                               |
+| Variable                         | Required | Description                                                                                                                                           |
+| :------------------------------- | :------: | :---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `IMMICH_URL`                     |   Yes    | The internal URL of your Immich instance (e.g., `http://192.168.1.50:2283`).                                                                          |
+| `LEPTOS_SITE_ROOT`               |    No    | Path to the static assets directory. Defaults to `target/site`.                                                                                       |
+| `LEPTOS_SITE_ADDR`               |    No    | Address and port to bind to. Defaults to `127.0.0.1:3000`.                                                                                            |
+| `IMMICH_API_KEY`                 |    No    | Admin/owner API key. Enables password detection, link-not-found resolution, and name fallback resolution.                                             |
+| `IMMICH_API_KEY_UPLOAD_USER`     |    No    | Service account/user API key for uploads. Enabling upload support requires this key.                                                                  |
+| `IPP_PUBLIC_BASE_URL`            |    No    | The public URL of the proxy (e.g., `https://photos.example.com`). Used for SEO/OpenGraph preview tags. Generated dynamically from headers if omitted. |
+| `IPP_TAG_GUARD_SCHEDULE`         |    No    | Comma-separated re-check delays in seconds for the tag guard. Defaults to `2,4,8,16,30`.                                                              |
+| `IPP_TAG_GUARD`                  |    No    | Set to `0`/`false` to disable the deferred uploader-tag guard (see Features → Upload Support). Enabled by default.                                    |
+| `IPP_TTL_SHARE_CACHE_SECS`       |    No    | TTL (seconds) for the in-memory share-details cache. Defaults to `45`. Entries are also proactively invalidated when an upload mutates an album.      |
+| `IPP_TTL_STATUS_LINK_CACHE_SECS` |    No    | TTL (seconds) for the short-lived upload-status permission cache. Defaults to `60`. Avoids upstream share key re-validation per poll tick.            |
+| `IPP_UPLOAD_CONCURRENCY`         |    No    | Max number of simultaneous background tag/album jobs across uploads. Defaults to `4` (minimum `1`).                                                   |
 
-> **Logging:** the proxy writes logs straight to stdout/stderr; there is no log-level filtering and no `RUST_LOG` variable.
+> **Logging:** the proxy currently writes logs straight to stdout/stderr; there is no log-level filtering and no `RUST_LOG` variable.
 
 ### API Key Permissions and Features
 

@@ -890,7 +890,7 @@ async fn tag_and_associate_asset(
     // state (TAG_CACHE / ADDED_ALBUMS) is independently locked, and the tag-create
     // path already handles concurrent creation via a POST-conflict re-query.
     let sem = IMMICH_API_SEMAPHORE.get_or_init(|| {
-        let permits = std::env::var("UPLOAD_CONCURRENCY")
+        let permits = std::env::var("IPP_UPLOAD_CONCURRENCY")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|n| *n >= 1)
@@ -1614,7 +1614,7 @@ mod status_link_cache {
     fn ttl() -> Duration {
         static TTL: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
         *TTL.get_or_init(|| {
-            let secs = std::env::var("STATUS_LINK_CACHE_TTL_SECS")
+            let secs = std::env::var("IPP_TTL_STATUS_LINK_CACHE_SECS")
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(60);
