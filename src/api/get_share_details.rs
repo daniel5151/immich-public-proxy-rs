@@ -134,14 +134,30 @@ pub mod share_cache {
     /// its album mutates). The generation bump invalidates any in-flight rebuild that
     /// started before this point.
     pub fn invalidate(key: &str) {
-        {
-            let mut gens = generations().write();
-            let g = gens.entry(key.to_string()).or_insert(0);
-            *g = g.wrapping_add(1);
-        }
+        let mut keys_to_bump = std::collections::HashSet::new();
+        keys_to_bump.insert(key.to_string());
+
         if let Some(cache) = CACHE.get() {
             let mut guard = cache.write();
-            guard.retain(|_, (k, _, _)| k != key);
+            guard.retain(|_, (k, details, _)| {
+                let matches = k == key || details.link.key == key || details.request_key == key;
+                if matches {
+                    keys_to_bump.insert(k.clone());
+                    keys_to_bump.insert(details.link.key.clone());
+                    keys_to_bump.insert(details.request_key.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+
+        {
+            let mut gens = generations().write();
+            for k in keys_to_bump {
+                let g = gens.entry(k).or_insert(0);
+                *g = g.wrapping_add(1);
+            }
         }
     }
 }
