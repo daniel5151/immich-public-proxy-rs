@@ -1056,6 +1056,25 @@ function GalleryPage({ details }: GalleryPageProps) {
       const item = itemsArray[idx] as unknown as { slideName?: string };
       return item?.slideName ?? null;
     };
+    const updateContributorInToolbar = (idx: number) => {
+      const counter = document.querySelector('.lg-counter');
+      if (!counter) return;
+
+      let contribSpan = counter.querySelector('.lg-counter-contributor') as HTMLSpanElement | null;
+      if (!contribSpan) {
+        contribSpan = document.createElement('span');
+        contribSpan.className = 'lg-counter-contributor';
+        counter.appendChild(contribSpan);
+      }
+
+      const asset = filteredAssets[idx];
+      if (asset && asset.uploaderName) {
+        contribSpan.textContent = ` • ${asset.uploaderName}`;
+        contribSpan.style.display = 'inline';
+      } else {
+        contribSpan.style.display = 'none';
+      }
+    };
     const onLgAfterOpen = () => {
       lgOpenRef.current = true;
       // The filmstrip DOM is now visible; start lazily filling its thumbnails.
@@ -1063,7 +1082,11 @@ function GalleryPage({ details }: GalleryPageProps) {
       ensureThumbObserver();
       requestAnimationFrame(() => {
         ensureThumbObserver();
-        if (lgRef.current) loadThumbsAround(lgRef.current.index ?? 0);
+        if (lgRef.current) {
+          const idx = lgRef.current.index ?? 0;
+          loadThumbsAround(idx);
+          updateContributorInToolbar(idx);
+        }
       });
       // The slide hash now owns position; drop the redundant ?at so the two
       // don't disagree (and so a shared in-lightbox URL stays clean).
@@ -1083,6 +1106,7 @@ function GalleryPage({ details }: GalleryPageProps) {
         // thumbnails are present even before the observer catches up.
         ensureThumbObserver();
         loadThumbsAround(idx);
+        updateContributorInToolbar(idx);
       }
     };
     const onLgAfterClose = () => {
