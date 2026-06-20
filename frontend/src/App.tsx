@@ -686,6 +686,20 @@ function GalleryPage({ details }: GalleryPageProps) {
         return;
       }
 
+      // At the very bottom, the indicator must sit at the very end of the bar,
+      // full stop. The anchored sweep below derives its progress from
+      // (scrollY - startScroll) / (maxScroll - startScroll); when the final
+      // day-group is short, the tail is entered only once we're already at
+      // maxScroll, so startScroll ≈ maxScroll, the span collapses to ~0, and the
+      // sweep can never advance past startFrac (you can't scroll past the
+      // bottom). That left the indicator frozen short of the end. Pin to 1
+      // whenever we're genuinely bottomed out, before the degenerate sweep runs.
+      if (scrollRemaining <= 1) {
+        tailAnchorRef.current = null;
+        setIndicatorFrac(1);
+        return;
+      }
+
       // Anchor the tail at the band position where we entered it (so there's no
       // jump), then sweep continuously to the very bottom of the bar as the
       // remaining page scroll is consumed.
