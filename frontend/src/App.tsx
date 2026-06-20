@@ -840,7 +840,16 @@ function GalleryPage({ details }: GalleryPageProps) {
 
     observer.observe(observerTarget);
     return () => observer.disconnect();
-  }, [filteredAssets.length, isUploading]);
+    // Re-arm on every displayCount change. An IntersectionObserver only fires on
+    // intersection *transitions*, not while the target stays intersecting. After
+    // a fast scroll to the bottom, one batch (+12) often isn't enough to push the
+    // 1px sentinel back out of the 200px rootMargin, so it remains intersecting,
+    // no further transition occurs, and the spinner hangs until the user scrolls
+    // up (exit) and back down (re-entry). Re-observing after each batch makes the
+    // browser re-report the sentinel's current state, chaining batches until it's
+    // genuinely out of view. Self-terminates once displayCount === length (the
+    // functional update returns `current` unchanged, so deps stop changing).
+  }, [filteredAssets.length, isUploading, displayCount]);
 
   // lightGallery initialization / update — uses filteredAssets
   useEffect(() => {
