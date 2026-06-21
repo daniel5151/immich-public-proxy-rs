@@ -10,6 +10,10 @@ import lgHash from 'lightgallery/plugins/hash';
 import type { GalleryItem } from 'lightgallery/lg-utils';
 import { groupAssetsByDate } from '../lib/groupAssetsByDate';
 import { startBatchStatusPoll, startStatusStream } from '../lib/uploadStatus';
+import { DropOverlay } from '../components/DropOverlay';
+import { UploadToast } from '../components/UploadToast';
+import { NameModal } from '../components/NameModal';
+import { SettingsModal } from '../components/SettingsModal';
 
 import 'lightgallery/css/lightgallery-bundle.css';
 
@@ -1177,6 +1181,23 @@ export function GalleryPage({ details }: GalleryPageProps) {
     setShowSettingsModal(false);
   };
 
+  const toggleUploader = (name: string) => {
+    setEnabledUploaders((prev) => {
+      const next = new Set(prev ?? distinctUploaders);
+      if (next.has(name)) {
+        next.delete(name);
+      } else {
+        next.add(name);
+      }
+      return next;
+    });
+  };
+
+  const handleSettingsNameBlur = () => {
+    const name = uploaderName.trim();
+    if (name) localStorage.setItem('uploader_name', name);
+  };
+
   const insertAndSortAsset = (newAsset: SafeAsset) => {
     setAssets((prev) => {
       if (prev.some((a) => a.id === newAsset.id)) return prev;
@@ -1347,18 +1368,7 @@ export function GalleryPage({ details }: GalleryPageProps) {
       <title>{title}</title>
 
       {/* Drag-and-drop overlay */}
-      {isDragOver && (
-        <div className="drop-overlay">
-          <div className="drop-overlay-content">
-            <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
-              <polyline points="17 8 12 3 7 8" />
-              <line x1="12" y1="3" x2="12" y2="15" />
-            </svg>
-            <span>Drop to upload</span>
-          </div>
-        </div>
-      )}
+      <DropOverlay visible={isDragOver} />
 
       {/* Selection floating bar */}
       <div id="selection-bar" className={selectedAssets.size > 0 ? 'active' : ''}>
@@ -1601,140 +1611,36 @@ export function GalleryPage({ details }: GalleryPageProps) {
       )}
 
       {/* Upload toast notifications */}
-      {(isUploading || uploadStatus) && (
-        <div id="upload-toast">
-          {isUploading && (
-            <div className="toast-content uploading">
-              <span className="loader-small"></span>
-              <div className="toast-text">
-                <span className="toast-progress">Uploading {uploadProgress.completed}/{uploadProgress.total}</span>
-                <span className="toast-warning">⚠️ Don't close this window! ⚠️</span>
-              </div>
-            </div>
-          )}
-          {!isUploading && uploadStatus?.type === 'success' && (
-            <div className="toast-content success">
-              <span>✅ Upload complete</span>
-            </div>
-          )}
-          {!isUploading && uploadStatus?.type === 'failed' && (
-            <div className="toast-content failed">
-              <span>❌ {uploadStatus.message}</span>
-            </div>
-          )}
-        </div>
-      )}
+      <UploadToast isUploading={isUploading} uploadProgress={uploadProgress} uploadStatus={uploadStatus} />
 
       {/* Upload name prompt modal (for upload button flow) */}
       {showNameModal && (
-        <div className="modal-overlay" onClick={handleCancelNameModal}>
-          <div className="modal-container" onClick={(e) => e.stopPropagation()}>
-            <h3 className="modal-title">Uploader Name</h3>
-            <p className="modal-desc">Please enter your name to attribute your uploaded photos.</p>
-            <form onSubmit={onConfirmName}>
-              <input
-                type="text"
-                className="modal-input"
-                placeholder="Your Name"
-                value={uploaderName}
-                required
-                autoFocus
-                onChange={(e) => setUploaderName(e.target.value)}
-              />
-              <div className="modal-actions">
-                <button type="button" className="header-btn" onClick={handleCancelNameModal}>
-                  Cancel
-                </button>
-                <button
-                  type="submit"
-                  className="modal-btn-confirm"
-                  disabled={!uploaderName.trim()}
-                >
-                  Confirm
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
+        <NameModal
+          uploaderName={uploaderName}
+          onNameChange={setUploaderName}
+          onConfirm={onConfirmName}
+          onCancel={handleCancelNameModal}
+        />
       )}
 
       {/* Unified Settings modal */}
       {showSettingsModal && (
-        <div className="modal-overlay" onClick={closeSettings}>
-          <div className="modal-container settings-modal" onClick={(e) => e.stopPropagation()}>
-            <h3 className="modal-title">Settings</h3>
-
-            {hasMultipleUploaders && (
-              <div className="settings-section">
-                <div className="settings-section-label">Filter by Uploader</div>
-                <div className="filter-list">
-                  {distinctUploaders.map((name) => (
-                    <label key={name} className="filter-row">
-                      <input
-                        type="checkbox"
-                        checked={enabledUploaders?.has(name) ?? true}
-                        onChange={() => {
-                          setEnabledUploaders((prev) => {
-                            const next = new Set(prev ?? distinctUploaders);
-                            if (next.has(name)) {
-                              next.delete(name);
-                            } else {
-                              next.add(name);
-                            }
-                            return next;
-                          });
-                        }}
-                      />
-                      <span className="filter-name">{name}</span>
-                      <span className="filter-count">{uploaderCounts.get(name) ?? 0}</span>
-                    </label>
-                  ))}
-                </div>
-                <div className="filter-actions">
-                  <button
-                    className="filter-link"
-                    onClick={() => setEnabledUploaders(new Set(distinctUploaders))}
-                  >
-                    Select All
-                  </button>
-                  <span className="filter-separator">·</span>
-                  <button
-                    className="filter-link"
-                    onClick={() => setEnabledUploaders(new Set())}
-                  >
-                    Clear All
-                  </button>
-                </div>
-                <div className="filter-summary">
-                  Showing {filteredAssets.length}/{assets.length}
-                </div>
-              </div>
-            )}
-
-            {allowUpload && (
-              <div className="settings-section">
-                <div className="settings-section-label">Uploader Name</div>
-                <input
-                  type="text"
-                  className="modal-input settings-name-input"
-                  placeholder="Your Name"
-                  value={uploaderName}
-                  onChange={(e) => setUploaderName(e.target.value)}
-                  onBlur={() => {
-                    const name = uploaderName.trim();
-                    if (name) localStorage.setItem('uploader_name', name);
-                  }}
-                />
-              </div>
-            )}
-
-            <div className="modal-actions">
-              <button className="modal-btn-confirm" onClick={closeSettings}>
-                Done
-              </button>
-            </div>
-          </div>
-        </div>
+        <SettingsModal
+          hasMultipleUploaders={hasMultipleUploaders}
+          allowUpload={allowUpload}
+          distinctUploaders={distinctUploaders}
+          enabledUploaders={enabledUploaders}
+          uploaderCounts={uploaderCounts}
+          filteredCount={filteredAssets.length}
+          totalCount={assets.length}
+          uploaderName={uploaderName}
+          onToggleUploader={toggleUploader}
+          onSelectAllUploaders={() => setEnabledUploaders(new Set(distinctUploaders))}
+          onClearAllUploaders={() => setEnabledUploaders(new Set())}
+          onNameChange={setUploaderName}
+          onNameBlur={handleSettingsNameBlur}
+          onClose={closeSettings}
+        />
       )}
     </div>
   );
