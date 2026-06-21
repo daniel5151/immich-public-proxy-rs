@@ -701,6 +701,7 @@ export function GalleryPage({ details }: GalleryPageProps) {
   useLightGallery({
     filteredAssets,
     realKey,
+    allowDownload,
     galleryContainerRef,
     lgRef,
     lgOpenRef,

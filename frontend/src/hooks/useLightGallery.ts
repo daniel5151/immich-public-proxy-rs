@@ -14,6 +14,7 @@ type LightGallery = ReturnType<typeof lightGallery>;
 interface UseLightGalleryArgs {
   filteredAssets: SafeAsset[];
   realKey: string;
+  allowDownload: boolean;
   galleryContainerRef: RefObject<HTMLDivElement | null>;
   lgRef: RefObject<LightGallery | null>;
   lgOpenRef: RefObject<boolean>;
@@ -30,6 +31,7 @@ interface UseLightGalleryArgs {
 export function useLightGallery({
   filteredAssets,
   realKey,
+  allowDownload,
   galleryContainerRef,
   lgRef,
   lgOpenRef,
@@ -114,7 +116,7 @@ export function useLightGallery({
       speed: 200,
       licenseKey: '8FFA6495-676C4D30-8BFC54B6-4D0A6CEC',
       selector: '.gallery-item',
-      download: true,
+      download: allowDownload,
       counter: true,
       // Identify slides by asset id, not list position. The hash becomes
       // #lg=1&slide=<assetId>, which resolves to the right photo even when the
@@ -124,7 +126,7 @@ export function useLightGallery({
       hideScrollbar: true,
       swipeToClose: true,
       preload: 2,
-      mobileSettings: { controls: false, showCloseIcon: true, download: true },
+      mobileSettings: { controls: false, showCloseIcon: true, download: allowDownload },
       dynamic: true,
       dynamicEl: itemsArray
     };
@@ -363,5 +365,5 @@ export function useLightGallery({
   // likewise omitted on purpose: it's re-created each render and only invoked
   // from the lightbox close callback, not needed as a re-init trigger.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [filteredAssets, realKey]);
+  }, [filteredAssets, realKey, allowDownload]);
 }
