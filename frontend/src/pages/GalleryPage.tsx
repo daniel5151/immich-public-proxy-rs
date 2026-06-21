@@ -10,6 +10,8 @@ import { NameModal } from '../components/NameModal';
 import { SettingsModal } from '../components/SettingsModal';
 import { GalleryGrid } from '../components/GalleryGrid';
 import { useLightGallery } from '../hooks/useLightGallery';
+import { useUploaderFilter } from '../hooks/useUploaderFilter';
+import { useSelection } from '../hooks/useSelection';
 
 import 'lightgallery/css/lightgallery-bundle.css';
 
@@ -29,40 +31,29 @@ export function GalleryPage({ details }: GalleryPageProps) {
   const title = link.description || link.album?.albumName || (link.type === 'INDIVIDUAL' && assets.length === 1 ? (assets[0].originalFileName || 'Shared File') : 'Shared Files');
   const albumDescription = link.album?.description;
 
-  const [selectedAssets, setSelectedAssets] = useState<Set<string>>(new Set());
-
-  // --- Filter by Uploader state ---
-  const [enabledUploaders, setEnabledUploaders] = useState<Set<string> | null>(null);
   const [showSettingsModal, setShowSettingsModal] = useState(false);
 
-  // Compute uploader counts and distinct names from the full asset list
-  const uploaderCounts = useMemo(() => {
-    const counts = new Map<string, number>();
-    for (const asset of assets) {
-      const name = asset.uploaderName ?? 'Unknown';
-      counts.set(name, (counts.get(name) ?? 0) + 1);
-    }
-    return counts;
-  }, [assets]);
+  // Uploader filter: counts, distinct names, filtered view, and toggle.
+  const {
+    enabledUploaders,
+    setEnabledUploaders,
+    uploaderCounts,
+    distinctUploaders,
+    hasMultipleUploaders,
+    isFilterActive,
+    filteredAssets,
+    toggleUploader,
+  } = useUploaderFilter(assets);
 
-  const distinctUploaders = useMemo(() => {
-    return Array.from(uploaderCounts.keys()).sort((a, b) => a.localeCompare(b));
-  }, [uploaderCounts]);
-
-  const hasMultipleUploaders = distinctUploaders.length >= 2;
-
-  const isFilterActive = enabledUploaders !== null && enabledUploaders.size < distinctUploaders.length;
-
-  // Filtered assets based on uploader selection
-  const filteredAssets = useMemo(() => {
-    if (!enabledUploaders) return assets;
-    return assets.filter((a) => {
-      const name = a.uploaderName ?? 'Unknown';
-      return enabledUploaders.has(name);
-    });
-  }, [assets, enabledUploaders]);
-
-  // --- End filter state ---
+  // Multi-select state + handlers (single, shift-range, group, download URL).
+  const {
+    selectedAssets,
+    setSelectedAssets,
+    onToggleAsset,
+    getGroupSelectionStatus,
+    onToggleGroup,
+    downloadSelectionUrl,
+  } = useSelection(filteredAssets, realKey);
 
   const [displayCount, setDisplayCount] = useState<number>(() => {
     // Render enough items up-front to satisfy both a deep-linked lightbox slide
@@ -161,7 +152,6 @@ export function GalleryPage({ details }: GalleryPageProps) {
   // React-controlled — so we must re-add it from here on every render, or a
   // selection re-render would drop it and restart the shimmer over the image.
   const loadedAssetsRef = useRef<Set<string>>(new Set());
-  const lastSelectedIndexRef = useRef<number | null>(null);
   const headerRef = useRef<HTMLDivElement | null>(null);
   const [headerHeight, setHeaderHeight] = useState(96);
 
@@ -195,16 +185,6 @@ export function GalleryPage({ details }: GalleryPageProps) {
     return () => window.removeEventListener('error', handleError, true);
   }, []);
 
-  // Sync selection state with body class
-  useEffect(() => {
-    if (selectedAssets.size > 0) {
-      document.body.classList.add('selection-mode');
-    } else {
-      document.body.classList.remove('selection-mode');
-    }
-    return () => document.body.classList.remove('selection-mode');
-  }, [selectedAssets.size]);
-
   // Auto-dismiss upload toast
   useEffect(() => {
     if (!uploadStatus || isUploading) return;
@@ -236,7 +216,7 @@ export function GalleryPage({ details }: GalleryPageProps) {
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [selectedAssets.size, filteredAssets, displayCount]);
+  }, [selectedAssets.size, filteredAssets, displayCount, setSelectedAssets]);
 
   // Group filteredAssets by date
   const groups = useMemo(() => groupAssetsByDate(filteredAssets), [filteredAssets]);
@@ -729,59 +709,6 @@ export function GalleryPage({ details }: GalleryPageProps) {
   });
 
   // Toggles and selection behaviors
-  const onToggleAsset = (id: string, index?: number, shiftKey?: boolean) => {
-    // Capture the anchor BEFORE we overwrite the ref at the end of this call.
-    // setSelectedAssets runs its updater asynchronously, so reading
-    // lastSelectedIndexRef inside it would see the just-written value and
-    // collapse the range to the single clicked tile.
-    const anchorIndex = lastSelectedIndexRef.current;
-    setSelectedAssets((prev) => {
-      const next = new Set(prev);
-      // Shift-click range select
-      if (shiftKey && index != null && anchorIndex != null) {
-        const start = Math.min(anchorIndex, index);
-        const end = Math.max(anchorIndex, index);
-        for (let i = start; i <= end; i++) {
-          if (i < filteredAssets.length) {
-            next.add(filteredAssets[i].id);
-          }
-        }
-      } else if (next.has(id)) {
-        next.delete(id);
-      } else {
-        next.add(id);
-      }
-      return next;
-    });
-    if (index != null) {
-      lastSelectedIndexRef.current = index;
-    }
-  };
-
-  const getGroupSelectionStatus = (groupItems: { asset: SafeAsset }[]) => {
-    const allSelected = groupItems.every((item) => selectedAssets.has(item.asset.id));
-    return allSelected;
-  };
-
-  const onToggleGroup = (groupItems: { asset: SafeAsset }[]) => {
-    setSelectedAssets((prev) => {
-      const next = new Set(prev);
-      const allSelected = groupItems.every((item) => prev.has(item.asset.id));
-      if (allSelected) {
-        groupItems.forEach((item) => next.delete(item.asset.id));
-      } else {
-        groupItems.forEach((item) => next.add(item.asset.id));
-      }
-      return next;
-    });
-  };
-
-  const downloadSelectionUrl = () => {
-    if (selectedAssets.size === 0) return '';
-    const idsStr = Array.from(selectedAssets).join(',');
-    return `/share/${realKey}/download?asset_ids=${encodeURIComponent(idsStr)}`;
-  };
-
   // Reset the download-all button once the download has actually kicked off or
   // the user dismissed the browser's save dialog. We can't observe an <a>-driven
   // download directly, so we reset on the next window focus (fires when a save
@@ -857,18 +784,6 @@ export function GalleryPage({ details }: GalleryPageProps) {
       localStorage.setItem('uploader_name', name);
     }
     setShowSettingsModal(false);
-  };
-
-  const toggleUploader = (name: string) => {
-    setEnabledUploaders((prev) => {
-      const next = new Set(prev ?? distinctUploaders);
-      if (next.has(name)) {
-        next.delete(name);
-      } else {
-        next.add(name);
-      }
-      return next;
-    });
   };
 
   const handleSettingsNameBlur = () => {
