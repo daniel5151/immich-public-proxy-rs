@@ -210,7 +210,8 @@ pub async fn get_share_details(
         .map_err(|e| e.to_string())?;
 
     if status == 401 {
-        return server_helpers::handle_unauthorized(&client, &key, ipp_public_base_url).await;
+        return server_helpers::handle_unauthorized(&client, &key, &text, ipp_public_base_url)
+            .await;
     }
 
     if !status.is_success() {
@@ -346,8 +347,26 @@ mod server_helpers {
     pub async fn handle_unauthorized(
         client: &ImmichClient,
         key: &str,
+        body: &str,
         ipp_public_base_url: String,
     ) -> Result<ShareDetails, String> {
+        // Immich answers a password-protected share with HTTP 401 and a body of
+        // `{"message":"Password required",...}` (no password supplied) or
+        // `{"message":"Invalid password",...}` (wrong password). In both cases
+        // the right response is the password prompt — "Invalid password" means
+        // try again, not "bad share". Trust the body directly: it works
+        // regardless of which user owns the link, whereas the admin
+        // `/shared-links` lookup below only sees links owned by the admin API
+        // key's user and would otherwise misreport someone else's
+        // password-protected share as an invalid key.
+        if body.contains("Password required") || body.contains("Invalid password") {
+            eprintln!(
+                "Share '{}' requires a password (per Immich 401 body)",
+                key
+            );
+            return Ok(password_required_response(key, ipp_public_base_url));
+        }
+
         match client.get_admin_shared_link(key).await {
             Ok(Some(link)) if link.password.is_some() => {
                 eprintln!("Share '{}' requires a password", key);
