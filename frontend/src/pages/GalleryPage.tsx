@@ -14,6 +14,7 @@ import { DropOverlay } from '../components/DropOverlay';
 import { UploadToast } from '../components/UploadToast';
 import { NameModal } from '../components/NameModal';
 import { SettingsModal } from '../components/SettingsModal';
+import { GalleryGrid } from '../components/GalleryGrid';
 
 import 'lightgallery/css/lightgallery-bundle.css';
 
@@ -1461,106 +1462,18 @@ export function GalleryPage({ details }: GalleryPageProps) {
       )}
 
       {/* LightGallery Grid container */}
-      <div id="lightgallery" ref={galleryContainerRef}>
-        {groups.map((group) => {
-          const groupStartIndex = group.items[0].globalIndex;
-          if (displayCount <= groupStartIndex) return null;
-
-          const isGroupSelected = getGroupSelectionStatus(group.items);
-          const visibleGroupItems = group.items.filter((item) => item.globalIndex < displayCount);
-
-          return (
-            <div
-              key={group.label}
-              className="gallery-date-group"
-              ref={(el) => {
-                if (el) dateGroupRefs.current.set(group.label, el);
-                else dateGroupRefs.current.delete(group.label);
-              }}
-            >
-              <div className="gallery-date-header">
-                <span className="date-label">{group.label}</span>
-                <div
-                  className={`date-selector ${isGroupSelected ? 'selected' : ''}`}
-                  onClick={() => onToggleGroup(group.items)}
-                >
-                  <span className="check-icon"></span>
-                </div>
-              </div>
-
-              <div className="gallery-date-items">
-                {visibleGroupItems.map(({ globalIndex, asset }) => {
-                  const isAssetSelected = selectedAssets.has(asset.id);
-                  const isVideo = asset.type === 'VIDEO';
-
-                  // Dynamic layout basis calculation
-                  const aspect = (asset.width || 4) / (asset.height || 3);
-                  const flexBasis = `${250 * aspect}px`;
-
-                  return (
-                    <div
-                      key={asset.id}
-                      className={`tile-wrapper ${isAssetSelected ? 'selected' : ''}`}
-                      // Seed the 'loaded' class from a ref callback (post-render,
-                      // so reading the ref is allowed) rather than during render.
-                      // This keeps an already-loaded thumbnail from replaying the
-                      // shimmer/fade-in when the tile re-renders (e.g. on selection
-                      // or filter changes), while the <img> onLoad below is what
-                      // first adds the class as each thumbnail finishes loading.
-                      ref={(el) => {
-                        if (el && loadedAssetsRef.current.has(asset.id)) el.classList.add('loaded');
-                      }}
-                      style={{ flexBasis, flexGrow: aspect }}
-                    >
-                      <div
-                        className="tile-selector"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          e.preventDefault();
-                          onToggleAsset(asset.id, globalIndex, e.shiftKey);
-                        }}
-                      >
-                        <span className="check-icon"></span>
-                      </div>
-                      <a
-                        className="gallery-item"
-                        data-index={globalIndex}
-                        data-asset-id={asset.id}
-                        href={`/share/photo/${realKey}/${asset.id}/preview`}
-                        onClick={(e) => {
-                          e.preventDefault();
-                          if (selectedAssets.size > 0) {
-                            e.stopPropagation();
-                            onToggleAsset(asset.id, globalIndex, e.shiftKey);
-                          }
-                          // Otherwise let lightGallery click handler take over
-                        }}
-                      >
-                        <img
-                          loading="lazy"
-                          src={`/share/photo/${realKey}/${asset.id}/thumbnail`}
-                          alt=""
-                          onLoad={(e) => {
-                            loadedAssetsRef.current.add(asset.id);
-                            const wrapper = (e.target as HTMLElement).closest('.tile-wrapper');
-                            if (wrapper) wrapper.classList.add('loaded');
-                          }}
-                        />
-                        {asset.uploaderName && (
-                          <div className={`uploader-badge ${asset.uploaderIsFallback ? 'using-owner-data' : ''}`}>
-                            {asset.uploaderName}
-                          </div>
-                        )}
-                        {isVideo && <div className="play-icon"></div>}
-                      </a>
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-          );
-        })}
-      </div>
+      <GalleryGrid
+        containerRef={galleryContainerRef}
+        groups={groups}
+        displayCount={displayCount}
+        realKey={realKey}
+        selectedAssets={selectedAssets}
+        loadedAssetsRef={loadedAssetsRef}
+        dateGroupRefs={dateGroupRefs}
+        getGroupSelectionStatus={getGroupSelectionStatus}
+        onToggleGroup={onToggleGroup}
+        onToggleAsset={onToggleAsset}
+      />
 
       {/* Date scrubber — proportional, full-height (immich-style) */}
       {groups.length > 1 && scrubberHeight > 0 && (
