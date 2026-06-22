@@ -49,7 +49,15 @@ graph TD
 │   ├── src/
 │   │   ├── types/
 │   │   │   └── generated/     # Generated TS types (DO NOT edit manually)
-│   │   ├── App.tsx             # Core React app code & routing
+│   │   ├── components/         # Presentational pieces (GalleryGrid, DropOverlay,
+│   │   │                       #   UploadToast, NameModal, SettingsModal)
+│   │   ├── pages/              # Route-level screens (GalleryPage, HomePage,
+│   │   │                       #   PasswordPage)
+│   │   ├── hooks/              # Stateful logic (useGalleryViewport, useDateScrubber,
+│   │   │                       #   useLightGallery, useUpload, useUploaderFilter,
+│   │   │                       #   useSelection)
+│   │   ├── lib/                # Pure helpers (groupAssetsByDate, uploadStatus, layout)
+│   │   ├── App.tsx             # Thin router; mounts the page components
 │   │   ├── index.css           # Modular stylesheet (copied from style/main.css)
 │   │   └── main.tsx            # React entry mount point
 │   ├── package.json
