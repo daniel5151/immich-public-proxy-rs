@@ -253,14 +253,9 @@ export function GalleryPage({ details }: GalleryPageProps) {
     filteredAssets,
     groups,
     headerHeight,
-    displayCount,
-    setDisplayCount,
-    galleryContainerRef,
+    viewport,
     dateGroupRefs,
     lgOpenRef,
-    didRestoreScrollRef,
-    pendingScrollRef,
-    scrollElementUnderHeader,
   });
 
   // Reset displayCount when filter changes. Skip the initial mount run so a

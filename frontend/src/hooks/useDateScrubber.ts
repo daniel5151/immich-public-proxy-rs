@@ -2,6 +2,7 @@ import { useState, useEffect, useMemo, useRef } from 'react';
 import type { RefObject } from 'react';
 import type { SafeAsset } from '../types/generated/SafeAsset';
 import type { DateGroup } from '../types';
+import type { GalleryViewport } from './useGalleryViewport';
 import { HEADER_GAP, ACTIVE_LINE_GAP } from '../lib/layout';
 
 const SCRUBBER_PAD = 6; // top & bottom breathing room inside the bar
@@ -20,14 +21,13 @@ interface UseDateScrubberArgs {
   filteredAssets: SafeAsset[];
   groups: DateGroup[];
   headerHeight: number;
-  displayCount: number;
-  setDisplayCount: (updater: number | ((current: number) => number)) => void;
-  galleryContainerRef: RefObject<HTMLDivElement | null>;
+  // The render-window + scroll-position machinery the scrubber drives and reads:
+  // it grows displayCount to bring a scrubbed-to date into view, scrolls via the
+  // shared primitive, queues far jumps through pendingScrollRef, and respects the
+  // restore-once guard. Passed as one unit instead of six loose props.
+  viewport: GalleryViewport;
   dateGroupRefs: RefObject<Map<string, HTMLDivElement>>;
   lgOpenRef: RefObject<boolean>;
-  didRestoreScrollRef: RefObject<boolean>;
-  pendingScrollRef: RefObject<(() => HTMLElement | null | undefined) | null>;
-  scrollElementUnderHeader: (el: HTMLElement, smooth?: boolean) => void;
 }
 
 export interface UseDateScrubberResult {
@@ -59,15 +59,18 @@ export function useDateScrubber({
   filteredAssets,
   groups,
   headerHeight,
-  displayCount,
-  setDisplayCount,
-  galleryContainerRef,
+  viewport,
   dateGroupRefs,
   lgOpenRef,
-  didRestoreScrollRef,
-  pendingScrollRef,
-  scrollElementUnderHeader,
 }: UseDateScrubberArgs): UseDateScrubberResult {
+  const {
+    displayCount,
+    setDisplayCount,
+    galleryContainerRef,
+    didRestoreScrollRef,
+    pendingScrollRef,
+    scrollElementUnderHeader,
+  } = viewport;
   const scrubberRef = useRef<HTMLDivElement | null>(null);
   const scrubRafRef = useRef<number | null>(null);
   const [scrubberHeight, setScrubberHeight] = useState(0);
