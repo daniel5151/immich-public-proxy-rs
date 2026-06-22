@@ -3,7 +3,6 @@ import type { ShareDetails } from '../types/generated/ShareDetails';
 import type { SafeAsset } from '../types/generated/SafeAsset';
 import lightGallery from 'lightgallery';
 import { groupAssetsByDate } from '../lib/groupAssetsByDate';
-import { startBatchStatusPoll, startStatusStream } from '../lib/uploadStatus';
 import { DropOverlay } from '../components/DropOverlay';
 import { UploadToast } from '../components/UploadToast';
 import { NameModal } from '../components/NameModal';
@@ -13,6 +12,7 @@ import { useLightGallery } from '../hooks/useLightGallery';
 import { useUploaderFilter } from '../hooks/useUploaderFilter';
 import { useSelection } from '../hooks/useSelection';
 import { useDateScrubber } from '../hooks/useDateScrubber';
+import { useUpload } from '../hooks/useUpload';
 import { HEADER_GAP } from '../lib/layout';
 
 import 'lightgallery/css/lightgallery-bundle.css';
@@ -105,19 +105,8 @@ export function GalleryPage({ details }: GalleryPageProps) {
     }
     return Math.min(needed, assets.length);
   });
-  const [isUploading, setIsUploading] = useState(false);
-  const [uploadProgress, setUploadProgress] = useState({ completed: 0, total: 0 });
-  const [uploadStatus, setUploadStatus] = useState<{ type: 'success' | 'failed'; message?: string } | null>(null);
-  const [isDragOver, setIsDragOver] = useState(false);
   const [isDownloading, setIsDownloading] = useState(false);
-  const dragCounterRef = useRef(0);
 
-  // Upload name prompt modal (kept separate from settings for the upload flow)
-  const [showNameModal, setShowNameModal] = useState(false);
-  const [uploaderName, setUploaderName] = useState(() => localStorage.getItem('uploader_name') || '');
-
-  const fileInputRef = useRef<HTMLInputElement>(null);
-  const pendingDropFilesRef = useRef<File[] | null>(null);
   const lgRef = useRef<LightGallery | null>(null);
   const galleryContainerRef = useRef<HTMLDivElement>(null);
   const dateGroupRefs = useRef<Map<string, HTMLDivElement>>(new Map());
@@ -141,6 +130,55 @@ export function GalleryPage({ details }: GalleryPageProps) {
   const headerRef = useRef<HTMLDivElement | null>(null);
   const [headerHeight, setHeaderHeight] = useState(96);
 
+  // Insert a freshly-uploaded asset into the gallery in album order, then grow
+  // the lazy-load window by one so it's rendered. Owns setAssets/setDisplayCount,
+  // so it stays in the component and is handed to the upload hook as the sink for
+  // each ready asset.
+  const insertAndSortAsset = (newAsset: SafeAsset) => {
+    setAssets((prev) => {
+      if (prev.some((a) => a.id === newAsset.id)) return prev;
+      const next = [...prev, newAsset];
+      const order = details.link.album?.order;
+      if (order === 'asc') {
+        next.sort((a, b) => {
+          const ad = a.fileCreatedAt ? new Date(a.fileCreatedAt).getTime() : 0;
+          const bd = b.fileCreatedAt ? new Date(b.fileCreatedAt).getTime() : 0;
+          return ad - bd;
+        });
+      } else if (order === 'desc') {
+        next.sort((a, b) => {
+          const ad = a.fileCreatedAt ? new Date(a.fileCreatedAt).getTime() : 0;
+          const bd = b.fileCreatedAt ? new Date(b.fileCreatedAt).getTime() : 0;
+          return bd - ad;
+        });
+      }
+      return next;
+    });
+    setDisplayCount((c) => c + 1);
+  };
+
+  // Upload subsystem: progress/toast state, drag-and-drop, the uploader-name
+  // prompt modal, and the file-POST loop wired to the SSE/poll status watcher.
+  // `uploaderName`/`setUploaderName` are also consumed by the SettingsModal.
+  const {
+    isUploading,
+    uploadProgress,
+    uploadStatus,
+    isDragOver,
+    showNameModal,
+    uploaderName,
+    setUploaderName,
+    fileInputRef,
+    triggerFileInput,
+    handleCancelNameModal,
+    onConfirmName,
+    onFileChange,
+    onDragEnter,
+    onDragLeave,
+    onDragOver,
+    onDrop,
+  } = useUpload({ realKey, allowUpload, onAssetReady: insertAndSortAsset });
+
   // CSP compliance: error boundary for missing thumbnails
   useEffect(() => {
     const handleError = (e: ErrorEvent) => {
@@ -153,14 +191,6 @@ export function GalleryPage({ details }: GalleryPageProps) {
     window.addEventListener('error', handleError, true);
     return () => window.removeEventListener('error', handleError, true);
   }, []);
-
-  // Auto-dismiss upload toast
-  useEffect(() => {
-    if (!uploadStatus || isUploading) return;
-    const delay = uploadStatus.type === 'failed' ? 8000 : 4000;
-    const timer = setTimeout(() => setUploadStatus(null), delay);
-    return () => clearTimeout(timer);
-  }, [uploadStatus, isUploading]);
 
   // Keyboard navigation
   useEffect(() => {
@@ -433,44 +463,6 @@ export function GalleryPage({ details }: GalleryPageProps) {
     window.addEventListener('focus', finish);
   };
 
-  // Upload helpers
-  const triggerFileInput = () => {
-    const name = (localStorage.getItem('uploader_name') || '').trim();
-    if (!name) {
-      setUploaderName('');
-      setShowNameModal(true);
-    } else {
-      fileInputRef.current?.click();
-    }
-  };
-
-  const handleCancelNameModal = () => {
-    setShowNameModal(false);
-    setUploaderName(localStorage.getItem('uploader_name') || '');
-    pendingDropFilesRef.current = null;
-  };
-
-  const onConfirmName = (e: React.FormEvent) => {
-    e.preventDefault();
-    const name = uploaderName.trim();
-    if (name) {
-      localStorage.setItem('uploader_name', name);
-      setShowNameModal(false);
-      // If the name modal was triggered by a drag-and-drop, upload those
-      // stashed files directly instead of popping the file picker.
-      const pending = pendingDropFilesRef.current;
-      if (pending && pending.length > 0) {
-        pendingDropFilesRef.current = null;
-        void uploadFiles(pending);
-      } else {
-        // Small timeout to allow state to settle before file dialog
-        setTimeout(() => {
-          fileInputRef.current?.click();
-        }, 50);
-      }
-    }
-  };
-
   // Settings modal open handler
   const openSettings = () => {
     // Initialize enabled uploaders on first open if multiple uploaders exist
@@ -494,165 +486,6 @@ export function GalleryPage({ details }: GalleryPageProps) {
   const handleSettingsNameBlur = () => {
     const name = uploaderName.trim();
     if (name) localStorage.setItem('uploader_name', name);
-  };
-
-  const insertAndSortAsset = (newAsset: SafeAsset) => {
-    setAssets((prev) => {
-      if (prev.some((a) => a.id === newAsset.id)) return prev;
-      const next = [...prev, newAsset];
-      const order = details.link.album?.order;
-      if (order === 'asc') {
-        next.sort((a, b) => {
-          const ad = a.fileCreatedAt ? new Date(a.fileCreatedAt).getTime() : 0;
-          const bd = b.fileCreatedAt ? new Date(b.fileCreatedAt).getTime() : 0;
-          return ad - bd;
-        });
-      } else if (order === 'desc') {
-        next.sort((a, b) => {
-          const ad = a.fileCreatedAt ? new Date(a.fileCreatedAt).getTime() : 0;
-          const bd = b.fileCreatedAt ? new Date(b.fileCreatedAt).getTime() : 0;
-          return bd - ad;
-        });
-      }
-      return next;
-    });
-    setDisplayCount((c) => c + 1);
-  };
-
-  // Upload-status watchers live in ./lib/uploadStatus. Both expose the same
-  // { add(id), done() } controller; `USE_SSE` selects server-push (SSE) over the
-  // batched client poll. `insertAndSortAsset` is the gallery-side sink for each
-  // ready asset (it owns setAssets/setDisplayCount, so it stays in the component).
-  const USE_SSE = true;
-
-  const uploadFiles = async (files: File[]) => {
-    if (files.length === 0) return;
-
-    const count = files.length;
-    setIsUploading(true);
-    setUploadProgress({ completed: 0, total: count });
-    setUploadStatus(null);
-
-    const encodedName = encodeURIComponent(uploaderName.trim());
-    let success = true;
-    let failedName = '';
-
-    // Start the status watcher up front so each asset can flow back into the
-    // gallery as soon as it's ready. Both implementations share the same
-    // { add(id), done() } controller shape; `USE_SSE` selects server-push (SSE)
-    // vs. the batched client poll. (For SSE, `add` only buffers ids and the stream
-    // actually opens on `done()` — see startStatusStream for why.)
-    const poller = USE_SSE
-      ? startStatusStream(realKey, { onAssetReady: insertAndSortAsset })
-      : startBatchStatusPoll(realKey, { onAssetReady: insertAndSortAsset });
-
-    // SSE uses a server-tracked, session-scoped pending set: tag every upload with
-    // the controller's session token so the open stream picks the asset up on its
-    // next tick. The poll path has no session token, so the param is simply omitted.
-    const sessionToken = 'sessionToken' in poller ? poller.sessionToken : undefined;
-    const uploadUrl = sessionToken
-      ? `/share/${realKey}/upload?session=${encodeURIComponent(sessionToken)}`
-      : `/share/${realKey}/upload`;
-
-    for (let i = 0; i < count; i++) {
-      const file = files[i];
-      const fileDate = new Date(file.lastModified).toISOString();
-
-      const formData = new FormData();
-      formData.append('assetData', file, file.name);
-      formData.append('deviceAssetId', file.name);
-      formData.append('deviceId', 'immich-public-proxy');
-      formData.append('fileCreatedAt', fileDate);
-      formData.append('fileModifiedAt', fileDate);
-
-      try {
-        const res = await fetch(uploadUrl, {
-          method: 'POST',
-          body: formData,
-          headers: {
-            'x-uploader-name': encodedName,
-          },
-        });
-        if (!res.ok) {
-          success = false;
-          failedName = file.name;
-          break;
-        }
-        const uploadResult: { id: string } = await res.json();
-        poller.add(uploadResult.id);
-      } catch {
-        success = false;
-        failedName = file.name;
-        break;
-      }
-
-      setUploadProgress((p) => ({ ...p, completed: p.completed + 1 }));
-    }
-
-    // Signal the poller that no more ids are coming; it finishes draining and exits.
-    poller.done();
-
-    if (success) {
-      setUploadStatus({ type: 'success' });
-    } else {
-      setUploadStatus({ type: 'failed', message: `Failed to upload: ${failedName}` });
-    }
-    setIsUploading(false);
-  };
-
-  const onFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const filesList = e.target.files;
-    if (!filesList || filesList.length === 0) return;
-    const files = Array.from(filesList);
-    // Reset file input value so same selection triggers event next time
-    e.target.value = '';
-    await uploadFiles(files);
-  };
-
-  // Drag-and-drop handlers
-  const onDragEnter = (e: React.DragEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-    if (!allowUpload) return;
-    dragCounterRef.current++;
-    if (e.dataTransfer.types.includes('Files')) {
-      setIsDragOver(true);
-    }
-  };
-
-  const onDragLeave = (e: React.DragEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-    dragCounterRef.current--;
-    if (dragCounterRef.current === 0) {
-      setIsDragOver(false);
-    }
-  };
-
-  const onDragOver = (e: React.DragEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-  };
-
-  const onDrop = (e: React.DragEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-    setIsDragOver(false);
-    dragCounterRef.current = 0;
-    if (!allowUpload || isUploading) return;
-    const files = Array.from(e.dataTransfer.files);
-    if (files.length === 0) return;
-    const name = (localStorage.getItem('uploader_name') || '').trim();
-    if (!name) {
-      // No uploader name yet: stash the dropped files and prompt for a name.
-      // They'll be uploaded on confirm, so we don't lose this drop or pop the
-      // file picker.
-      pendingDropFilesRef.current = files;
-      setUploaderName('');
-      setShowNameModal(true);
-      return;
-    }
-    void uploadFiles(files);
   };
 
   return (
