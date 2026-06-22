@@ -8,6 +8,7 @@ import lgFullscreen from 'lightgallery/plugins/fullscreen';
 import lgHash from 'lightgallery/plugins/hash';
 import type { GalleryItem } from 'lightgallery/lg-utils';
 import type { SafeAsset } from '../types/generated/SafeAsset';
+import type { GalleryViewport } from './useGalleryViewport';
 
 type LightGallery = ReturnType<typeof lightGallery>;
 
@@ -15,11 +16,12 @@ interface UseLightGalleryArgs {
   filteredAssets: SafeAsset[];
   realKey: string;
   allowDownload: boolean;
-  galleryContainerRef: RefObject<HTMLDivElement | null>;
+  // The gallery container ref (lightGallery builds its dynamicEl from it) and the
+  // grid-jump used on slideshow close, both owned by the viewport.
+  viewport: GalleryViewport;
   lgRef: RefObject<LightGallery | null>;
   lgOpenRef: RefObject<boolean>;
   currentSlideIdRef: RefObject<string | null>;
-  scrollGridToAssetId: (assetId: string) => void;
 }
 
 /**
@@ -32,12 +34,12 @@ export function useLightGallery({
   filteredAssets,
   realKey,
   allowDownload,
-  galleryContainerRef,
+  viewport,
   lgRef,
   lgOpenRef,
   currentSlideIdRef,
-  scrollGridToAssetId,
 }: UseLightGalleryArgs) {
+  const { galleryContainerRef, scrollToAssetId: scrollGridToAssetId } = viewport;
   // lightGallery initialization / update — uses filteredAssets
   useEffect(() => {
     if (filteredAssets.length === 0) return;

@@ -90,15 +90,10 @@ export function GalleryPage({ details }: GalleryPageProps) {
     headerHeight,
     isUploadingRef,
   });
-  const {
-    displayCount,
-    setDisplayCount,
-    galleryContainerRef,
-    observerRef,
-    pendingScrollRef,
-    didRestoreScrollRef,
-    scrollElementUnderHeader,
-  } = viewport;
+  // Only the render window and the two JSX-bound refs are read directly here; the
+  // scroll primitives (scrollElementUnderHeader, pendingScrollRef,
+  // didRestoreScrollRef) are consumed by the scrubber/lightbox via `viewport`.
+  const { displayCount, setDisplayCount, galleryContainerRef, observerRef } = viewport;
 
   // Insert a freshly-uploaded asset into the gallery in album order, then grow
   // the lazy-load window by one so it's rendered. Owns setAssets/setDisplayCount,
@@ -280,11 +275,10 @@ export function GalleryPage({ details }: GalleryPageProps) {
     filteredAssets,
     realKey,
     allowDownload,
-    galleryContainerRef,
+    viewport,
     lgRef,
     lgOpenRef,
     currentSlideIdRef,
-    scrollGridToAssetId: viewport.scrollToAssetId,
   });
 
   // Toggles and selection behaviors
