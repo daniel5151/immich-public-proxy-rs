@@ -350,6 +350,7 @@ impl ImmichClient {
                     width: None,
                     height: None,
                     ratio: data.ratio.get(i).copied(),
+                    thumbhash: data.thumbhash.get(i).cloned().flatten(),
                     exif_info: None,
                     db_id: None,
                     owner: None,

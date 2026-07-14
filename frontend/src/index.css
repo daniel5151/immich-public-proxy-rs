@@ -326,6 +326,14 @@ body.selection-mode .date-selector,
     animation: shimmer 1.5s ease-in-out infinite;
 }
 
+.gallery-date-items .tile-wrapper.has-thumbhash {
+    animation: none;
+    background-image: var(--thumbhash-url);
+    background-size: cover;
+    background-position: center;
+    background-repeat: no-repeat;
+}
+
 .gallery-date-items .tile-wrapper.loaded {
     animation: none;
     background: #111;
@@ -354,6 +362,14 @@ body.selection-mode .date-selector,
 .gallery-date-items .tile-wrapper.loaded img {
     opacity: 1;
 }
+
+.gallery-date-items .tile-wrapper.has-thumbhash.loaded {
+    background-image: var(--thumbhash-url);
+    background-size: cover;
+    background-position: center;
+    background-repeat: no-repeat;
+}
+
 
 .tile-wrapper.thumb-error {
     animation: none;

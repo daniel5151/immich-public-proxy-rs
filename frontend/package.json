@@ -12,7 +12,8 @@
   "dependencies": {
     "lightgallery": "^2.9.0",
     "react": "^19.2.6",
-    "react-dom": "^19.2.6"
+    "react-dom": "^19.2.6",
+    "thumbhash": "^0.1.1"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

@@ -1,6 +1,20 @@
 import type { RefObject } from 'react';
+import { thumbHashToDataURL } from 'thumbhash';
 import type { SafeAsset } from '../types/generated/SafeAsset';
 import type { DateGroup } from '../types';
+
+const thumbhashUrlCache = new Map<string, string>();
+function getThumbhashUrl(base64: string): string {
+  let url = thumbhashUrlCache.get(base64);
+  if (!url) {
+    const binary = atob(base64);
+    const hash = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) hash[i] = binary.charCodeAt(i);
+    url = thumbHashToDataURL(hash);
+    thumbhashUrlCache.set(base64, url);
+  }
+  return url;
+}
 
 interface GalleryGridProps {
   containerRef: RefObject<HTMLDivElement | null>;
@@ -72,7 +86,7 @@ export function GalleryGrid({
                 return (
                   <div
                     key={asset.id}
-                    className={`tile-wrapper ${isAssetSelected ? 'selected' : ''}`}
+                    className={`tile-wrapper ${isAssetSelected ? 'selected' : ''} ${asset.thumbhash ? 'has-thumbhash' : ''}`}
                     // Seed the 'loaded' class from a ref callback (post-render,
                     // so reading the ref is allowed) rather than during render.
                     // This keeps an already-loaded thumbnail from replaying the
@@ -82,7 +96,7 @@ export function GalleryGrid({
                     ref={(el) => {
                       if (el && loadedAssetsRef.current.has(asset.id)) el.classList.add('loaded');
                     }}
-                    style={{ flexBasis, flexGrow: aspect }}
+                    style={{ flexBasis, flexGrow: aspect, ...(asset.thumbhash ? { '--thumbhash-url': `url(${getThumbhashUrl(asset.thumbhash)})` } : {}) } as React.CSSProperties}
                   >
                     <div
                       className="tile-selector"

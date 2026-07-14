@@ -12,6 +12,7 @@ pub struct SafeAsset {
     pub original_mime_type: Option<String>,
     pub file_created_at: Option<String>,
     pub ratio: Option<f32>,
+    pub thumbhash: Option<String>,
     pub uploader_name: Option<String>,
     #[serde(default)]
     pub uploader_is_fallback: bool,
@@ -65,6 +66,7 @@ impl SafeAsset {
             original_mime_type: asset.original_mime_type,
             file_created_at: asset.file_created_at,
             ratio,
+            thumbhash: asset.thumbhash,
             uploader_name: None,
             uploader_is_fallback: false,
             owner_id: asset.owner_id,

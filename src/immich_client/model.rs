@@ -46,6 +46,7 @@ pub struct Asset {
     pub height: Option<i32>,
     #[serde(default)]
     pub ratio: Option<f32>,
+    pub thumbhash: Option<String>,
     pub owner_id: Option<String>,
     pub owner: Option<User>,
     pub tags: Option<Vec<Tag>>,
@@ -128,4 +129,6 @@ pub struct TimeBucketData {
     pub owner_id: Vec<String>,
     #[serde(default)]
     pub ratio: Vec<f32>,
+    #[serde(default)]
+    pub thumbhash: Vec<Option<String>>,
 }
