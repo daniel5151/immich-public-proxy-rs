@@ -116,17 +116,20 @@ Used to fetch share details, check passwords, and display uploader attribution b
 | **Link Not Found Resolution**   | `sharedLink.read`        | Distinguishes invalid keys from password-protected keys, avoiding infinite password prompt loops.                  |
 | **Uploader Attribution Badges** | `tag.read`, `asset.read` | Relies on photos having tags with format `SharedBy/{name}`.                                                        |
 | **Efficient User Resolution**   | `user.read`              | Recommended; allows fetching all users at once to resolve owner fallback names, avoiding slow sequential requests. |
+| **Upload User Album Access**   | `albumUser.create`      | Required to grant the upload service account editor access on albums.                                              |
 
 #### `IMMICH_API_KEY_UPLOAD_USER` (Upload Service Account API Key)
 
 Required to support uploading to shared albums.
 
-| Feature                        | Required Permissions            | Notes                                                                                                 |
-| :----------------------------- | :------------------------------ | :---------------------------------------------------------------------------------------------------- |
-| **Asset Upload**               | `asset.create`                  | Required to upload photos and videos to Immich.                                                       |
-| **Uploader Tagging**           | `tag.create`, `tag.read`        | Required to create and apply `SharedBy/{name}` tags.                                                  |
-| **Album Association**          | `album.write` or `album.update` | Required to add the uploaded asset to the shared album.                                               |
-| **Restore Trashed Duplicates** | `asset.delete`                  | Required if you want the proxy to automatically restore duplicate uploads that were manually trashed. |
+| Feature                        | Required Permissions                     | Notes                                                                                                 |
+| :----------------------------- | :--------------------------------------- | :---------------------------------------------------------------------------------------------------- |
+| **Asset Upload**               | `asset.upload`                           | Required to upload photos and videos to Immich.                                                       |
+| **Uploader Tagging**           | `tag.create`, `tag.read`, `tag.asset`    | Required to create and apply `SharedBy/{name}` tags.                                                  |
+| **Album Association**          | `albumAsset.create`                      | Required to add the uploaded asset to the shared album.                                               |
+| **Restore Trashed Duplicates** | `asset.delete`                           | Required if you want the proxy to automatically restore duplicate uploads that were manually trashed. |
+| **Upload Status Polling**      | `asset.read`, `asset.view`               | Required to check asset existence and thumbnail readiness after upload.                               |
+| **Service Account Identity**   | `user.read`                              | Required to resolve the upload service account's Immich user ID.                                      |
 
 ### Systemd Service Example
 

@@ -58,15 +58,34 @@ pub struct User {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct AlbumUser {
+    pub user: User,
+    pub role: String, // "owner" | "editor" | "viewer"
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Album {
     pub id: String,
     pub album_name: Option<String>,
     pub description: Option<String>,
     pub order: Option<String>, // 'asc' | 'desc'
     pub album_thumbnail_asset_id: Option<String>,
-    pub owner: Option<User>,
+    /// Album participants with roles. The owner has `role: "owner"`.
+    #[serde(default)]
+    pub album_users: Vec<AlbumUser>,
     #[serde(default)]
     pub assets: Vec<Asset>,
+}
+
+impl Album {
+    /// Returns the album owner from `album_users`.
+    pub fn get_owner(&self) -> Option<&User> {
+        self.album_users
+            .iter()
+            .find(|au| au.role == "owner")
+            .map(|au| &au.user)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -76,8 +95,7 @@ pub struct SharedLink {
     pub slug: Option<String>,
     pub description: Option<String>,
     pub expires_at: Option<String>,
-    #[serde(default)]
-    pub password_required: bool,
+
     pub r#type: Option<String>, // "ALBUM" or "INDIVIDUAL"
     pub allow_download: Option<bool>,
     pub allow_upload: Option<bool>,
@@ -85,5 +103,27 @@ pub struct SharedLink {
     #[serde(default)]
     pub assets: Vec<Asset>,
     pub album: Option<Album>,
+    /// Non-null means this shared link is password-protected.
     pub password: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TimeBucket {
+    pub time_bucket: String,
+    pub count: u32,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TimeBucketData {
+    pub id: Vec<String>,
+    #[serde(default)]
+    pub is_image: Vec<bool>,
+    #[serde(default)]
+    pub file_created_at: Vec<String>,
+    #[serde(default)]
+    pub owner_id: Vec<String>,
+    #[serde(default)]
+    pub ratio: Vec<f32>,
 }

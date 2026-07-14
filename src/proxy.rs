@@ -1,5 +1,5 @@
 use crate::immich_client::client::ImmichClient;
-use crate::immich_client::client::get_cookie_password;
+use crate::immich_client::client::get_cookie_share_token;
 use axum::body::Body;
 use axum::extract::Form;
 use axum::extract::Path;
@@ -105,6 +105,103 @@ fn check_csrf(headers: &HeaderMap) -> bool {
     }
 }
 
+fn shared_get_request(
+    client: &ImmichClient,
+    url: &str,
+    share_token: Option<&str>,
+    range: Option<&axum::http::HeaderValue>,
+) -> reqwest::RequestBuilder {
+    let mut req = client.http_client.get(url);
+    if let Some(token) = share_token {
+        req = req.header("cookie", format!("immich_shared_link_token={}", token));
+    }
+    if let Some(range) = range {
+        req = req.header(reqwest::header::RANGE, range.clone());
+    }
+    req
+}
+
+async fn fetch_shared_link_for_proxy(
+    client: &ImmichClient,
+    key: &str,
+    share_token: Option<&str>,
+    context: &str,
+) -> Result<crate::immich_client::model::SharedLink, StatusCode> {
+    match client.fetch_share_me(key, share_token).await {
+        Ok((status, text)) if status.is_success() => {
+            serde_json::from_str::<crate::immich_client::model::SharedLink>(&text).map_err(|e| {
+                eprintln!(
+                    "{}: failed to parse share link response for key '{}': {}",
+                    context, key, e
+                );
+                StatusCode::INTERNAL_SERVER_ERROR
+            })
+        }
+        Ok((status, text)) => {
+            eprintln!(
+                "{}: share link request failed for key '{}': {} — {}",
+                context, key, status, text
+            );
+            Err(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR))
+        }
+        Err(e) => {
+            eprintln!(
+                "{}: upstream request failed for key '{}': {}",
+                context, key, e
+            );
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+async fn resolve_canonical_share_key(
+    client: &ImmichClient,
+    key: &str,
+    share_token: Option<&str>,
+    context: &str,
+) -> Option<String> {
+    fetch_shared_link_for_proxy(client, key, share_token, context)
+        .await
+        .ok()
+        .map(|link| link.key)
+}
+
+/// On a 401 from an asset endpoint accessed via slug, resolve the canonical share
+/// key and retry the request with it.  Returns the retried response on success, or
+/// the original response unchanged if no retry was applicable.
+async fn retry_with_canonical_key(
+    client: &ImmichClient,
+    original_res: reqwest::Response,
+    key: &str,
+    share_token: Option<&str>,
+    subpath: &str,
+    range: Option<&axum::http::HeaderValue>,
+    context: &str,
+) -> Result<reqwest::Response, StatusCode> {
+    if original_res.status() != StatusCode::UNAUTHORIZED {
+        return Ok(original_res);
+    }
+    if let Some(canonical_key) =
+        resolve_canonical_share_key(client, key, share_token, context).await
+    {
+        if canonical_key != key {
+            let retry_params: Vec<(&str, &str)> = vec![("key", canonical_key.as_str())];
+            let retry_url = client.build_url(subpath, &retry_params);
+            match shared_get_request(client, &retry_url, share_token, range)
+                .send()
+                .await
+            {
+                Ok(res) => return Ok(res),
+                Err(e) => {
+                    eprintln!("{}: canonical-key retry failed: {}", context, e);
+                    return Err(StatusCode::INTERNAL_SERVER_ERROR);
+                }
+            }
+        }
+    }
+    Ok(original_res)
+}
+
 pub async fn unlock_share_handler(
     headers: HeaderMap,
     Form(payload): Form<UnlockPayload>,
@@ -118,53 +215,64 @@ pub async fn unlock_share_handler(
     }
 
     let client = ImmichClient::new();
-    let mut success = false;
-    let mut real_key = payload.key.clone();
 
-    if let Ok((status, text)) = client
-        .fetch_share_me(&payload.key, Some(&payload.password))
-        .await
-    {
-        if status.is_success() {
-            success = true;
+    // Immich 3.0: authenticate via POST /shared-links/login, which returns the
+    // SharedLinkResponseDto and sets an `immich_shared_link_token` cookie.
+    let login_result = client
+        .login_share_link(&payload.key, &payload.password)
+        .await;
+
+    match login_result {
+        Ok(Some((token, text))) => {
+            use base64::Engine;
+            let b64_key = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&payload.key);
+            let b64_token =
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(token.as_bytes());
+
+            let is_https = headers
+                .get("x-forwarded-proto")
+                .and_then(|p| p.to_str().ok())
+                .map(|p| p.eq_ignore_ascii_case("https"))
+                .unwrap_or(false);
+            let secure_flag = if is_https { " Secure;" } else { "" };
+
+            // Store the Immich shared-link token in the proxy's own cookie
+            let cookie1 = format!(
+                "immich_share_token_{}={};{} Path=/; HttpOnly; SameSite=Lax",
+                b64_key, b64_token, secure_flag
+            );
+            let mut resp = Redirect::to(&format!("/share/{}", payload.key)).into_response();
+            resp.headers_mut()
+                .append(axum::http::header::SET_COOKIE, cookie1.parse().unwrap());
+
+            // If the real key differs from the slug/identifier used, also set a cookie
+            // for the real key so both paths work
             if let Ok(link) = serde_json::from_str::<crate::immich_client::model::SharedLink>(&text)
             {
-                real_key = link.key;
+                if link.key != payload.key {
+                    let b64_real_key =
+                        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&link.key);
+                    let cookie2 = format!(
+                        "immich_share_token_{}={};{} Path=/; HttpOnly; SameSite=Lax",
+                        b64_real_key, b64_token, secure_flag
+                    );
+                    resp.headers_mut()
+                        .append(axum::http::header::SET_COOKIE, cookie2.parse().unwrap());
+                }
             }
+            return resp;
         }
-    }
-
-    if success {
-        use base64::Engine;
-        let b64_pwd = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&payload.password);
-        let b64_key = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&payload.key);
-
-        let is_https = headers
-            .get("x-forwarded-proto")
-            .and_then(|p| p.to_str().ok())
-            .map(|p| p.eq_ignore_ascii_case("https"))
-            .unwrap_or(false);
-        let secure_flag = if is_https { " Secure;" } else { "" };
-
-        let cookie1 = format!(
-            "immich_pwd_{}={};{} Path=/; HttpOnly; SameSite=Lax",
-            b64_key, b64_pwd, secure_flag
-        );
-        let mut resp = Redirect::to(&format!("/share/{}", payload.key)).into_response();
-        resp.headers_mut()
-            .append(axum::http::header::SET_COOKIE, cookie1.parse().unwrap());
-
-        if payload.key != real_key {
-            let b64_real_key = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&real_key);
-            let cookie2 = format!(
-                "immich_pwd_{}={};{} Path=/; HttpOnly; SameSite=Lax",
-                b64_real_key, b64_pwd, secure_flag
+        Ok(None) => {
+            // Auth failed (wrong password or invalid link)
+        }
+        Err(e) => {
+            eprintln!(
+                "unlock: login_share_link failed for key '{}': {}",
+                payload.key, e
             );
-            resp.headers_mut()
-                .append(axum::http::header::SET_COOKIE, cookie2.parse().unwrap());
         }
-        return resp;
     }
+
     Redirect::to(&format!("/share/{}", payload.key)).into_response()
 }
 
@@ -192,12 +300,9 @@ async fn proxy_photo_impl(
         return StatusCode::BAD_REQUEST.into_response();
     }
     let client = ImmichClient::new();
-    let cookie_password = get_cookie_password(&headers, &key);
+    let share_token = get_cookie_share_token(&headers, &key);
 
-    let mut params = vec![("key", key.as_str())];
-    if let Some(ref pwd) = cookie_password {
-        params.push(("password", pwd.as_str()));
-    }
+    let mut params: Vec<(&str, &str)> = vec![("key", key.as_str())];
 
     let subpath = if size_str == "original" {
         format!("/assets/{}/original", id)
@@ -207,13 +312,12 @@ async fn proxy_photo_impl(
     };
 
     let url = client.build_url(&subpath, &params);
+    let range = headers.get(axum::http::header::RANGE);
 
-    let mut req = client.http_client.get(&url);
-    if let Some(range) = headers.get(axum::http::header::RANGE) {
-        req = req.header(reqwest::header::RANGE, range.clone());
-    }
-
-    let res = match req.send().await {
+    let mut res = match shared_get_request(&client, &url, share_token.as_deref(), range)
+        .send()
+        .await
+    {
         Ok(res) => res,
         Err(e) => {
             eprintln!(
@@ -222,6 +326,21 @@ async fn proxy_photo_impl(
             );
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
+    };
+
+    res = match retry_with_canonical_key(
+        &client,
+        res,
+        &key,
+        share_token.as_deref(),
+        &subpath,
+        range,
+        "proxy_photo",
+    )
+    .await
+    {
+        Ok(res) => res,
+        Err(status) => return status.into_response(),
     };
 
     let mut builder = axum::response::Response::builder().status(res.status());
@@ -252,21 +371,18 @@ pub async fn proxy_video(
         return StatusCode::BAD_REQUEST.into_response();
     }
     let client = ImmichClient::new();
-    let cookie_password = get_cookie_password(&headers, &key);
+    let share_token = get_cookie_share_token(&headers, &key);
 
-    let mut params = vec![("key", key.as_str())];
-    if let Some(ref pwd) = cookie_password {
-        params.push(("password", pwd.as_str()));
-    }
+    let params: Vec<(&str, &str)> = vec![("key", key.as_str())];
 
-    let url = client.build_url(&format!("/assets/{}/video/playback", id), &params);
+    let subpath = format!("/assets/{}/video/playback", id);
+    let url = client.build_url(&subpath, &params);
+    let range = headers.get(axum::http::header::RANGE);
 
-    let mut req = client.http_client.get(&url);
-    if let Some(range) = headers.get(axum::http::header::RANGE) {
-        req = req.header(reqwest::header::RANGE, range.clone());
-    }
-
-    let res = match req.send().await {
+    let mut res = match shared_get_request(&client, &url, share_token.as_deref(), range)
+        .send()
+        .await
+    {
         Ok(res) => res,
         Err(e) => {
             eprintln!(
@@ -275,6 +391,21 @@ pub async fn proxy_video(
             );
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
+    };
+
+    res = match retry_with_canonical_key(
+        &client,
+        res,
+        &key,
+        share_token.as_deref(),
+        &subpath,
+        range,
+        "proxy_video",
+    )
+    .await
+    {
+        Ok(res) => res,
+        Err(status) => return status.into_response(),
     };
 
     let mut builder = axum::response::Response::builder().status(res.status());
@@ -310,52 +441,40 @@ pub async fn download_all(
         return StatusCode::BAD_REQUEST.into_response();
     }
     let client = ImmichClient::new();
-    let cookie_password = get_cookie_password(&headers, &key);
+    let share_token = get_cookie_share_token(&headers, &key);
 
-    let mut params = vec![("key", key.as_str())];
-    if let Some(ref pwd) = cookie_password {
-        params.push(("password", pwd.as_str()));
+    let share =
+        match fetch_shared_link_for_proxy(&client, &key, share_token.as_deref(), "download_all")
+            .await
+        {
+            Ok(share) => share,
+            Err(status) => return IntoResponse::into_response(status),
+        };
+    let canonical_key = share.key.clone();
+    let params: Vec<(&str, &str)> = vec![("key", canonical_key.as_str())];
+
+    if !share.allow_download.unwrap_or(false) {
+        return IntoResponse::into_response(StatusCode::FORBIDDEN);
     }
 
-    let url = client.build_url("/shared-links/me", &params);
-    let res = client.http_client.get(&url).send().await;
-    let mut share: crate::immich_client::model::SharedLink = match res {
-        Ok(r) if r.status().is_success() => match r.json().await {
-            Ok(data) => data,
-            Err(e) => {
-                eprintln!(
-                    "download_all: failed to parse share link response for key '{}': {}",
-                    key, e
-                );
-                return IntoResponse::into_response(StatusCode::INTERNAL_SERVER_ERROR);
-            }
-        },
-        Ok(r) => {
-            eprintln!(
-                "download_all: share link request failed for key '{}': {}",
-                key,
-                r.status()
-            );
-            return IntoResponse::into_response(StatusCode::UNAUTHORIZED);
-        }
-        Err(e) => {
-            eprintln!(
-                "download_all: upstream request failed for key '{}': {}",
-                key, e
-            );
-            return IntoResponse::into_response(StatusCode::INTERNAL_SERVER_ERROR);
-        }
-    };
-
-    if share.r#type.as_deref() == Some("ALBUM") {
+    // Immich v3: SharedLinkResponseDto returns assets: [] for album shares.
+    // Fetch album assets via timeline API when needed.
+    let mut share_assets = share.assets;
+    if share_assets.is_empty() {
         if let Some(ref album) = share.album {
-            let album_url = client.build_url(&format!("/albums/{}", album.id), &params);
-            if let Ok(album_res) = client.http_client.get(&album_url).send().await {
-                if let Ok(album_data) = album_res.json::<crate::immich_client::model::Album>().await
-                {
-                    share.assets = album_data.assets;
+            share_assets = match client
+                .fetch_album_assets(&album.id, &canonical_key, share_token.as_deref())
+                .await
+            {
+                Ok(assets) => assets,
+                Err(e) => {
+                    eprintln!(
+                        "download_all: failed to fetch album assets for '{}': {}",
+                        key, e
+                    );
+                    return IntoResponse::into_response(StatusCode::INTERNAL_SERVER_ERROR);
                 }
-            }
+            };
         }
     }
 
@@ -365,8 +484,7 @@ pub async fn download_all(
         .or_else(|| share.album.as_ref().and_then(|a| a.album_name.clone()))
         .unwrap_or_else(|| {
             if share.r#type.as_deref() == Some("INDIVIDUAL") {
-                share
-                    .assets
+                share_assets
                     .first()
                     .and_then(|a| a.original_file_name.clone())
                     .unwrap_or_else(|| "shared_assets".to_string())
@@ -384,7 +502,7 @@ pub async fn download_all(
             .map(|s| s.to_string())
             .collect()
     } else {
-        share.assets.into_iter().map(|a| a.id).collect()
+        share_assets.into_iter().map(|a| a.id).collect()
     };
 
     if asset_ids.is_empty() {
@@ -396,13 +514,11 @@ pub async fn download_all(
     });
 
     let download_url = client.build_url("/download/archive", &params);
-    let res = match client
-        .http_client
-        .post(&download_url)
-        .json(&payload)
-        .send()
-        .await
-    {
+    let mut dl_req = client.http_client.post(&download_url).json(&payload);
+    if let Some(ref token) = share_token {
+        dl_req = dl_req.header("cookie", format!("immich_shared_link_token={}", token));
+    }
+    let res = match dl_req.send().await {
         Ok(r) if r.status().is_success() => r,
         Ok(r) => {
             eprintln!(
@@ -1320,28 +1436,15 @@ pub async fn upload_asset_handler(
         _ => return StatusCode::BAD_REQUEST.into_response(),
     };
 
-    let cookie_password = get_cookie_password(&headers, &key);
+    let share_token = get_cookie_share_token(&headers, &key);
 
     // Validate share key first
-    let share_link = match client
-        .fetch_share_me(&key, cookie_password.as_deref())
-        .await
-    {
-        Ok((status, text)) if status.is_success() => {
-            match serde_json::from_str::<crate::immich_client::model::SharedLink>(&text) {
-                Ok(link) => link,
-                Err(e) => {
-                    eprintln!("upload: failed to parse share link response: {}", e);
-                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-                }
-            }
-        }
-        Ok((status, _)) => return status.into_response(),
-        Err(e) => {
-            eprintln!("upload: failed to fetch share link: {}", e);
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    };
+    let share_link =
+        match fetch_shared_link_for_proxy(&client, &key, share_token.as_deref(), "upload").await {
+            Ok(link) => link,
+            Err(status) => return status.into_response(),
+        };
+    let canonical_key = share_link.key.clone();
 
     if share_link.r#type.as_deref() != Some("ALBUM") || !share_link.allow_upload.unwrap_or(false) {
         return StatusCode::FORBIDDEN.into_response();
@@ -1371,7 +1474,7 @@ pub async fn upload_asset_handler(
     let upload_user_is_owner = share_link
         .album
         .as_ref()
-        .and_then(|a| a.owner.as_ref())
+        .and_then(|a| a.get_owner())
         .map(|o| o.id == service_account_user_id)
         .unwrap_or(false);
 
@@ -1512,13 +1615,16 @@ pub async fn upload_asset_handler(
     // rebuilds (IDEAS #6 invalidation). Re-invalidated below once tagging/association
     // completes, since that mutates the asset's attribution too.
     crate::api::get_share_details::share_cache::invalidate(&key);
+    if canonical_key != key {
+        crate::api::get_share_details::share_cache::invalidate(&canonical_key);
+    }
 
     // Spawn background task to tag and associate the asset, saving it to PROCESSED_ASSETS when done.
     let client_clone = client.clone();
     let asset_id_clone = asset_id.clone();
     let album_id_clone = album_id.clone();
     let uploader_name_clone = uploader_name.clone();
-    let key_clone = key.clone();
+    let key_clone = canonical_key.clone();
 
     tokio::spawn(async move {
         let success = tag_and_associate_asset(
@@ -1594,7 +1700,7 @@ struct UploadLinkMeta {
     allow_download: bool,
 }
 
-/// Short-TTL cache of share-link *permission* metadata, keyed by (key, password).
+/// Short-TTL cache of share-link *permission* metadata, keyed by (key, share_token).
 ///
 /// Deliberately separate from `share_cache`: that one caches album *contents* and
 /// is invalidated on every upload, so it would miss constantly during an active
@@ -1622,31 +1728,31 @@ mod status_link_cache {
         })
     }
 
-    fn entry_hash(key: &str, password: Option<&str>) -> u64 {
+    fn entry_hash(key: &str, share_token: Option<&str>) -> u64 {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         key.hash(&mut h);
-        match password {
-            Some(p) => {
+        match share_token {
+            Some(t) => {
                 1u8.hash(&mut h);
-                p.hash(&mut h);
+                t.hash(&mut h);
             }
             None => 0u8.hash(&mut h),
         }
         h.finish()
     }
 
-    pub(super) fn get(key: &str, password: Option<&str>) -> Option<UploadLinkMeta> {
+    pub(super) fn get(key: &str, share_token: Option<&str>) -> Option<UploadLinkMeta> {
         let t = ttl();
         if t.is_zero() {
             return None;
         }
         let cache = CACHE.get()?;
         let guard = cache.read();
-        let (meta, ts) = guard.get(&entry_hash(key, password))?;
+        let (meta, ts) = guard.get(&entry_hash(key, share_token))?;
         if ts.elapsed() < t { Some(*meta) } else { None }
     }
 
-    pub(super) fn put(key: &str, password: Option<&str>, meta: UploadLinkMeta) {
+    pub(super) fn put(key: &str, share_token: Option<&str>, meta: UploadLinkMeta) {
         let t = ttl();
         if t.is_zero() {
             return;
@@ -1654,7 +1760,7 @@ mod status_link_cache {
         let cache = CACHE.get_or_init(|| parking_lot::RwLock::new(HashMap::new()));
         let mut guard = cache.write();
         guard.retain(|_, (_, ts)| ts.elapsed() < t);
-        guard.insert(entry_hash(key, password), (meta, Instant::now()));
+        guard.insert(entry_hash(key, share_token), (meta, Instant::now()));
     }
 }
 
@@ -1667,39 +1773,20 @@ mod status_link_cache {
 async fn validate_upload_link(
     client: &ImmichClient,
     key: &str,
-    password: Option<&str>,
+    share_token: Option<&str>,
 ) -> Result<UploadLinkMeta, StatusCode> {
-    if let Some(meta) = status_link_cache::get(key, password) {
+    if let Some(meta) = status_link_cache::get(key, share_token) {
         return Ok(meta);
     }
 
-    let share_link = match client.fetch_share_me(key, password).await {
-        Ok((status, text)) if status.is_success() => {
-            match serde_json::from_str::<crate::immich_client::model::SharedLink>(&text) {
-                Ok(link) => link,
-                Err(e) => {
-                    eprintln!("status: failed to parse share link response: {}", e);
-                    return Err(StatusCode::INTERNAL_SERVER_ERROR);
-                }
-            }
-        }
-        Ok((status, _)) => {
-            return Err(
-                StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
-            );
-        }
-        Err(e) => {
-            eprintln!("status: failed to fetch share link: {}", e);
-            return Err(StatusCode::INTERNAL_SERVER_ERROR);
-        }
-    };
+    let share_link = fetch_shared_link_for_proxy(client, key, share_token, "status").await?;
 
     let meta = UploadLinkMeta {
         is_album: share_link.r#type.as_deref() == Some("ALBUM"),
         allow_upload: share_link.allow_upload.unwrap_or(false),
         allow_download: share_link.allow_download.unwrap_or(false),
     };
-    status_link_cache::put(key, password, meta);
+    status_link_cache::put(key, share_token, meta);
     Ok(meta)
 }
 
@@ -1834,8 +1921,8 @@ pub async fn upload_status_batch_handler(
         return StatusCode::FORBIDDEN.into_response();
     }
 
-    let cookie_password = get_cookie_password(&headers, &key);
-    let meta = match validate_upload_link(&client, &key, cookie_password.as_deref()).await {
+    let share_token = get_cookie_share_token(&headers, &key);
+    let meta = match validate_upload_link(&client, &key, share_token.as_deref()).await {
         Ok(m) => m,
         Err(status) => return status.into_response(),
     };
@@ -1975,8 +2062,8 @@ pub async fn upload_status_stream_handler(
     }
 
     // Validate the share key ONCE for the whole stream (reuses the permission cache).
-    let cookie_password = get_cookie_password(&headers, &key);
-    let meta = match validate_upload_link(&client, &key, cookie_password.as_deref()).await {
+    let share_token = get_cookie_share_token(&headers, &key);
+    let meta = match validate_upload_link(&client, &key, share_token.as_deref()).await {
         Ok(m) => m,
         Err(status) => return status.into_response(),
     };
@@ -2208,8 +2295,8 @@ pub async fn upload_status_handler(
         return StatusCode::FORBIDDEN.into_response();
     }
 
-    let cookie_password = get_cookie_password(&headers, &key);
-    let meta = match validate_upload_link(&client, &key, cookie_password.as_deref()).await {
+    let share_token = get_cookie_share_token(&headers, &key);
+    let meta = match validate_upload_link(&client, &key, share_token.as_deref()).await {
         Ok(m) => m,
         Err(status) => return status.into_response(),
     };

@@ -196,18 +196,21 @@ impl ImmichClient {
     /// Tries the provided identifier as a `key` first. On 401, falls back
     /// to querying the admin API to check whether the identifier is a slug,
     /// and retries with the slug parameter if so.
+    /// Fetches `/shared-links/me`, optionally forwarding an `immich_shared_link_token`
+    /// cookie obtained from a prior `POST /shared-links/login`.
     pub async fn fetch_share_me(
         &self,
         key_or_slug: &str,
-        password: Option<&str>,
+        share_token: Option<&str>,
     ) -> Result<(reqwest::StatusCode, String), reqwest::Error> {
-        let mut params = vec![("key", key_or_slug)];
-        if let Some(p) = password {
-            params.push(("password", p));
-        }
+        let params = vec![("key", key_or_slug)];
 
         let url = self.build_url("/shared-links/me", &params);
-        let res = self.http_client.get(&url).send().await?;
+        let mut req = self.http_client.get(&url);
+        if let Some(token) = share_token {
+            req = req.header("cookie", format!("immich_shared_link_token={}", token));
+        }
+        let res = req.send().await?;
         let status = res.status();
         let text = res.text().await.unwrap_or_default();
 
@@ -220,9 +223,13 @@ impl ImmichClient {
             };
 
             if is_slug {
-                params[0] = ("slug", key_or_slug);
-                let slug_url = self.build_url("/shared-links/me", &params);
-                if let Ok(r) = self.http_client.get(&slug_url).send().await {
+                let slug_url = self.build_url("/shared-links/me", &[("slug", key_or_slug)]);
+                let mut slug_req = self.http_client.get(&slug_url);
+                if let Some(token) = share_token {
+                    slug_req =
+                        slug_req.header("cookie", format!("immich_shared_link_token={}", token));
+                }
+                if let Ok(r) = slug_req.send().await {
                     return Ok((r.status(), r.text().await.unwrap_or_default()));
                 }
             }
@@ -230,12 +237,195 @@ impl ImmichClient {
 
         Ok((status, text))
     }
+
+    /// Fetches all assets for a shared album using the timeline API.
+    /// In Immich v3, SharedLinkResponseDto no longer includes album assets inline;
+    /// they must be fetched via GET /timeline/buckets + GET /timeline/bucket.
+    pub async fn fetch_album_assets(
+        &self,
+        album_id: &str,
+        key: &str,
+        share_token: Option<&str>,
+    ) -> Result<Vec<crate::immich_client::model::Asset>, String> {
+        use crate::immich_client::model::{TimeBucket, TimeBucketData};
+        use futures_util::StreamExt;
+
+        // Step 1: Get all time buckets for this album
+        let buckets_url =
+            self.build_url("/timeline/buckets", &[("albumId", album_id), ("key", key)]);
+        let mut req = self.http_client.get(&buckets_url);
+        if let Some(token) = share_token {
+            req = req.header("cookie", format!("immich_shared_link_token={}", token));
+        }
+        let res = req.send().await.map_err(|e| e.to_string())?;
+        let status = res.status();
+        if !status.is_success() {
+            let text = res.text().await.unwrap_or_default();
+            return Err(format!("timeline/buckets failed: {} {}", status, text));
+        }
+        let buckets: Vec<TimeBucket> = res.json().await.map_err(|e| e.to_string())?;
+
+        // Step 2: Fetch each bucket concurrently (columnar format)
+        let share_token_owned = share_token.map(String::from);
+
+        // Pre-build all bucket URLs to avoid lifetime issues with async closures
+        let bucket_tasks: Vec<(String, String, Client)> = buckets
+            .iter()
+            .map(|bucket| {
+                let bucket_url = self.build_url(
+                    "/timeline/bucket",
+                    &[
+                        ("albumId", album_id),
+                        ("key", key),
+                        ("timeBucket", &bucket.time_bucket),
+                    ],
+                );
+                (
+                    bucket.time_bucket.clone(),
+                    bucket_url,
+                    self.http_client.clone(),
+                )
+            })
+            .collect();
+
+        let mut fetches = futures_util::stream::iter(bucket_tasks.into_iter().map(
+            |(time_bucket, bucket_url, client)| {
+                let token = share_token_owned.clone();
+
+                async move {
+                    let mut req = client.get(&bucket_url);
+                    if let Some(ref t) = token {
+                        req = req.header("cookie", format!("immich_shared_link_token={}", t));
+                    }
+                    match req.send().await {
+                        Ok(res) if res.status().is_success() => res
+                            .json::<TimeBucketData>()
+                            .await
+                            .ok()
+                            .map(|d| (time_bucket, d)),
+                        Ok(res) => {
+                            eprintln!(
+                                "Warning: timeline/bucket failed for {}: {}",
+                                time_bucket,
+                                res.status()
+                            );
+                            None
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "Warning: timeline/bucket request error for {}: {}",
+                                time_bucket, e
+                            );
+                            None
+                        }
+                    }
+                }
+            },
+        ))
+        .buffer_unordered(8);
+
+        let mut bucket_results = Vec::new();
+        while let Some(result) = fetches.next().await {
+            if let Some(pair) = result {
+                bucket_results.push(pair);
+            }
+        }
+
+        // Sort buckets chronologically (latest first) to preserve timeline order
+        bucket_results.sort_by(|a, b| b.0.cmp(&a.0));
+
+        // Step 3: Convert columnar data to Asset structs
+        let mut all_assets = Vec::new();
+        for (_time_bucket, data) in bucket_results {
+            for i in 0..data.id.len() {
+                let is_image = data.is_image.get(i).copied().unwrap_or(true);
+                let ratio = data.ratio.get(i).copied().unwrap_or(1.0);
+
+                // The timeline bucket API only provides aspect ratio, not real pixel
+                // dimensions.  Synthesise layout-only placeholders so downstream code
+                // that computes aspect ratios from width/height still works.  Clamp
+                // ratio to a sane range to avoid i32 overflow on bad data.
+                let clamped_ratio = ratio.clamp(0.01, 100.0);
+                let placeholder_w = 1200i32;
+                let placeholder_h = (1200.0 / clamped_ratio as f64) as i32;
+
+                let asset = crate::immich_client::model::Asset {
+                    id: data.id[i].clone(),
+                    r#type: if is_image { "IMAGE" } else { "VIDEO" }.to_string(),
+                    original_file_name: None,
+                    original_mime_type: None,
+                    file_created_at: data.file_created_at.get(i).cloned(),
+                    owner_id: data.owner_id.get(i).cloned(),
+                    is_trashed: Some(false),
+                    width: Some(placeholder_w),
+                    height: Some(placeholder_h),
+                    exif_info: None,
+                    db_id: None,
+                    owner: None,
+                    tags: None,
+                };
+                all_assets.push(asset);
+            }
+        }
+        Ok(all_assets)
+    }
+
+    /// Authenticates a password-protected shared link via `POST /shared-links/login`.
+    /// Returns `Ok(Some(token))` on success (the `immich_shared_link_token` from the
+    /// Set-Cookie header), `Ok(None)` on auth failure (wrong password / invalid link),
+    /// and `Err` on transport errors.
+    pub async fn login_share_link(
+        &self,
+        key_or_slug: &str,
+        password: &str,
+    ) -> Result<Option<(String, String)>, reqwest::Error> {
+        let params = vec![("key", key_or_slug)];
+        let url = self.build_url("/shared-links/login", &params);
+        let body = serde_json::json!({ "password": password });
+        let res = self.http_client.post(&url).json(&body).send().await?;
+
+        if !res.status().is_success() {
+            // Try as slug
+            let slug_url = self.build_url("/shared-links/login", &[("slug", key_or_slug)]);
+            let slug_res = self.http_client.post(&slug_url).json(&body).send().await?;
+            if !slug_res.status().is_success() {
+                return Ok(None);
+            }
+            // Extract immich_shared_link_token from Set-Cookie
+            let token = Self::extract_share_token(&slug_res);
+            let text = slug_res.text().await.unwrap_or_default();
+            return Ok(token.map(|t| (t, text)));
+        }
+
+        let token = Self::extract_share_token(&res);
+        let text = res.text().await.unwrap_or_default();
+        Ok(token.map(|t| (t, text)))
+    }
+
+    /// Extract `immich_shared_link_token` value from Set-Cookie headers.
+    fn extract_share_token(res: &reqwest::Response) -> Option<String> {
+        for val in res.headers().get_all("set-cookie") {
+            if let Ok(s) = val.to_str() {
+                if let Some(rest) = s.strip_prefix("immich_shared_link_token=") {
+                    if let Some(token) = rest.split(';').next() {
+                        if !token.is_empty() {
+                            return Some(token.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
 }
 
-pub fn get_cookie_password(headers: &axum::http::HeaderMap, key: &str) -> Option<String> {
+/// Reads the proxy's own `immich_share_token_{b64_key}` cookie, which stores the
+/// `immich_shared_link_token` value obtained from `POST /shared-links/login` for
+/// password-protected shares.
+pub fn get_cookie_share_token(headers: &axum::http::HeaderMap, key: &str) -> Option<String> {
     use base64::Engine;
     let b64_key = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key);
-    let prefix = format!("immich_pwd_{}=", b64_key);
+    let prefix = format!("immich_share_token_{}=", b64_key);
 
     headers
         .get(axum::http::header::COOKIE)
