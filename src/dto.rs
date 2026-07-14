@@ -11,8 +11,7 @@ pub struct SafeAsset {
     pub r#type: String, // "IMAGE" or "VIDEO"
     pub original_mime_type: Option<String>,
     pub file_created_at: Option<String>,
-    pub width: Option<i32>,
-    pub height: Option<i32>,
+    pub ratio: Option<f32>,
     pub uploader_name: Option<String>,
     #[serde(default)]
     pub uploader_is_fallback: bool,
@@ -53,14 +52,19 @@ pub struct SafeSharedLink {
 
 impl SafeAsset {
     pub fn from_base(asset: crate::immich_client::model::Asset) -> Self {
+        let ratio = asset.ratio.or_else(|| {
+            match (asset.width, asset.height) {
+                (Some(w), Some(h)) if h != 0 => Some(w as f32 / h as f32),
+                _ => None,
+            }
+        });
         SafeAsset {
             id: asset.id,
             original_file_name: asset.original_file_name,
             r#type: asset.r#type,
             original_mime_type: asset.original_mime_type,
             file_created_at: asset.file_created_at,
-            width: asset.width,
-            height: asset.height,
+            ratio,
             uploader_name: None,
             uploader_is_fallback: false,
             owner_id: asset.owner_id,

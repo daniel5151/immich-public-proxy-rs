@@ -44,6 +44,8 @@ pub struct Asset {
     pub exif_info: Option<serde_json::Value>,
     pub width: Option<i32>,
     pub height: Option<i32>,
+    #[serde(default)]
+    pub ratio: Option<f32>,
     pub owner_id: Option<String>,
     pub owner: Option<User>,
     pub tags: Option<Vec<Tag>>,

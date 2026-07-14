@@ -66,7 +66,7 @@ export function GalleryGrid({
                 const isVideo = asset.type === 'VIDEO';
 
                 // Dynamic layout basis calculation
-                const aspect = (asset.width || 4) / (asset.height || 3);
+                const aspect = asset.ratio || 4 / 3;
                 const flexBasis = `${250 * aspect}px`;
 
                 return (

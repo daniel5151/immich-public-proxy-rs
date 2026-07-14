@@ -339,16 +339,6 @@ impl ImmichClient {
         for (_time_bucket, data) in bucket_results {
             for i in 0..data.id.len() {
                 let is_image = data.is_image.get(i).copied().unwrap_or(true);
-                let ratio = data.ratio.get(i).copied().unwrap_or(1.0);
-
-                // The timeline bucket API only provides aspect ratio, not real pixel
-                // dimensions.  Synthesise layout-only placeholders so downstream code
-                // that computes aspect ratios from width/height still works.  Clamp
-                // ratio to a sane range to avoid i32 overflow on bad data.
-                let clamped_ratio = ratio.clamp(0.01, 100.0);
-                let placeholder_w = 1200i32;
-                let placeholder_h = (1200.0 / clamped_ratio as f64) as i32;
-
                 let asset = crate::immich_client::model::Asset {
                     id: data.id[i].clone(),
                     r#type: if is_image { "IMAGE" } else { "VIDEO" }.to_string(),
@@ -357,8 +347,9 @@ impl ImmichClient {
                     file_created_at: data.file_created_at.get(i).cloned(),
                     owner_id: data.owner_id.get(i).cloned(),
                     is_trashed: Some(false),
-                    width: Some(placeholder_w),
-                    height: Some(placeholder_h),
+                    width: None,
+                    height: None,
+                    ratio: data.ratio.get(i).copied(),
                     exif_info: None,
                     db_id: None,
                     owner: None,
