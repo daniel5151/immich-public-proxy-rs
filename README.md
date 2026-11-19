@@ -105,6 +105,8 @@ Configuration is handled via environment variables.
 | `IPP_TTL_SHARE_CACHE_SECS`       |    No    | TTL (seconds) for the in-memory share-details cache. Defaults to `45`. Entries are also proactively invalidated when an upload mutates an album.      |
 | `IPP_TTL_STATUS_LINK_CACHE_SECS` |    No    | TTL (seconds) for the short-lived upload-status permission cache. Defaults to `60`. Avoids upstream share key re-validation per poll tick.            |
 | `IPP_UPLOAD_CONCURRENCY`         |    No    | Max number of simultaneous background tag/album jobs across uploads. Defaults to `4` (minimum `1`).                                                   |
+| `IPP_MAX_UPLOAD_BYTES`           |    No    | Max size (bytes) for a single uploaded file via `/share/{key}/upload`. Defaults to `268435456` (256 MiB, minimum 1 MiB).                              |
+| `IPP_TRUST_PROXY`                |    No    | Set to `1`/`true` when behind a trusted reverse proxy (e.g., Nginx) so per-IP rate limiting reads `X-Real-IP` / `CF-Connecting-IP` / `X-Forwarded-For`. Defaults to `0` (uses TCP peer IP). |
 
 > **Logging:** the proxy currently writes logs straight to stdout/stderr; there is no log-level filtering and no `RUST_LOG` variable.
 
@@ -127,6 +129,9 @@ Used to fetch share details, check passwords, and display uploader attribution b
 #### `IMMICH_API_KEY_UPLOAD_USER` (Upload Service Account API Key)
 
 Required to support uploading to shared albums.
+
+> [!IMPORTANT]
+> Use a **dedicated, isolated upload service account** for `IMMICH_API_KEY_UPLOAD_USER` rather than your personal/admin Immich account. Immich deduplicates uploads per user, and the proxy restores trashed duplicates when re-uploaded — using a dedicated service account ensures public uploaders cannot interact with your personal library.
 
 | Feature                        | Required Permissions                  | Notes                                                                                                 |
 | :----------------------------- | :------------------------------------ | :---------------------------------------------------------------------------------------------------- |
@@ -159,6 +164,108 @@ Restart=always
 
 [Install]
 WantedBy=multi-user.target
+```
+
+### Nginx Reverse Proxy Example
+
+When deploying behind Nginx, set `IPP_TRUST_PROXY=1` and `IPP_PUBLIC_BASE_URL=https://photos.example.com` in the proxy's environment, overwrite forwarding headers at Nginx so clients cannot spoof them, disable buffering on SSE/streaming routes, and scope large `client_max_body_size` strictly to `/upload`:
+
+```nginx
+# In http { ... } of nginx.conf:
+#   limit_req_zone $binary_remote_addr zone=ipp_flood:10m rate=10r/s;
+#   limit_req_zone $binary_remote_addr zone=ipp_auth:10m rate=10r/m;
+#   limit_req_status 429;
+#
+#   map $http_upgrade $connection_upgrade {
+#       default upgrade;
+#       ""      "";
+#   }
+
+server {
+    listen 443 ssl;
+    server_name photos.example.com;
+
+    # Tight default body cap prevents oversized POSTs on / and /share/unlock;
+    # /upload overrides this to match IPP_MAX_UPLOAD_BYTES (256 MiB + framing).
+    client_max_body_size 64k;
+
+    # Keep buffering ON by default for lightweight HTML/JSON & thumbnails/previews
+    proxy_buffering on;
+    proxy_buffers 8 32k;
+    proxy_buffer_size 64k;
+
+    # Common upstream headers (always overwrite client-supplied IP/proto headers)
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $remote_addr;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header Connection $connection_upgrade;
+
+    # 1. Password unlock — tight edge brute-force limit (pairs with Rust limiter)
+    location = /share/unlock {
+        limit_req zone=ipp_auth burst=5 nodelay;
+        proxy_pass http://127.0.0.1:3000;
+    }
+
+    # 2. Uploads — disable request/response buffering and allow up to 260 MiB
+    location ~ ^/share/[^/]+/upload$ {
+        client_max_body_size 260m;
+        proxy_buffering off;
+        proxy_request_buffering off;
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+        proxy_pass http://127.0.0.1:3000;
+    }
+
+    # 3. Real-time SSE upload status stream (must appear before generic /status)
+    location ~ ^/share/[^/]+/status/stream$ {
+        proxy_set_header Connection "";
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_read_timeout 150s; # > Rust SSE 120s ceiling
+        proxy_pass http://127.0.0.1:3000;
+    }
+
+    # 4. Status polling fallback
+    location ~ ^/share/[^/]+/status(/.*)?$ {
+        proxy_pass http://127.0.0.1:3000;
+    }
+
+    # 5. Bulk ZIP downloads — stream without spooling to proxy_temp
+    location ~ ^/share/[^/]+/download$ {
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_read_timeout 600s;
+        proxy_send_timeout 600s;
+        proxy_pass http://127.0.0.1:3000;
+    }
+
+    # 6. Video playback & 206 range requests — stream without buffering
+    location ~ ^/share/video/ {
+        proxy_buffering off;
+        proxy_read_timeout 300s;
+        proxy_pass http://127.0.0.1:3000;
+    }
+
+    # 7. Thumbnails & lightbox previews — buffered to free backend workers quickly
+    location ~ ^/share/photo/[^/]+/[^/]+/(thumbnail|preview)$ {
+        proxy_pass http://127.0.0.1:3000;
+    }
+
+    # 8. Full-res / original photos — stream without spooling to proxy_temp
+    location ~ ^/share/photo/ {
+        proxy_buffering off;
+        proxy_read_timeout 180s;
+        proxy_pass http://127.0.0.1:3000;
+    }
+
+    # 9. UI & API catch-all
+    location / {
+        limit_req zone=ipp_flood burst=1000 nodelay;
+        proxy_pass http://127.0.0.1:3000;
+    }
+}
 ```
 
 ---
