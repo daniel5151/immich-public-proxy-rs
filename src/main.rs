@@ -4,15 +4,18 @@ mod api;
 mod dto;
 mod immich_client;
 mod proxy;
+mod security;
 
+use crate::api::get_share_details::ShareDetailsError;
 use crate::proxy::ProxyRoutes as _;
 use axum::{
     Router,
-    extract::Path,
-    http::{HeaderMap, StatusCode},
+    extract::{ConnectInfo, DefaultBodyLimit, Path},
+    http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header},
     response::{Html, IntoResponse, Response},
     routing::get,
 };
+use std::net::SocketAddr;
 
 fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
@@ -22,8 +25,27 @@ fn html_escape(s: &str) -> String {
         .replace('\'', "&#x27;")
 }
 
-async fn serve_share_html(Path(key): Path<String>, headers: HeaderMap) -> Response {
-    let details_res = api::get_share_details::get_share_details(key.clone(), None, &headers).await;
+async fn serve_share_html(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Path(key): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if !security::is_safe_param(&key) {
+        return (StatusCode::BAD_REQUEST, "Invalid share key").into_response();
+    }
+
+    let client_ip = security::extract_client_ip(&headers, peer.ip());
+    if let Err(retry_after) = security::probe_limiter().check_blocked(client_ip) {
+        return security::rate_limited_response(retry_after, "Too many requests");
+    }
+
+    let details_res = api::get_share_details::get_share_details(key.clone(), &headers).await;
+    if matches!(
+        details_res,
+        Err(ShareDetailsError::InvalidKey | ShareDetailsError::NotAccessible)
+    ) {
+        security::probe_limiter().penalize(client_ip);
+    }
 
     static SITE_ROOT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     let site_root = SITE_ROOT.get_or_init(|| {
@@ -133,7 +155,9 @@ async fn serve_share_html(Path(key): Path<String>, headers: HeaderMap) -> Respon
         }
     }
 
-    Html(html_content).into_response()
+    let mut resp = Html(html_content).into_response();
+    security::insert_private_no_store(resp.headers_mut());
+    resp
 }
 
 async fn serve_index() -> Response {
@@ -158,9 +182,12 @@ async fn serve_index() -> Response {
 
 #[tokio::main]
 async fn main() {
+    // Validate required upstream config eagerly on startup.
+    immich_client::client::ImmichClient::init_and_validate();
+
     let addr_str =
         std::env::var("LEPTOS_SITE_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".to_string());
-    let addr: std::net::SocketAddr = addr_str.parse().expect("Invalid bind address");
+    let addr: SocketAddr = addr_str.parse().expect("Invalid bind address");
 
     let site_root = std::env::var("LEPTOS_SITE_ROOT").unwrap_or_else(|_| "target/site".to_string());
 
@@ -170,7 +197,7 @@ async fn main() {
             "/api/share/{key}",
             get(api::get_share_details::get_share_details_handler),
         )
-        // Proxy routes
+        // Proxy routes (upload route sets its own IPP_MAX_UPLOAD_BYTES body limit)
         .proxy_routes()
         // Meta SEO routes for shares
         .route("/share/{key}", get(serve_share_html))
@@ -179,11 +206,11 @@ async fn main() {
         .fallback_service(
             tower_http::services::ServeDir::new(&site_root).fallback(get(serve_index)),
         )
-        .layer(axum::extract::DefaultBodyLimit::disable())
+        // Strict default body cap for all non-upload routes (prevents OOM on /share/unlock).
+        .layer(DefaultBodyLimit::max(64 * 1024))
         .layer(axum::middleware::map_response(
             |mut response: Response| async move {
-                static CSP_HEADER: std::sync::OnceLock<axum::http::HeaderValue> =
-                    std::sync::OnceLock::new();
+                static CSP_HEADER: std::sync::OnceLock<HeaderValue> = std::sync::OnceLock::new();
                 let csp_value = CSP_HEADER.get_or_init(|| {
                     let connect_src = if cfg!(debug_assertions) {
                         "'self' ws://127.0.0.1:5173" // Vite dev ws
@@ -193,7 +220,7 @@ async fn main() {
 
                     let csp = format!(
                         "default-src 'none'; \
-                         script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; \
+                         script-src 'self'; \
                          worker-src 'self' blob:; \
                          style-src 'self' 'unsafe-inline'; \
                          img-src 'self' data:; \
@@ -204,19 +231,45 @@ async fn main() {
                          base-uri 'self'; \
                          form-action 'self'"
                     );
-                    axum::http::HeaderValue::from_str(&csp).unwrap()
+                    HeaderValue::from_str(&csp).unwrap()
                 });
-                response.headers_mut().insert(
-                    axum::http::header::CONTENT_SECURITY_POLICY,
-                    csp_value.clone(),
+
+                let headers = response.headers_mut();
+                // Respect stricter per-route CSP (e.g., `default-src 'none'; sandbox` on proxied media).
+                if !headers.contains_key(header::CONTENT_SECURITY_POLICY) {
+                    headers.insert(header::CONTENT_SECURITY_POLICY, csp_value.clone());
+                }
+                headers.insert(
+                    header::X_CONTENT_TYPE_OPTIONS,
+                    HeaderValue::from_static("nosniff"),
+                );
+                headers.insert(
+                    header::REFERRER_POLICY,
+                    HeaderValue::from_static("no-referrer"),
+                );
+                headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+                headers.insert(
+                    HeaderName::from_static("permissions-policy"),
+                    HeaderValue::from_static("camera=(), microphone=(), geolocation=()"),
+                );
+                headers.insert(
+                    HeaderName::from_static("cross-origin-opener-policy"),
+                    HeaderValue::from_static("same-origin"),
+                );
+                headers.insert(
+                    HeaderName::from_static("cross-origin-resource-policy"),
+                    HeaderValue::from_static("same-origin"),
                 );
                 response
             },
         ));
 
-    println!("Listening on http://{}", &addr);
+    println!("Listening on http://{}", addr);
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    axum::serve(listener, app.into_make_service())
-        .await
-        .unwrap();
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .unwrap();
 }

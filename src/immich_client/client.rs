@@ -1,5 +1,11 @@
 use reqwest::Client;
 use reqwest::Url;
+use std::time::{Duration, Instant};
+
+/// Timeout applied to non-streaming Immich JSON metadata requests so a stalled
+/// upstream cannot hold semaphore permits or request tasks open indefinitely.
+/// Streaming media, upload, and ZIP download paths intentionally stay untimed.
+pub const METADATA_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Clone)]
 pub struct ImmichClient {
@@ -9,13 +15,36 @@ pub struct ImmichClient {
     pub upload_api_key: Option<String>,
 }
 
+fn read_non_empty_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
 impl ImmichClient {
+    /// Validates required startup configuration (`IMMICH_URL`) eagerly so invalid
+    /// deployments fail fast at boot rather than panicking on the first request.
+    pub fn init_and_validate() {
+        let client = Self::new();
+        let parsed = Url::parse(&client.api_url).expect("IMMICH_URL must be a valid URL");
+        assert!(
+            matches!(parsed.scheme(), "http" | "https"),
+            "IMMICH_URL must use http or https scheme"
+        );
+    }
+
+    pub fn has_upload_api_key() -> bool {
+        Self::new().upload_api_key.is_some()
+    }
+
     pub fn new() -> Self {
         static API_URL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
         let api_url = API_URL
             .get_or_init(|| {
                 std::env::var("IMMICH_URL")
                     .expect("IMMICH_URL environment variable must be set")
+                    .trim()
                     .trim_end_matches('/')
                     .to_string()
                     + "/api"
@@ -26,7 +55,7 @@ impl ImmichClient {
         let http_client = CLIENT
             .get_or_init(|| {
                 Client::builder()
-                    .connect_timeout(std::time::Duration::from_secs(10))
+                    .connect_timeout(Duration::from_secs(10))
                     .build()
                     .expect("Failed to build HTTP client")
             })
@@ -34,12 +63,12 @@ impl ImmichClient {
 
         static ADMIN_API_KEY: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
         let admin_api_key = ADMIN_API_KEY
-            .get_or_init(|| std::env::var("IMMICH_API_KEY").ok())
+            .get_or_init(|| read_non_empty_env("IMMICH_API_KEY"))
             .clone();
 
         static UPLOAD_API_KEY: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
         let upload_api_key = UPLOAD_API_KEY
-            .get_or_init(|| std::env::var("IMMICH_API_KEY_UPLOAD_USER").ok())
+            .get_or_init(|| read_non_empty_env("IMMICH_API_KEY_UPLOAD_USER"))
             .clone();
 
         Self {
@@ -62,6 +91,7 @@ impl ImmichClient {
         let res = self
             .http_client
             .get(&url)
+            .timeout(METADATA_TIMEOUT)
             .header("x-api-key", upload_key)
             .send()
             .await
@@ -80,7 +110,7 @@ impl ImmichClient {
 
     pub fn build_url(&self, path: &str, params: &[(&str, &str)]) -> String {
         let url = format!("{}{}", self.api_url, path);
-        let mut u = Url::parse(&url).unwrap();
+        let mut u = Url::parse(&url).expect("validated IMMICH_URL + subpath must form a valid URL");
         if !params.is_empty() {
             u.query_pairs_mut()
                 .extend_pairs(params.iter().filter(|(_, v)| !v.is_empty()));
@@ -93,6 +123,7 @@ impl ImmichClient {
         let url = self.build_url(path, &[]);
         self.http_client
             .get(&url)
+            .timeout(METADATA_TIMEOUT)
             .header("x-api-key", key)
             .send()
             .await
@@ -109,6 +140,7 @@ impl ImmichClient {
         let url = self.build_url(path, &[]);
         self.http_client
             .post(&url)
+            .timeout(METADATA_TIMEOUT)
             .header("x-api-key", key)
             .json(body)
             .send()
@@ -126,6 +158,7 @@ impl ImmichClient {
         let url = self.build_url(path, &[]);
         self.http_client
             .put(&url)
+            .timeout(METADATA_TIMEOUT)
             .header("x-api-key", key)
             .json(body)
             .send()
@@ -162,11 +195,37 @@ impl ImmichClient {
         let admin_key = self.admin_api_key.as_ref()?;
         self.put_with_key(path, admin_key, body).await
     }
-    /// Queries the admin `/shared-links` endpoint to find a link by its key or slug.
+    /// Queries the admin `/shared-links` endpoint to find a link by its key or slug,
+    /// caching the link list briefly (15s) to prevent duplicate/amplified admin calls
+    /// when resolving 401 responses or invalid-key probes.
     pub async fn get_admin_shared_link(
         &self,
         key_or_slug: &str,
     ) -> Result<Option<crate::immich_client::model::SharedLink>, reqwest::Error> {
+        const ADMIN_LINKS_TTL: Duration = Duration::from_secs(15);
+        static ADMIN_LINKS_CACHE: std::sync::OnceLock<
+            parking_lot::RwLock<Option<(Vec<crate::immich_client::model::SharedLink>, Instant)>>,
+        > = std::sync::OnceLock::new();
+
+        if self.admin_api_key.is_none() {
+            return Ok(None);
+        }
+
+        let cache = ADMIN_LINKS_CACHE.get_or_init(|| parking_lot::RwLock::new(None));
+        {
+            let guard = cache.read();
+            if let Some((ref links, ts)) = *guard {
+                if ts.elapsed() < ADMIN_LINKS_TTL {
+                    return Ok(links
+                        .iter()
+                        .find(|link| {
+                            link.key == key_or_slug || link.slug.as_deref() == Some(key_or_slug)
+                        })
+                        .cloned());
+                }
+            }
+        }
+
         let Some(res) = self.admin_get("/shared-links").await else {
             return Ok(None);
         };
@@ -186,28 +245,36 @@ impl ImmichClient {
             Err(_) => return Ok(None),
         };
 
-        Ok(links
-            .into_iter()
-            .find(|link| link.key == key_or_slug || link.slug.as_deref() == Some(key_or_slug)))
+        let found = links
+            .iter()
+            .find(|link| link.key == key_or_slug || link.slug.as_deref() == Some(key_or_slug))
+            .cloned();
+
+        {
+            let mut guard = cache.write();
+            *guard = Some((links, Instant::now()));
+        }
+
+        Ok(found)
     }
 
     /// Fetches the `/shared-links/me` endpoint.
     ///
     /// Tries the provided identifier as a `key` first. On 401, falls back
     /// to querying the admin API to check whether the identifier is a slug,
-    /// and retries with the slug parameter if so.
-    /// Fetches `/shared-links/me`, optionally forwarding an `immich_shared_link_token`
-    /// cookie obtained from a prior `POST /shared-links/login`.
+    /// and retries with the slug parameter if so. Optionally forwards a validated
+    /// `immich_shared_link_token` cookie obtained from a prior `POST /shared-links/login`.
     pub async fn fetch_share_me(
         &self,
         key_or_slug: &str,
         share_token: Option<&str>,
     ) -> Result<(reqwest::StatusCode, String), reqwest::Error> {
+        let valid_token = share_token.filter(|t| crate::security::is_valid_share_token(t));
         let params = vec![("key", key_or_slug)];
 
         let url = self.build_url("/shared-links/me", &params);
-        let mut req = self.http_client.get(&url);
-        if let Some(token) = share_token {
+        let mut req = self.http_client.get(&url).timeout(METADATA_TIMEOUT);
+        if let Some(token) = valid_token {
             req = req.header("cookie", format!("immich_shared_link_token={}", token));
         }
         let res = req.send().await?;
@@ -224,8 +291,8 @@ impl ImmichClient {
 
             if is_slug {
                 let slug_url = self.build_url("/shared-links/me", &[("slug", key_or_slug)]);
-                let mut slug_req = self.http_client.get(&slug_url);
-                if let Some(token) = share_token {
+                let mut slug_req = self.http_client.get(&slug_url).timeout(METADATA_TIMEOUT);
+                if let Some(token) = valid_token {
                     slug_req =
                         slug_req.header("cookie", format!("immich_shared_link_token={}", token));
                 }
@@ -250,11 +317,13 @@ impl ImmichClient {
         use crate::immich_client::model::{TimeBucket, TimeBucketData};
         use futures_util::StreamExt;
 
+        let valid_token = share_token.filter(|t| crate::security::is_valid_share_token(t));
+
         // Step 1: Get all time buckets for this album
         let buckets_url =
             self.build_url("/timeline/buckets", &[("albumId", album_id), ("key", key)]);
-        let mut req = self.http_client.get(&buckets_url);
-        if let Some(token) = share_token {
+        let mut req = self.http_client.get(&buckets_url).timeout(METADATA_TIMEOUT);
+        if let Some(token) = valid_token {
             req = req.header("cookie", format!("immich_shared_link_token={}", token));
         }
         let res = req.send().await.map_err(|e| e.to_string())?;
@@ -266,7 +335,7 @@ impl ImmichClient {
         let buckets: Vec<TimeBucket> = res.json().await.map_err(|e| e.to_string())?;
 
         // Step 2: Fetch each bucket concurrently (columnar format)
-        let share_token_owned = share_token.map(String::from);
+        let share_token_owned = valid_token.map(String::from);
 
         // Pre-build all bucket URLs to avoid lifetime issues with async closures
         let bucket_tasks: Vec<(String, String, Client)> = buckets
@@ -293,7 +362,7 @@ impl ImmichClient {
                 let token = share_token_owned.clone();
 
                 async move {
-                    let mut req = client.get(&bucket_url);
+                    let mut req = client.get(&bucket_url).timeout(METADATA_TIMEOUT);
                     if let Some(ref t) = token {
                         req = req.header("cookie", format!("immich_shared_link_token={}", t));
                     }
@@ -374,12 +443,24 @@ impl ImmichClient {
         let params = vec![("key", key_or_slug)];
         let url = self.build_url("/shared-links/login", &params);
         let body = serde_json::json!({ "password": password });
-        let res = self.http_client.post(&url).json(&body).send().await?;
+        let res = self
+            .http_client
+            .post(&url)
+            .timeout(METADATA_TIMEOUT)
+            .json(&body)
+            .send()
+            .await?;
 
         if !res.status().is_success() {
             // Try as slug
             let slug_url = self.build_url("/shared-links/login", &[("slug", key_or_slug)]);
-            let slug_res = self.http_client.post(&slug_url).json(&body).send().await?;
+            let slug_res = self
+                .http_client
+                .post(&slug_url)
+                .timeout(METADATA_TIMEOUT)
+                .json(&body)
+                .send()
+                .await?;
             if !slug_res.status().is_success() {
                 return Ok(None);
             }
@@ -400,7 +481,7 @@ impl ImmichClient {
             if let Ok(s) = val.to_str() {
                 if let Some(rest) = s.strip_prefix("immich_shared_link_token=") {
                     if let Some(token) = rest.split(';').next() {
-                        if !token.is_empty() {
+                        if crate::security::is_valid_share_token(token) {
                             return Some(token.to_string());
                         }
                     }
@@ -411,28 +492,34 @@ impl ImmichClient {
     }
 }
 
-/// Reads the proxy's own `immich_share_token_{b64_key}` cookie, which stores the
-/// `immich_shared_link_token` value obtained from `POST /shared-links/login` for
-/// password-protected shares.
+/// Reads and validates the proxy's own `immich_share_token_{b64_key}` cookie, which
+/// stores the `immich_shared_link_token` value obtained from `POST /shared-links/login`
+/// for password-protected shares. Iterates all `Cookie` header lines and rejects any
+/// decoded token that fails `is_valid_share_token` (preventing upstream cookie injection).
 pub fn get_cookie_share_token(headers: &axum::http::HeaderMap, key: &str) -> Option<String> {
     use base64::Engine;
     let b64_key = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key);
     let prefix = format!("immich_share_token_{}=", b64_key);
 
-    headers
-        .get(axum::http::header::COOKIE)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|cookie_str| {
-            cookie_str
-                .split(';')
-                .map(|s| s.trim())
-                .find(|s| s.starts_with(&prefix))
-                .and_then(|s| {
-                    let encoded = &s[prefix.len()..];
-                    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                        .decode(encoded)
-                        .ok()?;
-                    String::from_utf8(decoded).ok()
-                })
-        })
+    for header_val in headers.get_all(axum::http::header::COOKIE) {
+        let Ok(cookie_str) = header_val.to_str() else {
+            continue;
+        };
+        for pair in cookie_str.split(';').map(str::trim) {
+            if let Some(encoded) = pair.strip_prefix(&prefix) {
+                let Ok(decoded) =
+                    base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(encoded)
+                else {
+                    continue;
+                };
+                let Ok(token) = String::from_utf8(decoded) else {
+                    continue;
+                };
+                if crate::security::is_valid_share_token(&token) {
+                    return Some(token);
+                }
+            }
+        }
+    }
+    None
 }

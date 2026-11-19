@@ -4,11 +4,12 @@ use crate::immich_client::model::Asset;
 use crate::immich_client::model::SharedLink;
 use axum::{
     Json,
-    extract::{Path, Query},
+    extract::{ConnectInfo, Path},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
 use ts_rs::TS;
 
 #[derive(Debug, Clone, Deserialize, Serialize, TS)]
@@ -21,30 +22,49 @@ pub struct ShareDetails {
     pub request_key: String,
 }
 
-#[derive(Deserialize)]
-pub struct ShareParams {
-    pub share_token: Option<String>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShareDetailsError {
+    BadRequest,
+    InvalidKey,
+    NotAccessible,
+    Internal,
 }
 
 /// TTL cache for fully-resolved share responses (IDEAS #4 + #6).
 ///
 /// A cold `/share/{key}` build does `fetch_share_me` + `/albums/{id}` + per-uploader
 /// tag searches + owner fallback. Caching the finished `ShareDetails` keyed by
-/// (share_key, share_token) collapses all of that to a single clone on repeat loads,
-/// and—because uploader names are already stamped onto the cached assets—also
-/// resolves the N+1 attribution work (#4). Entries are evicted on TTL expiry and
-/// proactively invalidated by the upload path when an album's contents change.
+/// `(share_key, Option<keyed_sha256(share_token)>)` collapses all of that to a single
+/// clone on repeat loads, and—because uploader names are already stamped onto the
+/// cached assets—also resolves the N+1 attribution work (#4).
+///
+/// Security & memory invariants:
+/// - Keyed by `(String, Option<[u8; 32]>)` (plaintext share key + per-process keyed
+///   SHA-256 digest of `share_token`) for 256-bit collision resistance, exact key
+///   equality, and zero plaintext token retention.
+/// - Public (non-password-protected) shares are stored under `(key, None)` and matched
+///   first on `get()`, so arbitrary client cookies cannot bust or bloat the cache.
+/// - Bounded to `MAX_CACHE_ENTRIES` (with expired + oldest eviction) and proactively
+///   invalidated by the upload path whenever an album's contents change.
 pub mod share_cache {
     use super::ShareDetails;
+    use crate::security::hash_token_keyed;
     use std::collections::HashMap;
-    use std::hash::{Hash, Hasher};
     use std::time::{Duration, Instant};
 
-    // hash(key,share_token) -> (share_key, details, inserted_at). The plaintext share key
-    // is stored alongside so we can invalidate every share_token variant of a key on
-    // mutation without needing to reverse the hash. The share_token itself is never stored.
+    const MAX_CACHE_ENTRIES: usize = 256;
+    const MAX_GENERATION_ENTRIES: usize = 1024;
+
+    type CacheKey = (String, Option<[u8; 32]>);
+
+    // (share_key, Option<keyed_sha256(share_token)>) -> (details, inserted_at).
+    // The plaintext share key is part of the map key so we can match and invalidate
+    // every token variant of a key on mutation without needing to reverse the token
+    // digest. The plaintext share_token itself is never stored.
+    //
+    // Lock ordering invariant: ALWAYS acquire CACHE before GENERATIONS when holding both.
     static CACHE: std::sync::OnceLock<
-        parking_lot::RwLock<HashMap<u64, (String, ShareDetails, Instant)>>,
+        parking_lot::RwLock<HashMap<CacheKey, (ShareDetails, Instant)>>,
     > = std::sync::OnceLock::new();
 
     // share_key -> monotonically increasing generation. Bumped on every invalidate so
@@ -67,17 +87,8 @@ pub mod share_cache {
         })
     }
 
-    fn entry_hash(key: &str, share_token: Option<&str>) -> u64 {
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        key.hash(&mut h);
-        match share_token {
-            Some(t) => {
-                1u8.hash(&mut h);
-                t.hash(&mut h);
-            }
-            None => 0u8.hash(&mut h),
-        }
-        h.finish()
+    fn token_digest(share_token: Option<&str>) -> Option<[u8; 32]> {
+        share_token.map(hash_token_keyed)
     }
 
     /// Current generation for a key. Capture this *before* starting a rebuild and pass
@@ -93,18 +104,31 @@ pub mod share_cache {
             return None;
         }
         let cache = CACHE.get()?;
-        let h = entry_hash(key, share_token);
         let guard = cache.read();
-        let (_, details, ts) = guard.get(&h)?;
-        if ts.elapsed() < t {
-            Some(details.clone())
-        } else {
-            None
+
+        // Check public (token-less) entry first so arbitrary client cookies cannot
+        // bust or bloat the cache for non-password-protected shares.
+        if let Some((details, ts)) = guard.get(&(key.to_string(), None)) {
+            if ts.elapsed() < t {
+                return Some(details.clone());
+            }
         }
+
+        if let Some(digest) = token_digest(share_token) {
+            if let Some((details, ts)) = guard.get(&(key.to_string(), Some(digest))) {
+                if ts.elapsed() < t {
+                    return Some(details.clone());
+                }
+            }
+        }
+        None
     }
 
     /// Store a freshly-built response, but only if no invalidation occurred for this
     /// key since `gen_at_start` was captured. Returns true if stored.
+    ///
+    /// Pass `share_token = None` for public shares (`link.password.is_none()`) so
+    /// every visitor shares a single cached entry regardless of client cookies.
     pub fn put(
         key: &str,
         share_token: Option<&str>,
@@ -116,48 +140,65 @@ pub mod share_cache {
             return false;
         }
         let cache = CACHE.get_or_init(|| parking_lot::RwLock::new(HashMap::new()));
-        let h = entry_hash(key, share_token);
+        let cache_key = (key.to_string(), token_digest(share_token));
         let mut guard = cache.write();
-        // Re-check the generation while holding the cache write lock. `invalidate`
-        // bumps the generation *before* taking this lock, so any invalidation that
-        // races our build is observed here and we refuse to store stale data.
+
+        // Check generation while holding CACHE write lock (matches invalidate lock order).
         if generation(key) != gen_at_start {
             return false;
         }
-        // Opportunistically drop expired entries to bound memory.
-        guard.retain(|_, (_, _, ts)| ts.elapsed() < t);
-        guard.insert(h, (key.to_string(), details.clone(), Instant::now()));
+
+        // Drop expired entries first, then enforce hard capacity cap.
+        guard.retain(|_, (_, ts)| ts.elapsed() < t);
+        if !guard.contains_key(&cache_key) {
+            while guard.len() >= MAX_CACHE_ENTRIES {
+                if let Some(oldest_key) = guard
+                    .iter()
+                    .min_by_key(|(_, (_, ts))| *ts)
+                    .map(|(k, _)| k.clone())
+                {
+                    guard.remove(&oldest_key);
+                } else {
+                    break;
+                }
+            }
+        }
+
+        guard.insert(cache_key, (details.clone(), Instant::now()));
         true
     }
 
     /// Drop every cached variant of a share key and bump its generation (called when
-    /// its album mutates). The generation bump invalidates any in-flight rebuild that
-    /// started before this point.
+    /// its album mutates). Holds `CACHE` write lock while bumping `GENERATIONS` so
+    /// concurrent `put()` calls observe the bump atomically.
     pub fn invalidate(key: &str) {
+        let cache = CACHE.get_or_init(|| parking_lot::RwLock::new(HashMap::new()));
         let mut keys_to_bump = std::collections::HashSet::new();
         keys_to_bump.insert(key.to_string());
 
-        if let Some(cache) = CACHE.get() {
-            let mut guard = cache.write();
-            guard.retain(|_, (k, details, _)| {
-                let matches = k == key || details.link.key == key || details.request_key == key;
-                if matches {
-                    keys_to_bump.insert(k.clone());
-                    keys_to_bump.insert(details.link.key.clone());
-                    keys_to_bump.insert(details.request_key.clone());
-                    false
-                } else {
-                    true
-                }
-            });
-        }
-
-        {
-            let mut gens = generations().write();
-            for k in keys_to_bump {
-                let g = gens.entry(k).or_insert(0);
-                *g = g.wrapping_add(1);
+        let mut guard = cache.write();
+        guard.retain(|(k, _), (details, _)| {
+            let matches = k == key || details.link.key == key || details.request_key == key;
+            if matches {
+                keys_to_bump.insert(k.clone());
+                keys_to_bump.insert(details.link.key.clone());
+                keys_to_bump.insert(details.request_key.clone());
+                false
+            } else {
+                true
             }
+        });
+
+        let mut gens = generations().write();
+        if gens.len() + keys_to_bump.len() > MAX_GENERATION_ENTRIES {
+            // Keep generations map bounded; retain active cache keys and clear stale ones.
+            let active_keys: std::collections::HashSet<&str> =
+                guard.keys().map(|(k, _)| k.as_str()).collect();
+            gens.retain(|k, _| active_keys.contains(k.as_str()) || keys_to_bump.contains(k));
+        }
+        for k in keys_to_bump {
+            let g = gens.entry(k).or_insert(0);
+            *g = g.wrapping_add(1);
         }
     }
 }
@@ -165,46 +206,34 @@ pub mod share_cache {
 /// Helper function to fetch share details. Used by the API handler and the HTML meta injector.
 pub async fn get_share_details(
     key: String,
-    share_token: Option<String>,
     headers: &HeaderMap,
-) -> Result<ShareDetails, String> {
+) -> Result<ShareDetails, ShareDetailsError> {
+    if !crate::security::is_safe_param(&key) {
+        return Err(ShareDetailsError::BadRequest);
+    }
     let client = ImmichClient::new();
-    get_share_details_with_client(&client, key, share_token, headers).await
+    get_share_details_with_client(&client, key, headers).await
 }
 
 async fn get_share_details_with_client(
     client: &ImmichClient,
     key: String,
-    share_token: Option<String>,
     headers: &HeaderMap,
-) -> Result<ShareDetails, String> {
-    let host = headers
-        .get("host")
-        .and_then(|h| h.to_str().ok())
-        .ok_or_else(|| "Host header must be present".to_string())?;
+) -> Result<ShareDetails, ShareDetailsError> {
+    let ipp_public_base_url = crate::security::resolve_public_base_url(headers).map_err(|e| {
+        eprintln!("get_share_details: invalid public base URL headers: {}", e);
+        ShareDetailsError::BadRequest
+    })?;
 
-    let proto = headers
-        .get("x-forwarded-proto")
-        .and_then(|p| p.to_str().ok())
-        .unwrap_or("http");
-
-    static IPP_PUBLIC_BASE_URL_ENV: std::sync::OnceLock<Option<String>> =
-        std::sync::OnceLock::new();
-    let ipp_public_base_url = IPP_PUBLIC_BASE_URL_ENV
-        .get_or_init(|| std::env::var("IPP_PUBLIC_BASE_URL").ok())
-        .clone()
-        .unwrap_or_else(|| format!("{}://{}", proto, host));
-
-    // Check cookie for share token if not provided
-    let share_token =
-        share_token.or_else(|| crate::immich_client::client::get_cookie_share_token(headers, &key));
+    // Read share token exclusively from the proxy's validated HttpOnly cookie.
+    let share_token = crate::immich_client::client::get_cookie_share_token(headers, &key);
 
     // Serve a fresh cached response when one is available (IDEAS #4 + #6).
     if let Some(mut cached) = share_cache::get(&key, share_token.as_deref()) {
         // The cached body is request-independent except for these two fields, which
-        // derive from the current request's host header; re-stamp them.
-        cached.ipp_public_base_url = ipp_public_base_url.clone();
-        cached.request_key = key.clone();
+        // derive from the current request's host header / path; re-stamp them.
+        cached.ipp_public_base_url = ipp_public_base_url;
+        cached.request_key = key;
         return Ok(cached);
     }
 
@@ -216,7 +245,10 @@ async fn get_share_details_with_client(
     let (status, text) = client
         .fetch_share_me(&key, share_token.as_deref())
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| {
+            eprintln!("fetch_share_me transport error for key {:?}: {}", key, e);
+            ShareDetailsError::Internal
+        })?;
 
     if status == 401 {
         return server_helpers::handle_unauthorized(client, &key, &text, ipp_public_base_url).await;
@@ -224,14 +256,21 @@ async fn get_share_details_with_client(
 
     if !status.is_success() {
         eprintln!(
-            "fetch_share_me failed for key '{}': {} — {}",
+            "fetch_share_me failed for key {:?}: {} — {}",
             key, status, text
         );
-        return Err(format!("Failed with status: {}", status));
+        return Err(ShareDetailsError::Internal);
     }
 
-    let link: SharedLink = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    let link: SharedLink = serde_json::from_str(&text).map_err(|e| {
+        eprintln!(
+            "fetch_share_me JSON parse error for key {:?}: {}",
+            key, e
+        );
+        ShareDetailsError::Internal
+    })?;
     let canonical_key = link.key.clone();
+    let is_password_protected = link.password.is_some();
 
     let allow_download = link.allow_download.unwrap_or(false);
     let show_metadata = link.show_metadata.unwrap_or(true);
@@ -241,12 +280,17 @@ async fn get_share_details_with_client(
     // For album-type shares, fetch assets via the v3 timeline bucket endpoints.
     if link.r#type.as_deref() == Some("ALBUM") {
         if let Some(ref album) = link.album {
-            // Fetch album assets if the shared link response didn't include them (v3 behavior)
             if safe_link.assets.is_empty() {
                 let assets = client
                     .fetch_album_assets(&album.id, &canonical_key, share_token.as_deref())
                     .await
-                    .map_err(|e| format!("Failed to fetch album assets: {}", e))?;
+                    .map_err(|e| {
+                        eprintln!(
+                            "Failed to fetch album assets for key {:?}: {}",
+                            key, e
+                        );
+                        ShareDetailsError::Internal
+                    })?;
                 safe_link.assets = assets
                     .into_iter()
                     .map(crate::dto::SafeAsset::from_base)
@@ -257,10 +301,8 @@ async fn get_share_details_with_client(
                     .await;
             }
         }
-    } else {
-        if show_metadata {
-            server_helpers::resolve_owner_fallback(client, &mut safe_link.assets).await;
-        }
+    } else if show_metadata {
+        server_helpers::resolve_owner_fallback(client, &mut safe_link.assets).await;
     }
 
     // Sort album assets if there is a sort order specified
@@ -296,32 +338,72 @@ async fn get_share_details_with_client(
         request_key: key.clone(),
     };
 
-    // Cache the fully-resolved response for fast repeat loads (no-op if a concurrent
-    // mutation bumped the generation while we were building).
-    share_cache::put(&key, share_token.as_deref(), &details, cache_generation);
+    // For public shares (no password), cache under `(key, None)` so arbitrary client
+    // cookies share the same entry and cannot cause cache bloat or cache-busting.
+    let cache_token = if is_password_protected {
+        share_token.as_deref()
+    } else {
+        None
+    };
+    share_cache::put(&key, cache_token, &details, cache_generation);
 
     Ok(details)
 }
 
 /// Axum JSON API handler
 pub async fn get_share_details_handler(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Path(key): Path<String>,
-    Query(params): Query<ShareParams>,
     headers: HeaderMap,
-) -> Result<Json<ShareDetails>, Response> {
-    match get_share_details(key, params.share_token, &headers).await {
-        Ok(details) => Ok(Json(details)),
-        Err(err) => {
-            let status = if err.contains("Invalid share key") {
-                StatusCode::NOT_FOUND
-            } else if err.contains("not accessible") {
-                StatusCode::FORBIDDEN
-            } else {
-                StatusCode::INTERNAL_SERVER_ERROR
-            };
-            Err((status, Json(serde_json::json!({ "error": err }))).into_response())
-        }
+) -> Response {
+    if !crate::security::is_safe_param(&key) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "Invalid share key" })),
+        )
+            .into_response();
     }
+
+    let client_ip = crate::security::extract_client_ip(&headers, peer.ip());
+    if let Err(retry_after) = crate::security::probe_limiter().check_blocked(client_ip) {
+        return crate::security::rate_limited_response(
+            retry_after,
+            Json(serde_json::json!({ "error": "Too many requests" })),
+        );
+    }
+
+    let mut resp = match get_share_details(key, &headers).await {
+        Ok(details) => Json(details).into_response(),
+        Err(ShareDetailsError::BadRequest) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "Bad request" })),
+        )
+            .into_response(),
+        Err(ShareDetailsError::InvalidKey) => {
+            crate::security::probe_limiter().penalize(client_ip);
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "Invalid share key" })),
+            )
+                .into_response()
+        }
+        Err(ShareDetailsError::NotAccessible) => {
+            crate::security::probe_limiter().penalize(client_ip);
+            (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({ "error": "Share is not accessible" })),
+            )
+                .into_response()
+        }
+        Err(ShareDetailsError::Internal) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "Internal server error" })),
+        )
+            .into_response(),
+    };
+
+    crate::security::insert_private_no_store(resp.headers_mut());
+    resp
 }
 
 mod server_helpers {
@@ -334,7 +416,7 @@ mod server_helpers {
         key: &str,
         body: &str,
         ipp_public_base_url: String,
-    ) -> Result<ShareDetails, String> {
+    ) -> Result<ShareDetails, ShareDetailsError> {
         // Immich answers a password-protected share with HTTP 401 and a body of
         // `{"message":"Password required",...}` (no password supplied) or
         // `{"message":"Invalid password",...}` (wrong password). In both cases
@@ -345,35 +427,35 @@ mod server_helpers {
         // key's user and would otherwise misreport someone else's
         // password-protected share as an invalid key.
         if body.contains("Password required") || body.contains("Invalid password") {
-            eprintln!("Share '{}' requires a password (per Immich 401 body)", key);
+            eprintln!("Share {:?} requires a password (per Immich 401 body)", key);
             return Ok(password_required_response(key, ipp_public_base_url));
         }
 
         match client.get_admin_shared_link(key).await {
             Ok(Some(link)) if link.password.is_some() => {
-                eprintln!("Share '{}' requires a password", key);
+                eprintln!("Share {:?} requires a password", key);
                 Ok(password_required_response(key, ipp_public_base_url))
             }
             Ok(Some(_)) => {
                 eprintln!(
-                    "Share '{}' returned 401 but has no password set — share is not accessible",
+                    "Share {:?} returned 401 but has no password set — share is not accessible",
                     key
                 );
-                Err("Share is not accessible".to_string())
+                Err(ShareDetailsError::NotAccessible)
             }
             Ok(None) if client.admin_api_key.is_some() => {
                 // Admin API is available but the link wasn't found
                 eprintln!(
-                    "Share '{}' not found via admin API — invalid share key",
+                    "Share {:?} not found via admin API — invalid share key",
                     key
                 );
-                Err("Invalid share key".to_string())
+                Err(ShareDetailsError::InvalidKey)
             }
             _ => {
                 // No admin key or API error — can't determine the cause,
                 // so assume password required as a safe fallback
                 eprintln!(
-                    "Share '{}' returned 401 and admin API is unavailable — assuming password required",
+                    "Share {:?} returned 401 and admin API is unavailable — assuming password required",
                     key
                 );
                 Ok(password_required_response(key, ipp_public_base_url))
@@ -599,5 +681,51 @@ mod server_helpers {
                 asset.uploader_is_fallback = true;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_details(key: &str) -> ShareDetails {
+        ShareDetails {
+            link: SafeSharedLink {
+                key: key.to_string(),
+                description: Some(format!("Album {}", key)),
+                r#type: Some("ALBUM".to_string()),
+                allow_download: Some(true),
+                allow_upload: Some(false),
+                assets: vec![],
+                album: None,
+            },
+            password_required: false,
+            ipp_public_base_url: "https://example.com".to_string(),
+            request_key: key.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_share_cache_token_isolation_and_public_collapsing() {
+        let priv_key = "test_priv_key_iso";
+        let g = share_cache::generation(priv_key);
+        let d = sample_details(priv_key);
+        assert!(share_cache::put(priv_key, Some("tok_a"), &d, g));
+        assert!(share_cache::get(priv_key, Some("tok_a")).is_some());
+        assert!(share_cache::get(priv_key, Some("tok_b")).is_none());
+        assert!(share_cache::get(priv_key, None).is_none());
+
+        // Public share stored with None is served even if client sends arbitrary cookie
+        let pub_key = "test_pub_key_collapse";
+        let gp = share_cache::generation(pub_key);
+        let dp = sample_details(pub_key);
+        assert!(share_cache::put(pub_key, None, &dp, gp));
+        assert!(share_cache::get(pub_key, None).is_some());
+        assert!(share_cache::get(pub_key, Some("random_junk")).is_some());
+
+        // Invalidation bumps generation and rejects stale writes
+        share_cache::invalidate(pub_key);
+        assert!(share_cache::get(pub_key, None).is_none());
+        assert!(!share_cache::put(pub_key, None, &dp, gp));
     }
 }

@@ -149,10 +149,19 @@ export function startStatusStream(
 ): UploadStatusController {
   // Client-minted session token, tying this drop's uploads to one stream. UUID is
   // alphanumeric + '-', which the server's is_safe_param validation already allows.
-  const sessionToken =
-    typeof crypto !== 'undefined' && 'randomUUID' in crypto
-      ? crypto.randomUUID()
-      : `sess-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  // Use crypto.getRandomValues as fallback (available in non-HTTPS contexts where
+  // crypto.randomUUID is undefined) rather than predictable Math.random().
+  const sessionToken = (() => {
+    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+      return crypto.randomUUID();
+    }
+    const bytes = new Uint8Array(16);
+    crypto.getRandomValues(bytes);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40; // UUID v4
+    bytes[8] = (bytes[8] & 0x3f) | 0x80; // RFC 4122 variant
+    const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+  })();
 
   let uploadsDone = false;
   let es: EventSource | null = null;

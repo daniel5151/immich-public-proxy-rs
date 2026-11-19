@@ -1,18 +1,40 @@
 use crate::immich_client::client::ImmichClient;
+use crate::immich_client::client::METADATA_TIMEOUT;
 use crate::immich_client::client::get_cookie_share_token;
-use axum::body::Body;
+use crate::security::{
+    check_csrf, extract_client_ip, insert_private_no_store, is_https_request, is_safe_param,
+    is_valid_share_token, random_hex_128, rate_limited_response, unlock_limiter,
+    validate_uploader_name,
+};
+use axum::body::{Body, Bytes};
+use axum::extract::ConnectInfo;
+use axum::extract::DefaultBodyLimit;
 use axum::extract::Form;
+use axum::extract::Multipart;
 use axum::extract::Path;
 use axum::extract::Query;
-use axum::extract::Request;
-use axum::http::HeaderMap;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::IntoResponse;
 use axum::response::Redirect;
 use axum::response::sse::Event;
 use axum::response::sse::KeepAlive;
 use axum::response::sse::Sse;
 use serde::Deserialize;
+use std::net::SocketAddr;
+
+/// Maximum single-file upload payload size (default 256 MiB, configurable via `IPP_MAX_UPLOAD_BYTES`).
+pub fn max_upload_bytes() -> usize {
+    static MAX_BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MAX_BYTES.get_or_init(|| {
+        const DEFAULT_MAX: usize = 256 * 1024 * 1024; // 256 MiB
+        const MIN_MAX: usize = 1024 * 1024; // 1 MiB floor
+        std::env::var("IPP_MAX_UPLOAD_BYTES")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map(|n| n.max(MIN_MAX))
+            .unwrap_or(DEFAULT_MAX)
+    })
+}
 
 pub trait ProxyRoutes {
     fn proxy_routes(self) -> Self;
@@ -20,6 +42,10 @@ pub trait ProxyRoutes {
 
 impl<T: Clone + Send + Sync + 'static> ProxyRoutes for axum::Router<T> {
     fn proxy_routes(self) -> Self {
+        // Allow 1 MiB headroom on Axum's route body limit for multipart framing overhead;
+        // the streaming multipart filter enforces `max_upload_bytes()` strictly on payload bytes.
+        let upload_route_limit = max_upload_bytes().saturating_add(1024 * 1024);
+
         self.route(
             "/share/photo/{key}/{id}/{size}",
             axum::routing::get(proxy_photo),
@@ -33,7 +59,8 @@ impl<T: Clone + Send + Sync + 'static> ProxyRoutes for axum::Router<T> {
         .route("/share/{key}/download", axum::routing::get(download_all))
         .route(
             "/share/{key}/upload",
-            axum::routing::post(upload_asset_handler),
+            axum::routing::post(upload_asset_handler)
+                .layer(DefaultBodyLimit::max(upload_route_limit)),
         )
         // Finish beacon for the session-scoped SSE stream: the client hits this once
         // its upload loop ends so the stream can terminate promptly (see
@@ -68,55 +95,18 @@ pub struct UnlockPayload {
     password: String,
 }
 
-fn is_safe_param(s: &str) -> bool {
-    s.chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-}
-
-/// Validate that the request origin matches the host, for CSRF protection.
-/// Returns true if the request passes the CSRF check (i.e., is same-origin).
-fn check_csrf(headers: &HeaderMap) -> bool {
-    // Prefer the Sec-Fetch-Site header (set by modern browsers, unforgeable)
-    if let Some(site) = headers.get("sec-fetch-site") {
-        return site == "same-origin";
-    }
-
-    // Fallback: compare parsed Origin host against the Host header
-    let origin = headers
-        .get(axum::http::header::ORIGIN)
-        .and_then(|v| v.to_str().ok());
-    let host = headers
-        .get(axum::http::header::HOST)
-        .and_then(|v| v.to_str().ok());
-
-    match (origin, host) {
-        (Some(o), Some(h)) => {
-            // Parse the Origin as a URI and extract its authority (host:port)
-            match o.parse::<axum::http::Uri>() {
-                Ok(uri) => match uri.authority() {
-                    Some(auth) => auth.as_str() == h,
-                    None => false,
-                },
-                Err(_) => false,
-            }
-        }
-        // If neither header is present, we can't validate - deny by default
-        _ => false,
-    }
-}
-
 fn shared_get_request(
     client: &ImmichClient,
     url: &str,
     share_token: Option<&str>,
-    range: Option<&axum::http::HeaderValue>,
+    range: Option<&HeaderValue>,
 ) -> reqwest::RequestBuilder {
     let mut req = client.http_client.get(url);
-    if let Some(token) = share_token {
+    if let Some(token) = share_token.filter(|t| is_valid_share_token(t)) {
         req = req.header("cookie", format!("immich_shared_link_token={}", token));
     }
     if let Some(range) = range {
-        req = req.header(reqwest::header::RANGE, range.clone());
+        req = req.header(header::RANGE, range.clone());
     }
     req
 }
@@ -131,7 +121,7 @@ async fn fetch_shared_link_for_proxy(
         Ok((status, text)) if status.is_success() => {
             serde_json::from_str::<crate::immich_client::model::SharedLink>(&text).map_err(|e| {
                 eprintln!(
-                    "{}: failed to parse share link response for key '{}': {}",
+                    "{}: failed to parse share link response for key {:?}: {}",
                     context, key, e
                 );
                 StatusCode::INTERNAL_SERVER_ERROR
@@ -139,14 +129,14 @@ async fn fetch_shared_link_for_proxy(
         }
         Ok((status, text)) => {
             eprintln!(
-                "{}: share link request failed for key '{}': {} — {}",
+                "{}: share link request failed for key {:?}: {} — {}",
                 context, key, status, text
             );
             Err(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR))
         }
         Err(e) => {
             eprintln!(
-                "{}: upstream request failed for key '{}': {}",
+                "{}: upstream request failed for key {:?}: {}",
                 context, key, e
             );
             Err(StatusCode::INTERNAL_SERVER_ERROR)
@@ -175,7 +165,8 @@ async fn retry_with_canonical_key(
     key: &str,
     share_token: Option<&str>,
     subpath: &str,
-    range: Option<&axum::http::HeaderValue>,
+    extra_params: &[(&str, &str)],
+    range: Option<&HeaderValue>,
     context: &str,
 ) -> Result<reqwest::Response, StatusCode> {
     if original_res.status() != StatusCode::UNAUTHORIZED {
@@ -185,7 +176,8 @@ async fn retry_with_canonical_key(
         resolve_canonical_share_key(client, key, share_token, context).await
     {
         if canonical_key != key {
-            let retry_params: Vec<(&str, &str)> = vec![("key", canonical_key.as_str())];
+            let mut retry_params: Vec<(&str, &str)> = vec![("key", canonical_key.as_str())];
+            retry_params.extend_from_slice(extra_params);
             let retry_url = client.build_url(subpath, &retry_params);
             match shared_get_request(client, &retry_url, share_token, range)
                 .send()
@@ -203,6 +195,7 @@ async fn retry_with_canonical_key(
 }
 
 pub async fn unlock_share_handler(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Form(payload): Form<UnlockPayload>,
 ) -> impl IntoResponse {
@@ -214,6 +207,11 @@ pub async fn unlock_share_handler(
         return StatusCode::FORBIDDEN.into_response();
     }
 
+    let client_ip = extract_client_ip(&headers, peer.ip());
+    if let Err(retry_after) = unlock_limiter().check(client_ip) {
+        return rate_limited_response(retry_after, "Too many unlock attempts");
+    }
+
     let client = ImmichClient::new();
 
     // Immich 3.0: authenticate via POST /shared-links/login, which returns the
@@ -223,18 +221,17 @@ pub async fn unlock_share_handler(
         .await;
 
     match login_result {
-        Ok(Some((token, text))) => {
+        Ok(Some((token, text))) if is_valid_share_token(&token) => {
             use base64::Engine;
             let b64_key = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&payload.key);
             let b64_token =
                 base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(token.as_bytes());
 
-            let is_https = headers
-                .get("x-forwarded-proto")
-                .and_then(|p| p.to_str().ok())
-                .map(|p| p.eq_ignore_ascii_case("https"))
-                .unwrap_or(false);
-            let secure_flag = if is_https { " Secure;" } else { "" };
+            let secure_flag = if is_https_request(&headers) {
+                " Secure;"
+            } else {
+                ""
+            };
 
             // Store the Immich shared-link token in the proxy's own cookie
             let cookie1 = format!(
@@ -242,38 +239,106 @@ pub async fn unlock_share_handler(
                 b64_key, b64_token, secure_flag
             );
             let mut resp = Redirect::to(&format!("/share/{}", payload.key)).into_response();
-            resp.headers_mut()
-                .append(axum::http::header::SET_COOKIE, cookie1.parse().unwrap());
+            if let Ok(val) = HeaderValue::from_str(&cookie1) {
+                resp.headers_mut().append(header::SET_COOKIE, val);
+            }
 
             // If the real key differs from the slug/identifier used, also set a cookie
             // for the real key so both paths work
             if let Ok(link) = serde_json::from_str::<crate::immich_client::model::SharedLink>(&text)
             {
-                if link.key != payload.key {
+                if link.key != payload.key && is_safe_param(&link.key) {
                     let b64_real_key =
                         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&link.key);
                     let cookie2 = format!(
                         "immich_share_token_{}={};{} Path=/; HttpOnly; SameSite=Lax",
                         b64_real_key, b64_token, secure_flag
                     );
-                    resp.headers_mut()
-                        .append(axum::http::header::SET_COOKIE, cookie2.parse().unwrap());
+                    if let Ok(val) = HeaderValue::from_str(&cookie2) {
+                        resp.headers_mut().append(header::SET_COOKIE, val);
+                    }
                 }
             }
             return resp;
         }
-        Ok(None) => {
+        Ok(_) => {
             // Auth failed (wrong password or invalid link)
         }
         Err(e) => {
             eprintln!(
-                "unlock: login_share_link failed for key '{}': {}",
+                "unlock: login_share_link failed for key {:?}: {}",
                 payload.key, e
             );
         }
     }
 
     Redirect::to(&format!("/share/{}", payload.key)).into_response()
+}
+
+/// Safe inert raster image MIME types allowed to display inline for non-original views.
+/// Active document formats (e.g. `image/svg+xml`, `text/html`) are never in this allowlist
+/// and are forced to `Content-Disposition: attachment` alongside a sandboxed CSP.
+fn is_safe_inline_image_mime(content_type: Option<&str>) -> bool {
+    let Some(ct) = content_type else {
+        return false;
+    };
+    let mime = ct.split(';').next().unwrap_or("").trim();
+    matches!(
+        mime.to_ascii_lowercase().as_str(),
+        "image/jpeg"
+            | "image/jpg"
+            | "image/png"
+            | "image/webp"
+            | "image/gif"
+            | "image/avif"
+            | "image/heic"
+            | "image/heif"
+    )
+}
+
+/// Rewrites a `Content-Disposition` value to force `attachment` while preserving any
+/// safe filename parameters from upstream.
+fn force_attachment_disposition(existing: Option<&HeaderValue>) -> HeaderValue {
+    if let Some(val) = existing.and_then(|v| v.to_str().ok()) {
+        let trimmed = val.trim();
+        if trimmed.len() >= 10 && trimmed[..10].eq_ignore_ascii_case("attachment") {
+            return HeaderValue::from_str(trimmed)
+                .unwrap_or_else(|_| HeaderValue::from_static("attachment"));
+        }
+        if let Some(semi_idx) = trimmed.find(';') {
+            let rewritten = format!("attachment{}", &trimmed[semi_idx..]);
+            if let Ok(hv) = HeaderValue::from_str(&rewritten) {
+                return hv;
+            }
+        }
+    }
+    HeaderValue::from_static("attachment")
+}
+
+/// Ensures `Cache-Control` for authenticated share responses cannot be stored in shared caches.
+fn private_cache_control(existing: Option<&HeaderValue>) -> HeaderValue {
+    if let Some(val) = existing.and_then(|v| v.to_str().ok()) {
+        let directives: Vec<&str> = val
+            .split(',')
+            .map(str::trim)
+            .filter(|d| !d.is_empty() && !d.eq_ignore_ascii_case("public"))
+            .collect();
+        let has_private = directives
+            .iter()
+            .any(|d| d.eq_ignore_ascii_case("private") || d.eq_ignore_ascii_case("no-store"));
+        let mut out = String::new();
+        if !has_private {
+            out.push_str("private");
+            if !directives.is_empty() {
+                out.push_str(", ");
+            }
+        }
+        out.push_str(&directives.join(", "));
+        if let Ok(hv) = HeaderValue::from_str(&out) {
+            return hv;
+        }
+    }
+    HeaderValue::from_static("private, no-store")
 }
 
 pub async fn proxy_photo(
@@ -296,23 +361,31 @@ async fn proxy_photo_impl(
     id: String,
     size_str: String,
 ) -> impl IntoResponse {
-    if !is_safe_param(&key) || !is_safe_param(&id) || !is_safe_param(&size_str) {
+    if !is_safe_param(&key)
+        || !is_safe_param(&id)
+        || !matches!(
+            size_str.as_str(),
+            "thumbnail" | "preview" | "fullsize" | "original"
+        )
+    {
         return StatusCode::BAD_REQUEST.into_response();
     }
     let client = ImmichClient::new();
     let share_token = get_cookie_share_token(&headers, &key);
 
     let mut params: Vec<(&str, &str)> = vec![("key", key.as_str())];
+    let mut extra_params: Vec<(&str, &str)> = Vec::new();
 
     let subpath = if size_str == "original" {
         format!("/assets/{}/original", id)
     } else {
         params.push(("size", size_str.as_str()));
+        extra_params.push(("size", size_str.as_str()));
         format!("/assets/{}/thumbnail", id)
     };
 
     let url = client.build_url(&subpath, &params);
-    let range = headers.get(axum::http::header::RANGE);
+    let range = headers.get(header::RANGE);
 
     let mut res = match shared_get_request(&client, &url, share_token.as_deref(), range)
         .send()
@@ -321,7 +394,7 @@ async fn proxy_photo_impl(
         Ok(res) => res,
         Err(e) => {
             eprintln!(
-                "proxy_photo: upstream request failed for asset {}: {}",
+                "proxy_photo: upstream request failed for asset {:?}: {}",
                 id, e
             );
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
@@ -334,6 +407,7 @@ async fn proxy_photo_impl(
         &key,
         share_token.as_deref(),
         &subpath,
+        &extra_params,
         range,
         "proxy_photo",
     )
@@ -343,6 +417,19 @@ async fn proxy_photo_impl(
         Err(status) => return status.into_response(),
     };
 
+    let upstream_ct = res
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    // Force `Content-Disposition: attachment` on all `/original` downloads, and on any
+    // successful non-original response whose MIME type is not in the inert raster image
+    // allowlist (e.g., `image/svg+xml`). Avoid forcing attachment on non-2xx upstream
+    // error responses (e.g., 401/404 JSON) so opening a broken image URL directly in a
+    // browser tab displays the error status rather than prompting a file download.
+    let force_attachment = size_str == "original"
+        || (res.status().is_success() && !is_safe_inline_image_mime(upstream_ct.as_deref()));
+
     let mut builder = axum::response::Response::builder().status(res.status());
     for (k, v) in res.headers() {
         if [
@@ -350,8 +437,6 @@ async fn proxy_photo_impl(
             "content-length",
             "etag",
             "last-modified",
-            "content-disposition",
-            "cache-control",
             "accept-ranges",
             "content-range",
         ]
@@ -360,6 +445,29 @@ async fn proxy_photo_impl(
             builder = builder.header(k.clone(), v.clone());
         }
     }
+
+    if force_attachment {
+        let disp = force_attachment_disposition(res.headers().get(header::CONTENT_DISPOSITION));
+        builder = builder.header(header::CONTENT_DISPOSITION, disp);
+    } else if let Some(disp) = res.headers().get(header::CONTENT_DISPOSITION) {
+        builder = builder.header(header::CONTENT_DISPOSITION, disp.clone());
+    }
+
+    if share_token.is_some() {
+        let cc = private_cache_control(res.headers().get(header::CACHE_CONTROL));
+        builder = builder.header(header::CACHE_CONTROL, cc);
+    } else if let Some(cc) = res.headers().get(header::CACHE_CONTROL) {
+        builder = builder.header(header::CACHE_CONTROL, cc.clone());
+    }
+
+    // Sandbox proxied media so even active document types cannot execute scripts on our origin.
+    builder = builder
+        .header(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static("default-src 'none'; sandbox"),
+        )
+        .header(header::VARY, HeaderValue::from_static("Cookie"));
+
     builder.body(Body::from_stream(res.bytes_stream())).unwrap()
 }
 
@@ -377,7 +485,7 @@ pub async fn proxy_video(
 
     let subpath = format!("/assets/{}/video/playback", id);
     let url = client.build_url(&subpath, &params);
-    let range = headers.get(axum::http::header::RANGE);
+    let range = headers.get(header::RANGE);
 
     let mut res = match shared_get_request(&client, &url, share_token.as_deref(), range)
         .send()
@@ -386,7 +494,7 @@ pub async fn proxy_video(
         Ok(res) => res,
         Err(e) => {
             eprintln!(
-                "proxy_video: upstream request failed for asset {}: {}",
+                "proxy_video: upstream request failed for asset {:?}: {}",
                 id, e
             );
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
@@ -399,6 +507,7 @@ pub async fn proxy_video(
         &key,
         share_token.as_deref(),
         &subpath,
+        &[],
         range,
         "proxy_video",
     )
@@ -417,13 +526,27 @@ pub async fn proxy_video(
             "last-modified",
             "content-range",
             "accept-ranges",
-            "cache-control",
         ]
         .contains(&k.as_str())
         {
             builder = builder.header(k.clone(), v.clone());
         }
     }
+
+    if share_token.is_some() {
+        let cc = private_cache_control(res.headers().get(header::CACHE_CONTROL));
+        builder = builder.header(header::CACHE_CONTROL, cc);
+    } else if let Some(cc) = res.headers().get(header::CACHE_CONTROL) {
+        builder = builder.header(header::CACHE_CONTROL, cc.clone());
+    }
+
+    builder = builder
+        .header(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static("default-src 'none'; sandbox"),
+        )
+        .header(header::VARY, HeaderValue::from_static("Cookie"));
+
     builder.body(Body::from_stream(res.bytes_stream())).unwrap()
 }
 
@@ -469,7 +592,7 @@ pub async fn download_all(
                 Ok(assets) => assets,
                 Err(e) => {
                     eprintln!(
-                        "download_all: failed to fetch album assets for '{}': {}",
+                        "download_all: failed to fetch album assets for {:?}: {}",
                         key, e
                     );
                     return IntoResponse::into_response(StatusCode::INTERNAL_SERVER_ERROR);
@@ -495,14 +618,25 @@ pub async fn download_all(
     let sanitized_title = title.replace(|c: char| !c.is_alphanumeric() && c != '-', "_");
     let filename = format!("{}.zip", sanitized_title);
 
+    const MAX_DOWNLOAD_ASSETS: usize = 5000;
+    let allowed_ids: std::collections::HashSet<&str> =
+        share_assets.iter().map(|a| a.id.as_str()).collect();
+
     let asset_ids: Vec<String> = if let Some(ids_str) = query.asset_ids {
+        let mut seen = std::collections::HashSet::new();
         ids_str
             .split(',')
-            .filter(|s| is_safe_param(s))
+            .map(str::trim)
+            .filter(|s| is_safe_param(s) && allowed_ids.contains(*s) && seen.insert(*s))
+            .take(MAX_DOWNLOAD_ASSETS)
             .map(|s| s.to_string())
             .collect()
     } else {
-        share_assets.into_iter().map(|a| a.id).collect()
+        share_assets
+            .iter()
+            .take(MAX_DOWNLOAD_ASSETS)
+            .map(|a| a.id.clone())
+            .collect()
     };
 
     if asset_ids.is_empty() {
@@ -515,14 +649,14 @@ pub async fn download_all(
 
     let download_url = client.build_url("/download/archive", &params);
     let mut dl_req = client.http_client.post(&download_url).json(&payload);
-    if let Some(ref token) = share_token {
+    if let Some(token) = share_token.as_deref().filter(|t| is_valid_share_token(t)) {
         dl_req = dl_req.header("cookie", format!("immich_shared_link_token={}", token));
     }
     let res = match dl_req.send().await {
         Ok(r) if r.status().is_success() => r,
         Ok(r) => {
             eprintln!(
-                "download_all: archive download failed for key '{}': {}",
+                "download_all: archive download failed for key {:?}: {}",
                 key,
                 r.status()
             );
@@ -530,17 +664,17 @@ pub async fn download_all(
         }
         Err(e) => {
             eprintln!(
-                "download_all: upstream archive request failed for key '{}': {}",
+                "download_all: upstream archive request failed for key {:?}: {}",
                 key, e
             );
             return IntoResponse::into_response(StatusCode::INTERNAL_SERVER_ERROR);
         }
     };
 
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        axum::http::header::CONTENT_TYPE,
-        "application/zip".parse().unwrap(),
+    let mut resp_headers = HeaderMap::new();
+    resp_headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/zip"),
     );
     let ascii_filename: String = filename
         .chars()
@@ -553,8 +687,8 @@ pub async fn download_all(
         })
         .collect();
     let encoded_filename = urlencoding::encode(&filename);
-    headers.insert(
-        axum::http::header::CONTENT_DISPOSITION,
+    resp_headers.insert(
+        header::CONTENT_DISPOSITION,
         format!(
             "attachment; filename=\"{}\"; filename*=UTF-8''{}",
             ascii_filename, encoded_filename
@@ -562,8 +696,19 @@ pub async fn download_all(
         .parse()
         .unwrap(),
     );
+    insert_private_no_store(&mut resp_headers);
 
-    (headers, Body::from_stream(res.bytes_stream())).into_response()
+    (resp_headers, Body::from_stream(res.bytes_stream())).into_response()
+}
+
+const MAX_TAG_CACHE_ENTRIES: usize = 4096;
+const MAX_PROCESSED_ASSETS: usize = 4096;
+
+#[derive(Clone)]
+struct ProcessedAsset {
+    uploader_name: String,
+    canonical_key: String,
+    timestamp: std::time::Instant,
 }
 
 static ADDED_ALBUMS: std::sync::OnceLock<parking_lot::RwLock<std::collections::HashSet<String>>> =
@@ -581,8 +726,53 @@ static TAG_LOCKS: std::sync::OnceLock<
     parking_lot::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
 > = std::sync::OnceLock::new();
 static PROCESSED_ASSETS: std::sync::OnceLock<
-    parking_lot::RwLock<std::collections::HashMap<String, (String, std::time::Instant)>>,
+    parking_lot::RwLock<std::collections::HashMap<String, ProcessedAsset>>,
 > = std::sync::OnceLock::new();
+
+/// Invalidates both the incoming `request_key` (which may be a slug) and the
+/// resolved `canonical_key` in `share_cache`, ensuring in-flight rebuilds started
+/// under a slug observe the generation bump even when `share_cache` is empty.
+fn invalidate_share_keys(request_key: &str, canonical_key: &str) {
+    crate::api::get_share_details::share_cache::invalidate(request_key);
+    if canonical_key != request_key {
+        crate::api::get_share_details::share_cache::invalidate(canonical_key);
+    }
+}
+
+fn record_processed_asset(asset_id: String, uploader_name: String, canonical_key: String) {
+    let cache =
+        PROCESSED_ASSETS.get_or_init(|| parking_lot::RwLock::new(std::collections::HashMap::new()));
+    let mut write_guard = cache.write();
+
+    // Clean up stale entries to prevent memory leaks from abandoned status polls,
+    // and enforce a hard capacity ceiling (MAX_PROCESSED_ASSETS) via oldest-first eviction.
+    let now = std::time::Instant::now();
+    let expiry = std::time::Duration::from_secs(600); // 10 minutes
+    write_guard.retain(|_, entry| now.duration_since(entry.timestamp) < expiry);
+
+    if !write_guard.contains_key(&asset_id) {
+        while write_guard.len() >= MAX_PROCESSED_ASSETS {
+            if let Some(oldest_id) = write_guard
+                .iter()
+                .min_by_key(|(_, e)| e.timestamp)
+                .map(|(id, _)| id.clone())
+            {
+                write_guard.remove(&oldest_id);
+            } else {
+                break;
+            }
+        }
+    }
+
+    write_guard.insert(
+        asset_id,
+        ProcessedAsset {
+            uploader_name,
+            canonical_key,
+            timestamp: now,
+        },
+    );
+}
 
 // ---------------------------------------------------------------------------
 // Upload-session registry — backs the SESSION-SCOPED SSE status stream.
@@ -607,15 +797,28 @@ static PROCESSED_ASSETS: std::sync::OnceLock<
 //     uploaded *after* the stream opened are picked up automatically — no URL
 //     churn, no second connection, no client->server push channel.
 //
-// The session token is minted by the client (crypto.randomUUID) and passed as the
-// `session` query param on each upload POST and on the stream open. It's validated
-// with the same `is_safe_param` rule as every other path segment (a UUID is
-// alphanumeric + '-', which that rule already permits).
+// The session token is minted by the client (crypto.randomUUID / getRandomValues)
+// and passed as the `session` query param on each upload POST and on the stream
+// open. It's validated with the same `is_safe_param` rule as every other path
+// segment (a UUID is alphanumeric + '-', which that rule already permits).
+//
+// Security & memory invariants:
+//   * Every session is bound to the resolved `canonical_key` of the share it was
+//     created under; operations from a different share key are rejected so one
+//     share cannot observe, hijack, or terminate another share's session.
+//   * Bounded to `MAX_SESSIONS` active sessions and `MAX_PENDING_PER_SESSION`
+//     pending assets per session, with lazy TTL sweeping + oldest eviction.
+// ---------------------------------------------------------------------------
 mod upload_sessions {
     use std::collections::{HashMap, HashSet};
     use std::time::{Duration, Instant};
 
+    const MAX_SESSIONS: usize = 512;
+    const MAX_PENDING_PER_SESSION: usize = 1024;
+
     struct Session {
+        /// Canonical share key that owns this session (enforces cross-share isolation).
+        canonical_key: String,
         /// Asset ids uploaded under this session not yet resolved by a stream.
         /// GROWS as uploads land mid-stream; shrinks as the stream resolves them.
         pending: HashSet<String>,
@@ -638,59 +841,99 @@ mod upload_sessions {
         SESSIONS.get_or_init(|| parking_lot::RwLock::new(HashMap::new()))
     }
 
-    /// Register a freshly-uploaded asset id under `session`, creating the session on
-    /// first use. Also lazily sweeps sessions older than the TTL (same cheap
-    /// retain-on-write pattern as `status_link_cache::put`) so abandoned ones can't
-    /// leak.
-    pub(super) fn add_pending(session: &str, asset_id: &str) {
+    /// Register a freshly-uploaded asset id under `session` (scoped to `canonical_key`),
+    /// creating the session on first use. Also lazily sweeps sessions older than the TTL
+    /// and enforces `MAX_SESSIONS` / `MAX_PENDING_PER_SESSION` caps.
+    pub(super) fn add_pending(canonical_key: &str, session: &str, asset_id: &str) {
         let mut guard = map().write();
         let now = Instant::now();
         guard.retain(|_, s| now.duration_since(s.created) < SESSION_TTL);
-        let entry = guard.entry(session.to_string()).or_insert_with(|| Session {
-            pending: HashSet::new(),
-            uploads_finished: false,
-            created: now,
-        });
-        entry.pending.insert(asset_id.to_string());
+
+        if let Some(existing) = guard.get_mut(session) {
+            if existing.canonical_key != canonical_key {
+                // Reject cross-share session collision/hijack
+                return;
+            }
+            if existing.pending.len() < MAX_PENDING_PER_SESSION {
+                existing.pending.insert(asset_id.to_string());
+            }
+            return;
+        }
+
+        while guard.len() >= MAX_SESSIONS {
+            if let Some(oldest_key) = guard
+                .iter()
+                .min_by_key(|(_, s)| s.created)
+                .map(|(k, _)| k.clone())
+            {
+                guard.remove(&oldest_key);
+            } else {
+                break;
+            }
+        }
+
+        let mut pending = HashSet::new();
+        pending.insert(asset_id.to_string());
+        guard.insert(
+            session.to_string(),
+            Session {
+                canonical_key: canonical_key.to_string(),
+                pending,
+                uploads_finished: false,
+                created: now,
+            },
+        );
     }
 
-    /// Mark a session's uploads complete. No-op if the session is unknown (e.g. the
-    /// finish beacon raced ahead of registration — unlikely, but harmless).
-    pub(super) fn mark_finished(session: &str) {
+    /// Mark a session's uploads complete (if owned by `canonical_key`). No-op if the
+    /// session is unknown or belongs to a different share.
+    pub(super) fn mark_finished(canonical_key: &str, session: &str) {
         if let Some(s) = map().write().get_mut(session) {
-            s.uploads_finished = true;
+            if s.canonical_key == canonical_key {
+                s.uploads_finished = true;
+            }
         }
     }
 
-    /// Snapshot the session's current pending ids. `None` if the session is unknown
-    /// (never created, or already cleaned up).
-    pub(super) fn snapshot_pending(session: &str) -> Option<Vec<String>> {
+    /// Snapshot the session's current pending ids (if owned by `canonical_key`).
+    /// `None` if the session is unknown, already cleaned up, or belongs to another share.
+    pub(super) fn snapshot_pending(canonical_key: &str, session: &str) -> Option<Vec<String>> {
         map()
             .read()
             .get(session)
+            .filter(|s| s.canonical_key == canonical_key)
             .map(|s| s.pending.iter().cloned().collect())
     }
 
-    /// True once the client has signaled no more uploads are coming. Unknown sessions
-    /// report false (keep waiting until the stream's wall-clock guard fires).
-    pub(super) fn is_finished(session: &str) -> bool {
+    /// True once the client has signaled no more uploads are coming for this share's session.
+    /// Unknown or cross-share sessions report false (keep waiting until wall-clock guard fires).
+    pub(super) fn is_finished(canonical_key: &str, session: &str) -> bool {
         map()
             .read()
             .get(session)
+            .filter(|s| s.canonical_key == canonical_key)
             .map(|s| s.uploads_finished)
             .unwrap_or(false)
     }
 
     /// Drop an id from the session's pending set once the stream has resolved it.
-    pub(super) fn remove_pending(session: &str, asset_id: &str) {
+    pub(super) fn remove_pending(canonical_key: &str, session: &str, asset_id: &str) {
         if let Some(s) = map().write().get_mut(session) {
-            s.pending.remove(asset_id);
+            if s.canonical_key == canonical_key {
+                s.pending.remove(asset_id);
+            }
         }
     }
 
-    /// Remove the whole session (called when its stream terminates).
-    pub(super) fn remove_session(session: &str) {
-        map().write().remove(session);
+    /// Remove the whole session (called when its owning stream terminates).
+    pub(super) fn remove_session(canonical_key: &str, session: &str) {
+        let mut guard = map().write();
+        if guard
+            .get(session)
+            .is_some_and(|s| s.canonical_key == canonical_key)
+        {
+            guard.remove(session);
+        }
     }
 }
 
@@ -724,6 +967,10 @@ async fn get_or_create_tag(
     let locks = TAG_LOCKS.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
     let key_lock = {
         let mut guard = locks.lock();
+        if guard.len() >= MAX_TAG_CACHE_ENTRIES && !guard.contains_key(&cache_key) {
+            // Reclaim uncontended single-flight lock entries (strong_count == 1) to stay bounded.
+            guard.retain(|_, v| std::sync::Arc::strong_count(v) > 1);
+        }
         guard
             .entry(cache_key.clone())
             .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
@@ -759,6 +1006,7 @@ async fn get_or_create_tag(
     let create_res = client
         .http_client
         .post(&post_url)
+        .timeout(METADATA_TIMEOUT)
         .header("x-api-key", upload_key)
         .json(&create_body)
         .send()
@@ -768,11 +1016,18 @@ async fn get_or_create_tag(
         Ok(res) if res.status().is_success() || res.status() == StatusCode::CREATED => {
             if let Ok(created_tag) = res.json::<crate::immich_client::model::Tag>().await {
                 let mut write_guard = cache.write();
+                if write_guard.len() >= MAX_TAG_CACHE_ENTRIES
+                    && !write_guard.contains_key(&cache_key)
+                {
+                    if let Some(evict_key) = write_guard.keys().next().cloned() {
+                        write_guard.remove(&evict_key);
+                    }
+                }
                 write_guard.insert(cache_key.clone(), created_tag.id.clone());
                 return Some(created_tag.id);
             }
             eprintln!(
-                "upload: tag create for '{}' returned success but body failed to parse; re-reading /tags",
+                "upload: tag create for {:?} returned success but body failed to parse; re-reading /tags",
                 cache_key
             );
         }
@@ -783,7 +1038,7 @@ async fn get_or_create_tag(
             let status = res.status();
             let body = res.text().await.unwrap_or_default();
             eprintln!(
-                "upload: tag create for '{}' returned status {} (likely already exists) — recovering via /tags re-read; body: {}",
+                "upload: tag create for {:?} returned status {} (likely already exists) — recovering via /tags re-read; body: {}",
                 cache_key,
                 status,
                 body.chars().take(200).collect::<String>()
@@ -791,7 +1046,7 @@ async fn get_or_create_tag(
         }
         Err(e) => {
             eprintln!(
-                "upload: tag create request for '{}' failed at transport level: {} — recovering via /tags re-read",
+                "upload: tag create request for {:?} failed at transport level: {} — recovering via /tags re-read",
                 cache_key, e
             );
         }
@@ -809,14 +1064,15 @@ async fn get_or_create_tag(
     }
 
     eprintln!(
-        "upload: FAILED to get-or-create tag '{}' after create + 3 recovery reads",
+        "upload: FAILED to get-or-create tag {:?} after create + 3 recovery reads",
         cache_key
     );
     None
 }
 
-/// GET /tags, bulk-cache every tag by (parent,name) key, and return the id for
-/// `cache_key` if present. Returns None on transport/parse failure or cache miss.
+/// GET /tags, bulk-cache every tag by (parent,name) key (bounded to
+/// `MAX_TAG_CACHE_ENTRIES`), and return the id for `cache_key` if present.
+/// Returns None on transport/parse failure or cache miss.
 async fn list_and_cache_tags(
     client: &ImmichClient,
     upload_key: &str,
@@ -827,6 +1083,7 @@ async fn list_and_cache_tags(
     let res = client
         .http_client
         .get(&get_url)
+        .timeout(METADATA_TIMEOUT)
         .header("x-api-key", upload_key)
         .send()
         .await
@@ -842,19 +1099,32 @@ async fn list_and_cache_tags(
         .ok()?;
 
     let mut write_guard = cache.write();
+    if tags.len() >= MAX_TAG_CACHE_ENTRIES || write_guard.len() + tags.len() > MAX_TAG_CACHE_ENTRIES
+    {
+        write_guard.clear();
+    }
+    let mut found = None;
     for tag in &tags {
         let key = match &tag.parent_id {
             Some(p_id) => format!("{}:{}", p_id, tag.name),
             None => format!("root:{}", tag.name),
         };
-        // Overwrite: /tags is authoritative, so a fresh listing should win over any
-        // stale cache entry.
-        write_guard.insert(key, tag.id.clone());
+        if key == cache_key {
+            found = Some(tag.id.clone());
+        }
+        // Overwrite: /tags is authoritative, so a fresh listing wins over stale entries.
+        if write_guard.len() < MAX_TAG_CACHE_ENTRIES {
+            write_guard.insert(key, tag.id.clone());
+        }
     }
-    write_guard.get(cache_key).cloned()
+    found.or_else(|| write_guard.get(cache_key).cloned())
 }
 
 static IMMICH_API_SEMAPHORE: std::sync::OnceLock<tokio::sync::Semaphore> =
+    std::sync::OnceLock::new();
+static TAG_GUARD_SEMAPHORE: std::sync::OnceLock<tokio::sync::Semaphore> =
+    std::sync::OnceLock::new();
+static SSE_SEMAPHORE: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
     std::sync::OnceLock::new();
 
 /// Tri-state result of reading an asset's tag list back from Immich.
@@ -879,6 +1149,7 @@ async fn asset_tag_state(client: &ImmichClient, asset_id: &str, tag_id: &str) ->
     let res = client
         .http_client
         .get(&url)
+        .timeout(METADATA_TIMEOUT)
         .header("x-api-key", client.upload_api_key.as_ref().unwrap())
         .send()
         .await;
@@ -938,6 +1209,7 @@ async fn relink_tag(client: &ImmichClient, asset_id: &str, tag_id: &str) -> Reli
     let res = client
         .http_client
         .put(&tag_url)
+        .timeout(METADATA_TIMEOUT)
         .header("x-api-key", client.upload_api_key.as_ref().unwrap())
         .json(&serde_json::json!({ "ids": [asset_id] }))
         .send()
@@ -1004,7 +1276,7 @@ async fn tag_and_associate_asset(
     // Concurrency for the tag/associate background work. Defaults to 4 so multiple
     // simultaneous uploads can be processed in parallel; the only shared mutable
     // state (TAG_CACHE / ADDED_ALBUMS) is independently locked, and the tag-create
-    // path already handles concurrent creation via a POST-conflict re-query.
+    // path already handles concurrent creation via single-flight + POST-conflict re-query.
     let sem = IMMICH_API_SEMAPHORE.get_or_init(|| {
         let permits = std::env::var("IPP_UPLOAD_CONCURRENCY")
             .ok()
@@ -1028,6 +1300,7 @@ async fn tag_and_associate_asset(
             let asset_res = client
                 .http_client
                 .get(&get_asset_url)
+                .timeout(METADATA_TIMEOUT)
                 .header("x-api-key", client.upload_api_key.as_ref().unwrap())
                 .send()
                 .await;
@@ -1045,6 +1318,7 @@ async fn tag_and_associate_asset(
                             let restore_res = client
                                 .http_client
                                 .post(&restore_url)
+                                .timeout(METADATA_TIMEOUT)
                                 .header("x-api-key", client.upload_api_key.as_ref().unwrap())
                                 .json(&restore_body)
                                 .send()
@@ -1130,6 +1404,7 @@ async fn tag_and_associate_asset(
                         let tag_res = client
                             .http_client
                             .put(&tag_url)
+                            .timeout(METADATA_TIMEOUT)
                             .header("x-api-key", client.upload_api_key.as_ref().unwrap())
                             .json(&serde_json::json!({ "ids": [asset_id] }))
                             .send()
@@ -1178,7 +1453,7 @@ async fn tag_and_associate_asset(
                 }
                 (Some(_), None) => {
                     eprintln!(
-                        "upload: could not resolve child tag '{}' for asset {} (outer attempt {})",
+                        "upload: could not resolve child tag {:?} for asset {} (outer attempt {})",
                         uploader_name, asset_id, attempt
                     );
                 }
@@ -1197,6 +1472,7 @@ async fn tag_and_associate_asset(
             let album_res = client
                 .http_client
                 .put(&album_url)
+                .timeout(METADATA_TIMEOUT)
                 .header("x-api-key", client.upload_api_key.as_ref().unwrap())
                 .json(&serde_json::json!({ "ids": [asset_id] }))
                 .send()
@@ -1266,7 +1542,15 @@ async fn tag_and_associate_asset(
 /// checks — i.e. the metadata job has already run and there is no pending wipe — so
 /// it is robust even when extraction is delayed under load. It re-resolves the child
 /// tag id itself (TAG_CACHE fast-path) to stay decoupled from the tagging path.
-async fn deferred_tag_guard(client: &ImmichClient, asset_id: &str, uploader_name: &str, key: &str) {
+/// Upstream HTTP calls inside each tick are bounded by `TAG_GUARD_SEMAPHORE` (not held
+/// across sleeps) so a large upload burst cannot storm Immich concurrently.
+async fn deferred_tag_guard(
+    client: &ImmichClient,
+    asset_id: &str,
+    uploader_name: &str,
+    request_key: &str,
+    canonical_key: &str,
+) {
     // Guard is on by default; set IPP_TAG_GUARD=0 to disable.
     let enabled = std::env::var("IPP_TAG_GUARD")
         .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
@@ -1289,11 +1573,16 @@ async fn deferred_tag_guard(client: &ImmichClient, asset_id: &str, uploader_name
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| vec![2, 4, 8, 16, 30]);
 
+    let guard_sem = TAG_GUARD_SEMAPHORE.get_or_init(|| tokio::sync::Semaphore::new(8));
+
     // Re-resolve the child tag id (cached after the synchronous tagging path ran).
-    let parent_tag_id = get_or_create_tag(client, "SharedBy", None).await;
-    let child_tag_id = match &parent_tag_id {
-        Some(p) => get_or_create_tag(client, uploader_name, Some(p)).await,
-        None => None,
+    let child_tag_id = {
+        let _permit = guard_sem.acquire().await.ok();
+        let parent_tag_id = get_or_create_tag(client, "SharedBy", None).await;
+        match &parent_tag_id {
+            Some(p) => get_or_create_tag(client, uploader_name, Some(p)).await,
+            None => None,
+        }
     };
     let child_tag_id = match child_tag_id {
         Some(id) => id,
@@ -1315,6 +1604,7 @@ async fn deferred_tag_guard(client: &ImmichClient, asset_id: &str, uploader_name
     for delay in &schedule {
         tokio::time::sleep(std::time::Duration::from_secs(*delay)).await;
 
+        let _permit = guard_sem.acquire().await.ok();
         match asset_tag_state(client, asset_id, &child_tag_id).await {
             TagState::Present => {
                 consecutive_present += 1;
@@ -1322,8 +1612,9 @@ async fn deferred_tag_guard(client: &ImmichClient, asset_id: &str, uploader_name
                 if consecutive_present >= 2 {
                     if restored {
                         // Attribution was genuinely restored after a wipe; refresh
-                        // the share cache so viewers see the corrected uploader.
-                        crate::api::get_share_details::share_cache::invalidate(key);
+                        // the share cache (both request slug and canonical key) so
+                        // viewers see the corrected uploader.
+                        invalidate_share_keys(request_key, canonical_key);
                         println!(
                             "guard: asset {} tag {} restored and now stable",
                             asset_id, child_tag_id
@@ -1346,7 +1637,8 @@ async fn deferred_tag_guard(client: &ImmichClient, asset_id: &str, uploader_name
                 continue;
             }
             TagState::Absent => {
-                // Confirmed absent — Immich wiped it (or it never settled). Re-apply.
+                // Confirmed absent — Immich wiped it (or it never settled). Re-apply
+                // under the same tick permit.
                 consecutive_present = 0;
                 match relink_tag(client, asset_id, &child_tag_id).await {
                     RelinkOutcome::Applied => {
@@ -1378,10 +1670,14 @@ async fn deferred_tag_guard(client: &ImmichClient, asset_id: &str, uploader_name
     }
 
     // Schedule exhausted — report final state so a stubborn miss is never silent.
-    match asset_tag_state(client, asset_id, &child_tag_id).await {
+    let final_state = {
+        let _permit = guard_sem.acquire().await.ok();
+        asset_tag_state(client, asset_id, &child_tag_id).await
+    };
+    match final_state {
         TagState::Present => {
             if restored {
-                crate::api::get_share_details::share_cache::invalidate(key);
+                invalidate_share_keys(request_key, canonical_key);
             }
             println!(
                 "guard: asset {} tag {} present at end of guard schedule",
@@ -1403,14 +1699,238 @@ async fn deferred_tag_guard(client: &ImmichClient, asset_id: &str, uploader_name
     }
 }
 
+const ALLOWED_UPLOAD_FIELDS: &[&str] = &[
+    "assetData",
+    "deviceAssetId",
+    "deviceId",
+    "fileCreatedAt",
+    "fileModifiedAt",
+    "filename",
+    "duration",
+];
+const MAX_UPLOAD_FIELDS: usize = 16;
+const MAX_METADATA_FIELD_BYTES: usize = 4096;
+/// Pre-buffer up to 64 KiB of validated multipart output before opening the upstream
+/// HTTP POST to Immich. Because the frontend appends all small metadata fields
+/// (`deviceAssetId`, `deviceId`, `fileCreatedAt`, `fileModifiedAt`) *before*
+/// `assetData`, this guarantees that 100% of metadata fields and the opening
+/// `assetData` header/chunk are validated before a single packet is sent to Immich.
+/// Once `PREBUFFER_BYTES` is reached (for large photos/videos), we fire `ready_tx`
+/// with the `mpsc::Receiver` and flush the remaining payload in O(1) RAM.
+const PREBUFFER_BYTES: usize = 64 * 1024;
+
+type MultipartStreamRx = tokio::sync::mpsc::Receiver<Result<Bytes, std::io::Error>>;
+type MultipartReadyTx = tokio::sync::oneshot::Sender<Result<MultipartStreamRx, StatusCode>>;
+
+struct MultipartSink {
+    ready_tx: Option<MultipartReadyTx>,
+    pre_buf: Vec<Bytes>,
+    pre_bytes: usize,
+    stream_tx: Option<tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>>,
+}
+
+impl MultipartSink {
+    fn new(ready_tx: MultipartReadyTx) -> Self {
+        Self {
+            ready_tx: Some(ready_tx),
+            pre_buf: Vec::new(),
+            pre_bytes: 0,
+            stream_tx: None,
+        }
+    }
+
+    async fn promote_to_stream(&mut self) -> bool {
+        if self.stream_tx.is_some() {
+            return true;
+        }
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        if let Some(ready) = self.ready_tx.take() {
+            if ready.send(Ok(rx)).is_err() {
+                return false;
+            }
+        }
+        for item in self.pre_buf.drain(..) {
+            if tx.send(Ok(item)).await.is_err() {
+                return false;
+            }
+        }
+        self.stream_tx = Some(tx);
+        true
+    }
+
+    async fn emit(&mut self, chunk: Bytes) -> bool {
+        if let Some(ref tx) = self.stream_tx {
+            return tx.send(Ok(chunk)).await.is_ok();
+        }
+        self.pre_bytes = self.pre_bytes.saturating_add(chunk.len());
+        self.pre_buf.push(chunk);
+        if self.pre_bytes >= PREBUFFER_BYTES {
+            return self.promote_to_stream().await;
+        }
+        true
+    }
+
+    async fn fail(mut self, status: StatusCode, msg: &'static str) -> Result<(), StatusCode> {
+        if let Some(ready) = self.ready_tx.take() {
+            let _ = ready.send(Err(status));
+        } else if let Some(tx) = self.stream_tx.take() {
+            let _ = tx.send(Err(std::io::Error::other(msg))).await;
+        }
+        Err(status)
+    }
+
+    async fn finish(mut self) -> Result<(), StatusCode> {
+        let _ = self.promote_to_stream().await;
+        Ok(())
+    }
+}
+
+fn sanitize_multipart_header_value(raw: &str) -> String {
+    raw.chars()
+        .filter(|&c| !c.is_control() && c != '"' && c != '\\')
+        .take(255)
+        .collect()
+}
+
+/// Streams an incoming `axum::extract::Multipart` into a bounded `mpsc` channel
+/// re-encoded with `boundary`, enforcing a strict field-name allowlist, per-field
+/// metadata size caps, and an overall `max_bytes` payload cap in O(1) memory.
+///
+/// Pre-buffers up to `PREBUFFER_BYTES` (64 KiB) before signaling `ready_tx` so
+/// malformed requests or disallowed fields are rejected before opening an upstream
+/// connection to Immich.
+async fn pump_filtered_multipart(
+    mut multipart: Multipart,
+    boundary: &str,
+    max_bytes: usize,
+    ready_tx: MultipartReadyTx,
+) -> Result<(), StatusCode> {
+    let mut sink = MultipartSink::new(ready_tx);
+    let mut field_count: usize = 0;
+    let mut asset_data_count: usize = 0;
+    let mut total_bytes: usize = 0;
+
+    loop {
+        let next = match multipart.next_field().await {
+            Ok(Some(field)) => field,
+            Ok(None) => break,
+            Err(e) => {
+                return sink.fail(e.status(), "malformed multipart body").await;
+            }
+        };
+
+        field_count += 1;
+        if field_count > MAX_UPLOAD_FIELDS {
+            return sink
+                .fail(StatusCode::BAD_REQUEST, "too many multipart fields")
+                .await;
+        }
+
+        let Some(field_name) = next.name().map(str::to_string) else {
+            return sink
+                .fail(StatusCode::BAD_REQUEST, "missing multipart field name")
+                .await;
+        };
+
+        if !ALLOWED_UPLOAD_FIELDS.contains(&field_name.as_str()) {
+            eprintln!("upload: rejected disallowed multipart field {:?}", field_name);
+            return sink
+                .fail(StatusCode::BAD_REQUEST, "disallowed multipart field")
+                .await;
+        }
+
+        let is_asset_data = field_name == "assetData";
+        if is_asset_data {
+            asset_data_count += 1;
+            if asset_data_count > 1 {
+                return sink
+                    .fail(StatusCode::BAD_REQUEST, "duplicate assetData field")
+                    .await;
+            }
+        }
+
+        let mut header_buf = String::with_capacity(192);
+        header_buf.push_str("--");
+        header_buf.push_str(boundary);
+        header_buf.push_str("\r\nContent-Disposition: form-data; name=\"");
+        header_buf.push_str(&field_name);
+        header_buf.push('"');
+        if let Some(fname) = next.file_name() {
+            let safe_fname = sanitize_multipart_header_value(fname);
+            header_buf.push_str("; filename=\"");
+            header_buf.push_str(&safe_fname);
+            header_buf.push('"');
+        }
+        header_buf.push_str("\r\n");
+        if let Some(ct) = next.content_type() {
+            let safe_ct = sanitize_multipart_header_value(ct);
+            if !safe_ct.is_empty() {
+                header_buf.push_str("Content-Type: ");
+                header_buf.push_str(&safe_ct);
+                header_buf.push_str("\r\n");
+            }
+        }
+        header_buf.push_str("\r\n");
+
+        if !sink.emit(Bytes::from(header_buf)).await {
+            // Upstream receiver dropped early; let caller inspect upstream response.
+            return Ok(());
+        }
+
+        let mut field = next;
+        let mut field_bytes: usize = 0;
+        loop {
+            match field.chunk().await {
+                Ok(Some(chunk)) => {
+                    field_bytes = field_bytes.saturating_add(chunk.len());
+                    total_bytes = total_bytes.saturating_add(chunk.len());
+
+                    if !is_asset_data && field_bytes > MAX_METADATA_FIELD_BYTES {
+                        return sink
+                            .fail(StatusCode::BAD_REQUEST, "metadata field too large")
+                            .await;
+                    }
+                    if total_bytes > max_bytes {
+                        return sink
+                            .fail(StatusCode::PAYLOAD_TOO_LARGE, "upload exceeds max size")
+                            .await;
+                    }
+
+                    if !sink.emit(chunk).await {
+                        return Ok(());
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    return sink.fail(e.status(), "multipart chunk read error").await;
+                }
+            }
+        }
+
+        if !sink.emit(Bytes::from_static(b"\r\n")).await {
+            return Ok(());
+        }
+    }
+
+    if asset_data_count == 0 {
+        return sink
+            .fail(StatusCode::BAD_REQUEST, "missing assetData field")
+            .await;
+    }
+
+    let closing = format!("--{}--\r\n", boundary);
+    let _ = sink.emit(Bytes::from(closing)).await;
+    sink.finish().await
+}
+
 pub async fn upload_asset_handler(
     headers: HeaderMap,
     Path(key): Path<String>,
     // Optional `?session=TOKEN` ties this upload to a session-scoped SSE stream (see
     // `mod upload_sessions`). `Query` reads only the URI, so it's safe to extract
-    // before the body-consuming `Request`.
+    // before the body-consuming `Multipart`.
     Query(params): Query<std::collections::HashMap<String, String>>,
-    req: Request,
+    multipart: Multipart,
 ) -> impl IntoResponse {
     if !is_safe_param(&key) {
         return StatusCode::BAD_REQUEST.into_response();
@@ -1427,10 +1947,13 @@ pub async fn upload_asset_handler(
         return StatusCode::FORBIDDEN.into_response();
     }
 
-    // Parse uploader name header
+    // Parse and strictly validate uploader name header
     let uploader_name = match headers.get("x-uploader-name").and_then(|h| h.to_str().ok()) {
         Some(val) if !val.is_empty() => match urlencoding::decode(val) {
-            Ok(decoded) => decoded.into_owned(),
+            Ok(decoded) => match validate_uploader_name(&decoded) {
+                Some(valid) => valid,
+                None => return StatusCode::BAD_REQUEST.into_response(),
+            },
             Err(_) => return StatusCode::BAD_REQUEST.into_response(),
         },
         _ => return StatusCode::BAD_REQUEST.into_response(),
@@ -1528,42 +2051,59 @@ pub async fn upload_asset_handler(
         write_guard.insert(album_id.clone());
     }
 
-    // Extract crucial headers from the incoming request.
-    let content_type = headers.get(axum::http::header::CONTENT_TYPE).cloned();
-    let content_length = headers.get(axum::http::header::CONTENT_LENGTH).cloned();
+    // Stream-filter the multipart body with O(1) RAM overhead into Immich POST /assets.
+    // Pre-validates leading metadata fields + first 64 KiB before opening the upstream
+    // connection so invalid requests never touch Immich.
+    let boundary = format!("ipp-boundary-{}", random_hex_128());
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let boundary_for_pump = boundary.clone();
+    let max_bytes = max_upload_bytes();
+    let pump_task = tokio::spawn(async move {
+        pump_filtered_multipart(multipart, &boundary_for_pump, max_bytes, ready_tx).await
+    });
 
-    // Stream the raw axum body directly into the reqwest body.
-    let stream = req.into_body().into_data_stream();
-    let reqwest_body = reqwest::Body::wrap_stream(stream);
+    let rx = match ready_rx.await {
+        Ok(Ok(rx)) => rx,
+        Ok(Err(status)) => return status.into_response(),
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
 
-    // Forward the streamed request to Immich using the service account API key
+    let rx_stream = futures_util::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    });
+    let reqwest_body = reqwest::Body::wrap_stream(rx_stream);
+
+    // Forward the validated streamed request to Immich using the service account API key
     let url = client.build_url("/assets", &[]);
-    let mut out_req = client
+    let out_req = client
         .http_client
         .post(&url)
         .header("x-api-key", client.upload_api_key.as_ref().unwrap())
+        .header(
+            header::CONTENT_TYPE,
+            format!("multipart/form-data; boundary={}", boundary),
+        )
         .body(reqwest_body);
 
-    if let Some(ct) = content_type {
-        out_req = out_req.header(reqwest::header::CONTENT_TYPE, ct);
-    }
-    if let Some(cl) = content_length {
-        out_req = out_req.header(reqwest::header::CONTENT_LENGTH, cl);
+    let (pump_join, send_res) = tokio::join!(pump_task, out_req.send());
+
+    if let Ok(Err(status)) = pump_join {
+        return status.into_response();
     }
 
-    let res = match out_req.send().await {
+    let res = match send_res {
         Ok(r) if r.status().is_success() => r,
         Ok(r) => {
             let status = r.status();
             let body = r.text().await.unwrap_or_default();
             eprintln!(
-                "upload: upstream rejected asset for key '{}': {} — {}",
+                "upload: upstream rejected asset for key {:?}: {} — {}",
                 key, status, body
             );
             return status.into_response();
         }
         Err(e) => {
-            eprintln!("upload: upstream request failed for key '{}': {}", key, e);
+            eprintln!("upload: upstream request failed for key {:?}: {}", key, e);
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
@@ -1583,7 +2123,7 @@ pub async fn upload_asset_handler(
         Ok(v) => v,
         Err(e) => {
             eprintln!(
-                "upload: failed to parse upload response for key '{}': {}",
+                "upload: failed to parse upload response for key {:?}: {}",
                 key, e
             );
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
@@ -1595,36 +2135,36 @@ pub async fn upload_asset_handler(
     // existing asset id; if that asset is concurrently processed under another uploader
     // name this is where divergence starts.
     println!(
-        "upload: asset {} accepted (status={:?}, uploader={:?}, key={})",
+        "upload: asset {} accepted (status={:?}, uploader={:?}, key={:?})",
         asset_id, upload_resp.status, uploader_name, key
     );
 
     // Session-scoped SSE support: if the client supplied an upload session token,
-    // register this asset id under it so an already-open status stream picks it up on
-    // its next tick (see `mod upload_sessions`). This is what lets photos stream back
-    // while later files in the same drop are still uploading. The token is validated
-    // with the same is_safe_param rule as every path segment; an absent/invalid token
-    // is a no-op, so the poll path and the legacy ids= stream are unaffected.
+    // register this asset id under it (scoped to `canonical_key`) so an already-open
+    // status stream picks it up on its next tick (see `mod upload_sessions`). This is
+    // what lets photos stream back while later files in the same drop are still
+    // uploading. The token is validated with the same is_safe_param rule as every path
+    // segment; an absent/invalid token is a no-op, so the poll path and the legacy
+    // ids= stream are unaffected.
     if let Some(session) = params.get("session") {
-        if !session.is_empty() && is_safe_param(session) {
-            upload_sessions::add_pending(session, &asset_id);
+        if is_safe_param(session) {
+            upload_sessions::add_pending(&canonical_key, session, &asset_id);
         }
     }
 
-    // Album contents just changed; drop any cached share response so the next load
-    // rebuilds (IDEAS #6 invalidation). Re-invalidated below once tagging/association
-    // completes, since that mutates the asset's attribution too.
-    crate::api::get_share_details::share_cache::invalidate(&key);
-    if canonical_key != key {
-        crate::api::get_share_details::share_cache::invalidate(&canonical_key);
-    }
+    // Album contents just changed; drop any cached share response (both request slug
+    // and canonical key) so the next load rebuilds (IDEAS #6 invalidation).
+    // Re-invalidated below once tagging/association completes, since that mutates the
+    // asset's attribution too.
+    invalidate_share_keys(&key, &canonical_key);
 
     // Spawn background task to tag and associate the asset, saving it to PROCESSED_ASSETS when done.
     let client_clone = client.clone();
     let asset_id_clone = asset_id.clone();
     let album_id_clone = album_id.clone();
     let uploader_name_clone = uploader_name.clone();
-    let key_clone = canonical_key.clone();
+    let request_key_clone = key.clone();
+    let canonical_key_clone = canonical_key.clone();
 
     tokio::spawn(async move {
         let success = tag_and_associate_asset(
@@ -1635,36 +2175,38 @@ pub async fn upload_asset_handler(
         )
         .await;
 
-        // Attribution/album membership settled — invalidate again so the resolved
-        // uploader name is reflected on the next share load.
-        crate::api::get_share_details::share_cache::invalidate(&key_clone);
+        // Attribution/album membership settled — invalidate both request key (slug) and
+        // canonical key so any in-flight rebuild under either identifier is rejected and
+        // the resolved uploader name is reflected on the next share load.
+        invalidate_share_keys(&request_key_clone, &canonical_key_clone);
 
         if success {
-            let cache = PROCESSED_ASSETS
-                .get_or_init(|| parking_lot::RwLock::new(std::collections::HashMap::new()));
-            let mut write_guard = cache.write();
+            record_processed_asset(
+                asset_id_clone.clone(),
+                uploader_name_clone.clone(),
+                canonical_key_clone.clone(),
+            );
 
-            // Clean up stale entries to prevent memory leaks from abandoned status polls
-            let now = std::time::Instant::now();
-            let expiry = std::time::Duration::from_secs(600); // 10 minutes
-            write_guard.retain(|_, (_, timestamp)| now.duration_since(*timestamp) < expiry);
-
-            write_guard.insert(asset_id_clone.clone(), (uploader_name_clone.clone(), now));
-        }
-
-        // Deferred guard: Immich's async metadata-extraction job can REPLACE this
-        // asset's tag set (with the empty set parsed from a keyword-less file) AFTER
-        // the synchronous PUT+verify above already confirmed the tag, silently
-        // orphaning it. Run a detached guard that re-checks across the extraction
-        // window and re-applies the tag if it vanishes. Only runs once the initial
-        // tag/associate succeeded, so it defends a known-good attribution.
-        if success {
+            // Deferred guard: Immich's async metadata-extraction job can REPLACE this
+            // asset's tag set (with the empty set parsed from a keyword-less file) AFTER
+            // the synchronous PUT+verify above already confirmed the tag, silently
+            // orphaning it. Run a detached guard that re-checks across the extraction
+            // window and re-applies the tag if it vanishes. Only runs once the initial
+            // tag/associate succeeded, so it defends a known-good attribution.
             let guard_client = client_clone.clone();
             let guard_asset = asset_id_clone.clone();
             let guard_uploader = uploader_name_clone.clone();
-            let guard_key = key_clone.clone();
+            let guard_req_key = request_key_clone.clone();
+            let guard_can_key = canonical_key_clone.clone();
             tokio::spawn(async move {
-                deferred_tag_guard(&guard_client, &guard_asset, &guard_uploader, &guard_key).await;
+                deferred_tag_guard(
+                    &guard_client,
+                    &guard_asset,
+                    &guard_uploader,
+                    &guard_req_key,
+                    &guard_can_key,
+                )
+                .await;
             });
         }
     });
@@ -1682,39 +2224,48 @@ pub async fn upload_asset_handler(
 }
 
 // ---------------------------------------------------------------------------
-// Upload-status validation + resolution helpers (shared by the single-asset and
-// batched status endpoints). See IDEAS.local.md "avoid slamming the status
-// endpoint": a big album drop used to spawn one 500ms poll loop *per asset*, and
-// every poll re-validated the share key via `fetch_share_me` (an upstream hit) on
-// top of the thumbnail/asset reads. That amplified N uploads into ~3N upstream
-// calls/sec. These helpers let the batched endpoint validate once per request and
-// reuse a short-TTL permission cache across polls, collapsing the storm.
+// Upload-status validation + resolution helpers (shared by the single-asset,
+// batched, and SSE status endpoints). See IDEAS.local.md "avoid slamming the
+// status endpoint": a big album drop used to spawn one 500ms poll loop *per
+// asset*, and every poll re-validated the share key via `fetch_share_me` (an
+// upstream hit) on top of the thumbnail/asset reads. That amplified N uploads
+// into ~3N upstream calls/sec. These helpers let the status endpoints validate
+// once per request/stream and reuse a short-TTL permission cache across polls,
+// collapsing the storm.
 // ---------------------------------------------------------------------------
 
-/// Immutable permission facts about a share link, as far as the upload-status
-/// path cares. All `Copy`, so the cache hands back values without cloning.
-#[derive(Clone, Copy)]
+/// Permission and identity facts about a share link for the upload-status path,
+/// including `canonical_key` for cross-share isolation.
+#[derive(Clone)]
 struct UploadLinkMeta {
+    canonical_key: String,
     is_album: bool,
     allow_upload: bool,
     allow_download: bool,
 }
 
-/// Short-TTL cache of share-link *permission* metadata, keyed by (key, share_token).
+/// Bounded short-TTL cache of share-link *permission* metadata, keyed by
+/// `(share_key, Option<keyed_sha256(share_token)>)` for collision resistance.
 ///
 /// Deliberately separate from `share_cache`: that one caches album *contents* and
 /// is invalidated on every upload, so it would miss constantly during an active
 /// drop. A link's *permissions* (type / allow_upload / allow_download) don't change
 /// when its album contents do, so a stale-but-valid read within the TTL is safe and
 /// lets a burst of status polls skip re-hitting Immich's `/shared-links/me`.
+/// Only caches valid upload-enabled album links so probing random cookies on
+/// read-only shares cannot bloat memory.
 mod status_link_cache {
     use super::UploadLinkMeta;
+    use crate::security::hash_token_keyed;
     use std::collections::HashMap;
-    use std::hash::{Hash, Hasher};
     use std::time::{Duration, Instant};
 
+    const MAX_ENTRIES: usize = 512;
+
+    type CacheKey = (String, Option<[u8; 32]>);
+
     static CACHE: std::sync::OnceLock<
-        parking_lot::RwLock<HashMap<u64, (UploadLinkMeta, Instant)>>,
+        parking_lot::RwLock<HashMap<CacheKey, (UploadLinkMeta, Instant)>>,
     > = std::sync::OnceLock::new();
 
     fn ttl() -> Duration {
@@ -1728,17 +2279,8 @@ mod status_link_cache {
         })
     }
 
-    fn entry_hash(key: &str, share_token: Option<&str>) -> u64 {
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        key.hash(&mut h);
-        match share_token {
-            Some(t) => {
-                1u8.hash(&mut h);
-                t.hash(&mut h);
-            }
-            None => 0u8.hash(&mut h),
-        }
-        h.finish()
+    fn cache_key(key: &str, share_token: Option<&str>) -> CacheKey {
+        (key.to_string(), share_token.map(hash_token_keyed))
     }
 
     pub(super) fn get(key: &str, share_token: Option<&str>) -> Option<UploadLinkMeta> {
@@ -1748,8 +2290,20 @@ mod status_link_cache {
         }
         let cache = CACHE.get()?;
         let guard = cache.read();
-        let (meta, ts) = guard.get(&entry_hash(key, share_token))?;
-        if ts.elapsed() < t { Some(*meta) } else { None }
+        // Check public (token-less) entry first, then token-scoped entry
+        if let Some((meta, ts)) = guard.get(&(key.to_string(), None)) {
+            if ts.elapsed() < t {
+                return Some(meta.clone());
+            }
+        }
+        if share_token.is_some() {
+            if let Some((meta, ts)) = guard.get(&cache_key(key, share_token)) {
+                if ts.elapsed() < t {
+                    return Some(meta.clone());
+                }
+            }
+        }
+        None
     }
 
     pub(super) fn put(key: &str, share_token: Option<&str>, meta: UploadLinkMeta) {
@@ -1758,15 +2312,30 @@ mod status_link_cache {
             return;
         }
         let cache = CACHE.get_or_init(|| parking_lot::RwLock::new(HashMap::new()));
+        let k = cache_key(key, share_token);
         let mut guard = cache.write();
         guard.retain(|_, (_, ts)| ts.elapsed() < t);
-        guard.insert(entry_hash(key, share_token), (meta, Instant::now()));
+        if !guard.contains_key(&k) {
+            while guard.len() >= MAX_ENTRIES {
+                if let Some(oldest_k) = guard
+                    .iter()
+                    .min_by_key(|(_, (_, ts))| *ts)
+                    .map(|(k, _)| k.clone())
+                {
+                    guard.remove(&oldest_k);
+                } else {
+                    break;
+                }
+            }
+        }
+        guard.insert(k, (meta, Instant::now()));
     }
 }
 
 /// Validate that `key` is an upload-enabled album share, reusing a short-TTL
 /// permission cache so repeated status polls don't each hit Immich. On a cache
-/// miss this calls `fetch_share_me` once and memoizes the result.
+/// miss this calls `fetch_share_me` once and memoizes the result (when it is a
+/// valid upload-enabled album link).
 ///
 /// `Ok(meta)` means the key resolved; the caller still checks `is_album` /
 /// `allow_upload`. `Err(status)` is an upstream/parse failure to surface verbatim.
@@ -1780,13 +2349,24 @@ async fn validate_upload_link(
     }
 
     let share_link = fetch_shared_link_for_proxy(client, key, share_token, "status").await?;
+    let is_password_protected = share_link.password.is_some();
 
     let meta = UploadLinkMeta {
+        canonical_key: share_link.key,
         is_album: share_link.r#type.as_deref() == Some("ALBUM"),
         allow_upload: share_link.allow_upload.unwrap_or(false),
         allow_download: share_link.allow_download.unwrap_or(false),
     };
-    status_link_cache::put(key, share_token, meta);
+
+    // Only cache valid upload-enabled album shares; collapse public links under None token.
+    if meta.is_album && meta.allow_upload {
+        let cache_token = if is_password_protected {
+            share_token
+        } else {
+            None
+        };
+        status_link_cache::put(key, cache_token, meta.clone());
+    }
     Ok(meta)
 }
 
@@ -1800,25 +2380,42 @@ enum UploadedAssetStatus {
     Error,
 }
 
-/// Resolve one asset by id: pending until it's in `PROCESSED_ASSETS` *and* Immich
-/// has generated its thumbnail, then fetch the full asset and build a `SafeAsset`.
-/// On `Ready` the asset is removed from `PROCESSED_ASSETS`. No upstream calls are
-/// made for a still-pending asset (the in-memory map check short-circuits first),
-/// so polling a not-yet-ready batch costs nothing upstream.
+/// Checks if `asset_id` is in `PROCESSED_ASSETS` and belongs to `canonical_key`.
+fn lookup_processed_uploader(asset_id: &str, canonical_key: &str) -> Option<String> {
+    let cache = PROCESSED_ASSETS.get()?;
+    let read_guard = cache.read();
+    read_guard
+        .get(asset_id)
+        .filter(|entry| entry.canonical_key == canonical_key)
+        .map(|entry| entry.uploader_name.clone())
+}
+
+fn remove_processed_asset(asset_id: &str, canonical_key: &str) {
+    if let Some(cache) = PROCESSED_ASSETS.get() {
+        let mut guard = cache.write();
+        if guard
+            .get(asset_id)
+            .is_some_and(|e| e.canonical_key == canonical_key)
+        {
+            guard.remove(asset_id);
+        }
+    }
+}
+
+/// Resolve one asset by id: pending until it's in `PROCESSED_ASSETS` (under
+/// `canonical_key`) *and* Immich has generated its thumbnail, then fetch the full
+/// asset and build a `SafeAsset`. On `Ready` the asset is removed from
+/// `PROCESSED_ASSETS`. No upstream calls are made for a still-pending or cross-share
+/// asset (the in-memory map check short-circuits first), so polling a not-yet-ready
+/// batch costs nothing upstream and cannot leak cross-share metadata.
 async fn resolve_uploaded_asset(
     client: &ImmichClient,
-    key: &str,
+    canonical_key: &str,
     asset_id: &str,
     allow_download: bool,
 ) -> UploadedAssetStatus {
-    let uploader_name = {
-        let cache = PROCESSED_ASSETS
-            .get_or_init(|| parking_lot::RwLock::new(std::collections::HashMap::new()));
-        let read_guard = cache.read();
-        match read_guard.get(asset_id) {
-            Some((name, _)) => name.clone(),
-            None => return UploadedAssetStatus::Pending,
-        }
+    let Some(uploader_name) = lookup_processed_uploader(asset_id, canonical_key) else {
+        return UploadedAssetStatus::Pending;
     };
 
     // Thumbnail generated yet?
@@ -1829,6 +2426,7 @@ async fn resolve_uploaded_asset(
     let thumb_res = client
         .http_client
         .head(&get_thumb_url)
+        .timeout(METADATA_TIMEOUT)
         .header("x-api-key", client.upload_api_key.as_ref().unwrap())
         .send()
         .await;
@@ -1842,6 +2440,7 @@ async fn resolve_uploaded_asset(
     let asset_res = client
         .http_client
         .get(&get_asset_url)
+        .timeout(METADATA_TIMEOUT)
         .header("x-api-key", client.upload_api_key.as_ref().unwrap())
         .send()
         .await;
@@ -1869,16 +2468,14 @@ async fn resolve_uploaded_asset(
     safe_asset.uploader_name = Some(uploader_name);
     safe_asset.uploader_is_fallback = false;
     if allow_download {
-        safe_asset.download_url = Some(format!("/share/photo/{}/{}/original", key, safe_asset.id));
+        safe_asset.download_url = Some(format!(
+            "/share/photo/{}/{}/original",
+            canonical_key, safe_asset.id
+        ));
     }
 
     // Resolved — drop it from the pending map.
-    {
-        let cache = PROCESSED_ASSETS
-            .get_or_init(|| parking_lot::RwLock::new(std::collections::HashMap::new()));
-        cache.write().remove(asset_id);
-    }
-
+    remove_processed_asset(asset_id, canonical_key);
     UploadedAssetStatus::Ready(Box::new(safe_asset))
 }
 
@@ -1934,7 +2531,7 @@ pub async fn upload_status_batch_handler(
     let mut pending: Vec<String> = Vec::new();
     let mut errored: Vec<String> = Vec::new();
     for id in &ids {
-        match resolve_uploaded_asset(&client, &key, id, meta.allow_download).await {
+        match resolve_uploaded_asset(&client, &meta.canonical_key, id, meta.allow_download).await {
             UploadedAssetStatus::Ready(a) => ready.push(*a),
             UploadedAssetStatus::Pending => pending.push(id.clone()),
             UploadedAssetStatus::Error => errored.push(id.clone()),
@@ -1947,7 +2544,7 @@ pub async fn upload_status_batch_handler(
         pending: Vec<String>,
         errored: Vec<String>,
     }
-    (
+    let mut resp = (
         StatusCode::OK,
         axum::Json(BatchStatusResponse {
             ready,
@@ -1955,7 +2552,9 @@ pub async fn upload_status_batch_handler(
             errored,
         }),
     )
-        .into_response()
+        .into_response();
+    insert_private_no_store(resp.headers_mut());
+    resp
 }
 
 /// Session-scoped SSE upload-status stream:
@@ -2003,10 +2602,11 @@ pub async fn upload_status_batch_handler(
 /// On termination we emit `done` and remove the session from the registry.
 ///
 /// Validation mirrors the batch endpoint: `is_safe_param` on the key and token,
-/// the 256-id `MAX_BATCH` cap on the legacy ids path, and a single
-/// `validate_upload_link` call (which reuses the short-TTL permission cache), so the
-/// share key is validated ONCE for the life of the stream rather than once per poll.
-/// Inside the stream we reuse `resolve_uploaded_asset` for every id — no
+/// the 256-id `MAX_BATCH` cap on the legacy ids path, a global `SSE_SEMAPHORE`
+/// concurrency cap (64 streams), and a single `validate_upload_link` call (which
+/// reuses the short-TTL permission cache), so the share key is validated ONCE for
+/// the life of the stream rather than once per poll. Inside the stream we reuse
+/// `resolve_uploaded_asset` (scoped to `meta.canonical_key`) for every id — no
 /// upstream-call logic is duplicated.
 pub async fn upload_status_stream_handler(
     headers: HeaderMap,
@@ -2071,6 +2671,14 @@ pub async fn upload_status_stream_handler(
         return StatusCode::FORBIDDEN.into_response();
     }
 
+    // Bound global concurrent SSE streams to prevent connection/task exhaustion.
+    const MAX_CONCURRENT_SSE: usize = 64;
+    let sse_sem = SSE_SEMAPHORE
+        .get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SSE)));
+    let Ok(sse_permit) = sse_sem.clone().try_acquire_owned() else {
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    };
+
     // Per-connection driver state. `stream::unfold` calls our async closure once per
     // yielded item; we keep a small output buffer because a single poll tick can
     // resolve several assets at once (each becomes its own SSE event) while unfold
@@ -2081,7 +2689,7 @@ pub async fn upload_status_stream_handler(
     // list captured from the legacy `ids=` param.
     struct StreamState {
         client: ImmichClient,
-        key: String,
+        canonical_key: String,
         allow_download: bool,
         session: Option<String>,
         pending: Vec<String>,
@@ -2090,6 +2698,7 @@ pub async fn upload_status_stream_handler(
         start: std::time::Instant,
         delay_ms: u64,
         finished: bool,
+        _permit: tokio::sync::OwnedSemaphorePermit,
     }
 
     // Same cadence spirit as the poll loop: 500ms -> 1s -> 2s (capped). A freshly
@@ -2100,7 +2709,7 @@ pub async fn upload_status_stream_handler(
 
     let init = StreamState {
         client,
-        key,
+        canonical_key: meta.canonical_key,
         allow_download: meta.allow_download,
         session,
         pending: legacy_ids, // empty in session mode; the registry is the source of truth there
@@ -2109,6 +2718,7 @@ pub async fn upload_status_stream_handler(
         start: std::time::Instant::now(),
         delay_ms: MIN_DELAY_MS,
         finished: false,
+        _permit: sse_permit,
     };
 
     // The done payload reports how many resolved and which ids (if any) were still
@@ -2130,7 +2740,7 @@ pub async fn upload_status_stream_handler(
             if st.finished {
                 // Session mode: tear down the registry entry now that we're closing.
                 if let Some(ref sess) = st.session {
-                    upload_sessions::remove_session(sess);
+                    upload_sessions::remove_session(&st.canonical_key, sess);
                 }
                 return None;
             }
@@ -2142,10 +2752,10 @@ pub async fn upload_status_stream_handler(
             let timed_out = st.start.elapsed().as_millis() >= MAX_WALL_MS;
             let uploads_finished = match st.session {
                 Some(ref sess) => {
-                    if let Some(live) = upload_sessions::snapshot_pending(sess) {
+                    if let Some(live) = upload_sessions::snapshot_pending(&st.canonical_key, sess) {
                         st.pending = live;
                     }
-                    upload_sessions::is_finished(sess)
+                    upload_sessions::is_finished(&st.canonical_key, sess)
                 }
                 // Legacy ids mode has no finish beacon; it's "finished" by definition
                 // (the id list never grows), so draining the list ends the stream.
@@ -2195,7 +2805,14 @@ pub async fn upload_status_stream_handler(
             // Iterate over a snapshot so we can rebuild `pending` cleanly.
             let snapshot = std::mem::take(&mut st.pending);
             for id in snapshot {
-                match resolve_uploaded_asset(&st.client, &st.key, &id, st.allow_download).await {
+                match resolve_uploaded_asset(
+                    &st.client,
+                    &st.canonical_key,
+                    &id,
+                    st.allow_download,
+                )
+                .await
+                {
                     UploadedAssetStatus::Ready(asset) => {
                         match Event::default().event("ready").json_data(&*asset) {
                             Ok(ev) => st.out.push_back(ev),
@@ -2206,7 +2823,7 @@ pub async fn upload_status_stream_handler(
                         // Resolved — drop it from the session registry too so a
                         // reconnect (which re-reads the registry) won't re-emit it.
                         if let Some(ref sess) = st.session {
-                            upload_sessions::remove_pending(sess, &id);
+                            upload_sessions::remove_pending(&st.canonical_key, sess, &id);
                         }
                         st.resolved += 1;
                         made_progress = true;
@@ -2215,7 +2832,7 @@ pub async fn upload_status_stream_handler(
                         st.out
                             .push_back(Event::default().event("errored").data(id.clone()));
                         if let Some(ref sess) = st.session {
-                            upload_sessions::remove_pending(sess, &id);
+                            upload_sessions::remove_pending(&st.canonical_key, sess, &id);
                         }
                         made_progress = true;
                     }
@@ -2240,24 +2857,37 @@ pub async fn upload_status_stream_handler(
     // KeepAlive holds the connection through quiet stretches (e.g. a slow-to-process
     // asset) so intermediaries don't reap an idle stream; it emits a `: comment` line
     // every 15s, which EventSource silently ignores.
-    Sse::new(stream)
+    let mut resp = Sse::new(stream)
         .keep_alive(
             KeepAlive::new()
                 .interval(std::time::Duration::from_secs(15))
                 .text("keep-alive"),
         )
-        .into_response()
+        .into_response();
+    // Defense-in-depth for Nginx: disable response buffering on SSE streams.
+    resp.headers_mut().insert(
+        HeaderName::from_static("x-accel-buffering"),
+        HeaderValue::from_static("no"),
+    );
+    resp.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-cache"),
+    );
+    resp.headers_mut()
+        .insert(header::VARY, HeaderValue::from_static("Cookie"));
+    resp
 }
 
 /// Finish beacon for the session-scoped SSE stream:
 /// `POST /share/{key}/upload/finish?session=TOKEN`.
 ///
-/// The client calls this once its upload loop ends. It flips the session's
-/// `uploads_finished` flag so the stream can terminate as soon as the pending set
-/// drains, instead of waiting out the full wall-clock ceiling. Body-less; returns
-/// 204. An unknown/invalid token is a harmless no-op (still 204) — the stream's
-/// wall clock is the backstop either way. CSRF-checked like the upload endpoint
-/// since it mutates session state.
+/// The client calls this once its upload loop ends. It validates that the caller is
+/// authorized for upload on `{key}` and flips the session's `uploads_finished` flag
+/// (scoped to `meta.canonical_key`) so the stream can terminate as soon as the
+/// pending set drains, instead of waiting out the full wall-clock ceiling. Body-less;
+/// returns 204. An unknown session token for that share is a harmless no-op (still
+/// 204) — the stream's wall clock is the backstop either way. CSRF-checked like the
+/// upload endpoint since it mutates session state.
 pub async fn mark_upload_session_done_handler(
     headers: HeaderMap,
     Path(key): Path<String>,
@@ -2269,13 +2899,25 @@ pub async fn mark_upload_session_done_handler(
     if !check_csrf(&headers) {
         return StatusCode::FORBIDDEN.into_response();
     }
-    match params.get("session") {
-        Some(tok) if !tok.is_empty() && is_safe_param(tok) => {
-            upload_sessions::mark_finished(tok);
-            StatusCode::NO_CONTENT.into_response()
-        }
-        _ => StatusCode::BAD_REQUEST.into_response(),
+    let Some(tok) = params.get("session").filter(|t| is_safe_param(t)) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+
+    let client = ImmichClient::new();
+    if client.upload_api_key.is_none() {
+        return StatusCode::FORBIDDEN.into_response();
     }
+    let share_token = get_cookie_share_token(&headers, &key);
+    let meta = match validate_upload_link(&client, &key, share_token.as_deref()).await {
+        Ok(m) => m,
+        Err(status) => return status.into_response(),
+    };
+    if !meta.is_album || !meta.allow_upload {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+
+    upload_sessions::mark_finished(&meta.canonical_key, tok);
+    StatusCode::NO_CONTENT.into_response()
 }
 
 pub async fn upload_status_handler(
@@ -2304,10 +2946,163 @@ pub async fn upload_status_handler(
         return StatusCode::FORBIDDEN.into_response();
     }
 
-    match resolve_uploaded_asset(&client, &key, &asset_id, meta.allow_download).await {
+    let mut resp = match resolve_uploaded_asset(
+        &client,
+        &meta.canonical_key,
+        &asset_id,
+        meta.allow_download,
+    )
+    .await
+    {
         // 202 Accepted: still processing tagging/association or thumbnail not ready.
         UploadedAssetStatus::Pending => StatusCode::ACCEPTED.into_response(),
         UploadedAssetStatus::Ready(asset) => (StatusCode::OK, axum::Json(*asset)).into_response(),
         UploadedAssetStatus::Error => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    insert_private_no_store(resp.headers_mut());
+    resp
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::extract::FromRequest;
+    use axum::http::Request;
+
+    #[test]
+    fn test_upload_sessions_cross_share_isolation() {
+        let sess = "test-sess-iso-1";
+        upload_sessions::add_pending("share_a", sess, "asset_1");
+        // Share B cannot inject into, read, finish, or delete Share A's session
+        upload_sessions::add_pending("share_b", sess, "asset_evil");
+        assert!(upload_sessions::snapshot_pending("share_b", sess).is_none());
+        upload_sessions::mark_finished("share_b", sess);
+        assert!(!upload_sessions::is_finished("share_a", sess));
+        upload_sessions::remove_pending("share_b", sess, "asset_1");
+        upload_sessions::remove_session("share_b", sess);
+
+        // Share A retains sole ownership
+        let snap = upload_sessions::snapshot_pending("share_a", sess).unwrap();
+        assert_eq!(snap, vec!["asset_1".to_string()]);
+        upload_sessions::mark_finished("share_a", sess);
+        assert!(upload_sessions::is_finished("share_a", sess));
+        upload_sessions::remove_session("share_a", sess);
+        assert!(upload_sessions::snapshot_pending("share_a", sess).is_none());
+    }
+
+    #[test]
+    fn test_processed_assets_cross_share_isolation() {
+        record_processed_asset(
+            "asset-iso-1".to_string(),
+            "Alice".to_string(),
+            "share_a".to_string(),
+        );
+        assert_eq!(
+            lookup_processed_uploader("asset-iso-1", "share_b"),
+            None
+        );
+        remove_processed_asset("asset-iso-1", "share_b");
+        assert_eq!(
+            lookup_processed_uploader("asset-iso-1", "share_a"),
+            Some("Alice".to_string())
+        );
+        remove_processed_asset("asset-iso-1", "share_a");
+        assert_eq!(lookup_processed_uploader("asset-iso-1", "share_a"), None);
+    }
+
+    #[test]
+    fn test_media_security_header_helpers() {
+        assert!(is_safe_inline_image_mime(Some("image/jpeg")));
+        assert!(is_safe_inline_image_mime(Some("image/webp; charset=utf-8")));
+        assert!(!is_safe_inline_image_mime(Some("image/svg+xml")));
+        assert!(!is_safe_inline_image_mime(Some("text/html")));
+        assert!(!is_safe_inline_image_mime(None));
+
+        let inline = HeaderValue::from_static("inline; filename=\"pic.svg\"");
+        assert_eq!(
+            force_attachment_disposition(Some(&inline)),
+            "attachment; filename=\"pic.svg\""
+        );
+        assert_eq!(force_attachment_disposition(None), "attachment");
+
+        let pub_cc = HeaderValue::from_static("public, max-age=3600");
+        assert_eq!(private_cache_control(Some(&pub_cc)), "private, max-age=3600");
+    }
+
+    async fn build_multipart(body: Vec<u8>, boundary: &str) -> Multipart {
+        let req = Request::builder()
+            .method("POST")
+            .header(
+                header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={}", boundary),
+            )
+            .body(Body::from(body))
+            .unwrap();
+        Multipart::from_request(req, &()).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_streaming_multipart_filter_allows_valid_fields() {
+        let b = "testbound";
+        let raw = format!(
+            "--{b}\r\nContent-Disposition: form-data; name=\"fileCreatedAt\"\r\n\r\n2026-01-01T00:00:00.000Z\r\n\
+             --{b}\r\nContent-Disposition: form-data; name=\"assetData\"; filename=\"photo.jpg\"\r\nContent-Type: image/jpeg\r\n\r\nJPEGDATA\r\n\
+             --{b}--\r\n"
+        );
+        let mp = build_multipart(raw.into_bytes(), b).await;
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let pump = tokio::spawn(async move {
+            pump_filtered_multipart(mp, "outbound", 1024, ready_tx).await
+        });
+        let mut rx = ready_rx.await.unwrap().unwrap();
+        let mut out = Vec::new();
+        while let Some(item) = rx.recv().await {
+            out.extend_from_slice(&item.unwrap());
+        }
+        assert_eq!(pump.await.unwrap(), Ok(()));
+        let forwarded = String::from_utf8(out).unwrap();
+        assert!(forwarded.contains("name=\"fileCreatedAt\""));
+        assert!(forwarded.contains("name=\"assetData\"; filename=\"photo.jpg\""));
+        assert!(forwarded.contains("JPEGDATA"));
+        assert!(forwarded.ends_with("--outbound--\r\n"));
+    }
+
+    #[tokio::test]
+    async fn test_streaming_multipart_filter_rejects_disallowed_field_before_upstream_connect() {
+        let b = "testbound";
+        let raw = format!(
+            "--{b}\r\nContent-Disposition: form-data; name=\"isFavorite\"\r\n\r\ntrue\r\n\
+             --{b}\r\nContent-Disposition: form-data; name=\"assetData\"; filename=\"photo.jpg\"\r\n\r\nDATA\r\n\
+             --{b}--\r\n"
+        );
+        let mp = build_multipart(raw.into_bytes(), b).await;
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let pump = tokio::spawn(async move {
+            pump_filtered_multipart(mp, "outbound", 1024, ready_tx).await
+        });
+        // Disallowed field is caught during pre-validation: ready_rx yields Err(400)
+        // without ever creating an upstream stream!
+        let ready_res = ready_rx.await.unwrap();
+        assert_eq!(ready_res.unwrap_err(), StatusCode::BAD_REQUEST);
+        assert_eq!(pump.await.unwrap(), Err(StatusCode::BAD_REQUEST));
+    }
+
+    #[tokio::test]
+    async fn test_streaming_multipart_filter_rejects_oversized_upload() {
+        let b = "testbound";
+        let big = "X".repeat(2048);
+        let raw = format!(
+            "--{b}\r\nContent-Disposition: form-data; name=\"assetData\"; filename=\"big.bin\"\r\n\r\n{big}\r\n\
+             --{b}--\r\n"
+        );
+        let mp = build_multipart(raw.into_bytes(), b).await;
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let pump = tokio::spawn(async move {
+            pump_filtered_multipart(mp, "outbound", 512, ready_tx).await
+        });
+        if let Ok(Ok(mut rx)) = ready_rx.await {
+            while rx.recv().await.is_some() {}
+        }
+        assert_eq!(pump.await.unwrap(), Err(StatusCode::PAYLOAD_TOO_LARGE));
     }
 }

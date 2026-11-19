@@ -90,12 +90,7 @@ impl SafeAlbum {
 
 impl SafeSharedLink {
     pub fn from_base(link: crate::immich_client::model::SharedLink) -> Self {
-        static UPLOAD_KEY_SET: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let upload_key_set = *UPLOAD_KEY_SET.get_or_init(|| {
-            std::env::var("IMMICH_API_KEY_UPLOAD_USER")
-                .map(|v| !v.is_empty())
-                .unwrap_or(false)
-        });
+        let upload_key_set = crate::immich_client::client::ImmichClient::has_upload_api_key();
         SafeSharedLink {
             key: link.key,
             description: link.description,

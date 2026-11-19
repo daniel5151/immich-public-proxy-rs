@@ -119,11 +119,13 @@ export function useUpload({ realKey, allowUpload, onAssetReady }: UseUploadArgs)
       const fileDate = new Date(file.lastModified).toISOString();
 
       const formData = new FormData();
-      formData.append('assetData', file, file.name);
+      // Append small metadata fields before assetData so the proxy can validate
+      // all metadata fields before streaming the file payload to Immich.
       formData.append('deviceAssetId', file.name);
       formData.append('deviceId', 'immich-public-proxy');
       formData.append('fileCreatedAt', fileDate);
       formData.append('fileModifiedAt', fileDate);
+      formData.append('assetData', file, file.name);
 
       try {
         const res = await fetch(uploadUrl, {
